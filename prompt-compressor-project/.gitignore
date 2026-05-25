@@ -1,0 +1,8 @@
+/target
+/dist
+/node_modules
+/local-model-files/*.gguf
+*.log
+.DS_Store
+Thumbs.db
+

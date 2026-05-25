@@ -1,0 +1,28 @@
+schema_version: 1
+id: balanced-codex-compression-policy-v1
+
+mode_defaults:
+  codex_optimized:
+    level: 2
+
+required_categories:
+  - objective
+  - target_scope
+  - constraints
+  - prohibitions
+  - output_format
+
+protected_patterns:
+  - code_block
+  - inline_code
+  - file_path
+  - error_message
+  - numeric_condition
+  - negation
+
+verification:
+  require_preserved_numbers: true
+  require_preserved_negations: true
+  require_preserved_file_names: true
+  fallback_on_high_risk: true
+

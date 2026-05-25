@@ -1,0 +1,33 @@
+schema_version: 1
+id: code-focused-codex-compression-policy-v1
+
+mode_defaults:
+  developer_mode:
+    level: 2
+
+required_categories:
+  - objective
+  - target_files
+  - current_behavior
+  - expected_change
+  - constraints
+  - prohibitions
+  - output_format
+
+protected_patterns:
+  - code_block
+  - inline_code
+  - file_path
+  - function_name
+  - error_message
+  - stack_trace
+  - numeric_condition
+  - negation
+
+verification:
+  require_preserved_numbers: true
+  require_preserved_negations: true
+  require_preserved_file_names: true
+  require_preserved_error_messages: true
+  fallback_on_high_risk: true
+

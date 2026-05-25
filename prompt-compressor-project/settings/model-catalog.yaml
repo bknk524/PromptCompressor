@@ -1,0 +1,46 @@
+schema_version: 1
+
+models:
+  qwen3_1_7b:
+    label: Qwen3-1.7B
+    adapter: qwen3
+    runtime: llama_cpp_default
+    model_path: local-model-files/qwen3-1.7b-q4_k_m.gguf
+    quantization: q4_k_m
+    context_length: 32768
+    thinking: false
+    default_max_output: 256
+    prompt_template: general-codex-compression-v1
+
+  qwen2_5_coder_1_5b:
+    label: Qwen2.5-Coder-1.5B-Instruct
+    adapter: qwen_coder
+    runtime: llama_cpp_default
+    model_path: local-model-files/qwen2.5-coder-1.5b-q4_k_m.gguf
+    quantization: q4_k_m
+    context_length: 32768
+    thinking: false
+    default_max_output: 256
+    prompt_template: code-focused-codex-compression-v1
+
+  gemma3_1b_it:
+    label: Gemma 3 1B IT
+    adapter: gemma
+    runtime: llama_cpp_default
+    model_path: local-model-files/gemma-3-1b-it-q4_k_m.gguf
+    quantization: q4_k_m
+    context_length: 32768
+    thinking: false
+    default_max_output: 256
+    prompt_template: general-codex-compression-v1
+
+  lmstudio_auto:
+    label: LM Studio loaded model
+    adapter: openai_chat
+    runtime: lmstudio_default
+    api_model: auto
+    quantization: managed_by_lmstudio
+    context_length: 32768
+    thinking: false
+    default_max_output: 256
+    prompt_template: general-codex-compression-v1

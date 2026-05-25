@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://prompt-compressor.local/schemas/compression-request.schema.json",
+  "title": "CompressionRequest",
+  "type": "object",
+  "required": [
+    "input_text",
+    "task_type",
+    "compression_mode",
+    "compression_level",
+    "profile",
+    "constraints",
+    "target",
+    "source"
+  ],
+  "properties": {
+    "input_text": {
+      "type": "string",
+      "minLength": 1
+    },
+    "task_type": {
+      "type": "string",
+      "enum": [
+        "coding",
+        "log_analysis",
+        "refactor",
+        "design_discussion",
+        "general"
+      ]
+    },
+    "compression_mode": {
+      "type": "string",
+      "enum": [
+        "lossless",
+        "instruction_extract",
+        "codex_optimized",
+        "privacy_redaction",
+        "developer_mode"
+      ]
+    },
+    "compression_level": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4
+    },
+    "profile": {
+      "type": "string",
+      "minLength": 1
+    },
+    "constraints": {
+      "type": "object",
+      "required": [
+        "preserve_code_blocks",
+        "preserve_file_names",
+        "preserve_error_messages",
+        "preserve_numbers",
+        "preserve_negations"
+      ],
+      "properties": {
+        "preserve_code_blocks": { "type": "boolean" },
+        "preserve_file_names": { "type": "boolean" },
+        "preserve_error_messages": { "type": "boolean" },
+        "preserve_numbers": { "type": "boolean" },
+        "preserve_negations": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "target": {
+      "type": "object",
+      "required": ["destination", "tokenizer_profile"],
+      "properties": {
+        "destination": { "type": "string" },
+        "tokenizer_profile": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "source": {
+      "type": "string",
+      "enum": ["cli", "mcp", "desktop"]
+    }
+  },
+  "additionalProperties": false
+}
+

@@ -1,0 +1,25 @@
+schema_version: 1
+id: safe-codex-compression-policy-v1
+
+mode_defaults:
+  lossless:
+    level: 1
+
+required_categories:
+  - objective
+  - constraints
+  - prohibitions
+
+protected_patterns:
+  - code_block
+  - inline_code
+  - file_path
+  - error_message
+  - numeric_condition
+  - negation
+
+verification:
+  require_preserved_numbers: true
+  require_preserved_negations: true
+  fallback_on_high_risk: true
+
