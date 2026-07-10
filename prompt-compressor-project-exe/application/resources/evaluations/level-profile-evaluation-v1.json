@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "id": "level-profile-evaluation-v1",
+  "profile": "sarashina_2_2_3b_instruct",
+  "levels": {
+    "1": { "max_character_ratio": 0.86 },
+    "2": { "max_character_ratio": 0.78 },
+    "3": { "max_character_ratio": 0.70 }
+  },
+  "cases": [
+    {
+      "id": "react_search_constraints",
+      "task_type": "coding",
+      "compression_mode": "codex_optimized",
+      "input_text": "React の検索画面で、検索ボタンを押したときだけ API を呼び出してください。既存の useSearchParams による URL クエリ管理は維持し、ページ番号変更時も検索状態を保持してください。TypeScript の既存構造を活かし、大規模なリファクタリングは避けてください。",
+      "required_terms": ["React", "API", "useSearchParams", "URL", "TypeScript"],
+      "required_marker_groups": ["のみ|だけ", "禁止|避け|しない"]
+    }
+  ]
+}
