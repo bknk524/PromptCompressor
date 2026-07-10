@@ -1,0 +1,26 @@
+schema_version: 1
+id: level-prompt-profiles-v1
+
+# Each profile inherits this baseline. The selected profile is sent to the
+# model in one request; the application does not run a second derivation pass.
+shared_instruction: "本題/対象/必須語/数値/禁止/維持/のみ/ではなくを本文へ各1回統合。必須語は語単体やラベルにせず、役割/対象と一緒に本文へ自然に含める。日時/ID/URL/ファイル名/エラー表記は変換禁止。挨拶/雑談/明白ノイズは削除可。原文外追加/重複/個別ケース暗記は禁止。"
+
+profiles:
+  level_1_reference:
+    level: 1
+    target_ratio: "75〜90%"
+    instruction: "短くしすぎない。重複だけ削り、語順と表現を優先。"
+    format_instruction: "1〜3文。助詞と必要な説明は残す。"
+    allow_semantic_shortening: false
+  level_2_balanced:
+    level: 2
+    target_ratio: "通常40〜65%、雑入力50〜75%"
+    instruction: "普段使い標準。怠惰/曖昧/誤字混じり入力でも本題を抽出。背景/敬語/重複/明白ノイズだけ削り、条件は短く同じ文へ統合。条件行の各要素、タイミング、状態保持、例外、禁止/維持/のみ/ではなく/読み込まずは必ず残す。"
+    format_instruction: "1〜2文。短くしてよいが、条件欠落・対象不明・実装者が迷う省略は禁止。条件を末尾に原文のまま追記しない。テスト文だけに効く言い回しやケース固有の丸暗記は禁止。"
+    allow_semantic_shortening: false
+  level_3_aggressive:
+    level: 3
+    target_ratio: "50%以下"
+    instruction: "名詞句中心、短い同義語可。列挙は / 。説明語/見出し/重複禁止。制約は変更しない/維持/のみ/禁止など短語で残す。"
+    format_instruction: "1文45〜80字目安。してください/追加/検証/含める等の指示語、助詞、敬語を削る。"
+    allow_semantic_shortening: true

@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://prompt-compressor.local/schemas/compression-result.schema.json",
+  "title": "CompressionResult",
+  "type": "object",
+  "required": [
+    "request_id",
+    "profile",
+    "model_id",
+    "runtime",
+    "distilled_prompt",
+    "preserved_requirements",
+    "removed_content_summary",
+    "risk_flags",
+    "should_send_original",
+    "metrics"
+  ],
+  "properties": {
+    "request_id": { "type": "string" },
+    "profile": { "type": "string" },
+    "model_id": { "type": "string" },
+    "runtime": { "type": "string" },
+    "distilled_prompt": { "type": "string" },
+    "preserved_requirements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "text"],
+        "properties": {
+          "kind": { "type": "string" },
+          "text": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "removed_content_summary": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "risk_flags": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["code", "severity", "message"],
+        "properties": {
+          "code": { "type": "string" },
+          "severity": {
+            "type": "string",
+            "enum": ["low", "medium", "high"]
+          },
+          "message": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "should_send_original": { "type": "boolean" },
+    "fallback_reason": {
+      "type": ["string", "null"]
+    },
+    "metrics": {
+      "type": "object",
+      "required": [
+        "input_tokens_est",
+        "output_tokens_est",
+        "compression_ratio",
+        "latency_ms"
+      ],
+      "properties": {
+        "input_tokens_est": { "type": "integer", "minimum": 0 },
+        "output_tokens_est": { "type": "integer", "minimum": 0 },
+        "compression_ratio": { "type": "number", "minimum": 0 },
+        "latency_ms": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

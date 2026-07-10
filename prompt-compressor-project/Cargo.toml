@@ -1,9 +1,10 @@
 [workspace]
 members = [
-  "applications/command-line-compressor",
-  "applications/local-web-compressor-ui",
-  "applications/codex-mcp-compressor-server",
-  "libraries/compression-core",
+  "application/interfaces/cli",
+  "application/ui/desktop",
+  "application/ui/web",
+  "application/interfaces/mcp",
+  "application/core/compression-core",
 ]
 resolver = "2"
 

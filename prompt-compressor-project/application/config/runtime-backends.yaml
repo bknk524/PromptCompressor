@@ -1,0 +1,15 @@
+schema_version: 1
+
+runtimes:
+  llama_cpp_embedded:
+    backend: llama.cpp
+    launch_mode: embedded
+    threads: auto
+    gpu_layers: 0
+    timeout_ms: 120000
+
+  lmstudio_external:
+    backend: lmstudio
+    launch_mode: external
+    base_url: http://127.0.0.1:1234/v1
+    timeout_ms: 120000
