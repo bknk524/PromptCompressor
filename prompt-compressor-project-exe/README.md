@@ -1,39 +1,48 @@
 # Prompt Compressor
 
-Prompt Compressor is a local-first compression layer for Codex-oriented prompts.
-It turns long draft requests into shorter execution prompts while keeping a
-review-before-use workflow.
+Prompt Compressor は、Codex 向けの長い依頼文を、必要な条件を保ったまま短くするローカルファーストのプロンプト圧縮アプリです。
 
-Folder purposes are summarized in `資料/フォルダ構成.md`.
+アプリ本体は Windows ネイティブアプリ化を前提にしており、最終的には exe だけを起動して文章の圧縮まで完了できる構成を目指しています。
 
-## Current Status
+各フォルダの役割は `資料/フォルダ構成.md` にまとめています。
 
-This project is a working Rust workspace with:
+現在の作業状況と他の Codex への引き継ぎ情報は、先に次のファイルを読んでください。
 
-- a shared compression core library
-- a command-line compressor
-- a local Web UI for browser-based testing
-- a native Windows desktop shell using WebView2
-- an MCP server scaffold
-- settings for the bundled local model, embedded runtime, and compression policies
-- planning and operational materials
+```text
+資料/評価メモ/Codex引き継ぎ_レベル2圧縮改善.md
+```
 
-The default runtime is self-contained at application runtime. It uses the
-embedded `llama.cpp` backend compiled into the Rust application and the local
-Sarashina GGUF model under `application/local/models/`. It does not require
-LM Studio, `llama.exe`, `llama-server.exe`, a local LLM HTTP port, or a runtime
-download while the app is running.
+このファイルには、レベル2圧縮改善の目的、実LLM評価結果、残っている失敗、次に実行するコマンドを記録しています。
 
-The optional `lmstudio_local` profile remains available for testing user-owned
-local models through LM Studio. That profile connects to
-`http://127.0.0.1:1234/v1` and automatically uses the model currently loaded
-in LM Studio. It is not required for the bundled-model workflow.
+## 現在の状態
 
-If the configured GGUF model file is unavailable or the local runtime fails,
-compression returns the original prompt and marks `should_send_original=true`
-in JSON output.
+このプロジェクトは Rust workspace として構成されています。
 
-## Repository Layout
+主な構成は次のとおりです。
+
+- 圧縮ロジックを持つ共通 core ライブラリ
+- コマンドライン版の圧縮ツール
+- 開発確認用のローカル Web UI
+- WebView2 を使う Windows デスクトップシェル
+- MCP サーバーの土台
+- 同梱ローカルモデル、組み込みランタイム、圧縮ポリシー用の設定
+- 企画資料、評価メモ、将来構想などの資料
+
+標準の実行経路は `internal_llm` です。
+
+`internal_llm` は、Rust アプリに組み込んだ `llama.cpp` バックエンドと、`application/local/models/` に置いた Sarashina の GGUF モデルを使います。
+
+通常利用では次のものは不要です。
+
+- LM Studio
+- `llama.exe`
+- `llama-server.exe`
+- ローカル LLM 用の HTTP ポート
+- アプリ起動時の外部ランタイムダウンロード
+
+LM Studio は、ユーザーが任意のローカルモデルを試すための追加経路として残しています。標準の圧縮処理には不要です。
+
+## フォルダ構成
 
 ```text
 application/
@@ -41,91 +50,124 @@ application/
   ui/                             ローカル Web UI と Windows デスクトップシェル
   interfaces/                     CLI と MCP サーバー
   config/                         Git 管理するモデル・プロファイル・ポリシー設定
-  resources/                      LLM テンプレートと JSON スキーマ
-  local/                          PC ごとのモデル・ログ・状態
+  resources/                      LLM テンプレート、JSON スキーマ、評価 fixture
+  local/                          PC ごとのモデル、ログ、状態
 資料/
   企画資料/                       企画、設計、要件、進捗、作業リスト
-  評価メモ/                       評価設計と結果メモ
+  評価メモ/                       評価設計、評価結果、Codex引き継ぎ
   将来構想/                       未実装機能の構想資料
   フォルダ構成.md                 各フォルダの詳細説明
 ```
 
-## First Commands
+## 最初に確認するコマンド
+
+プロファイル一覧を確認します。
 
 ```powershell
 cargo run -p prompt-compressor-cli -- --list-profiles
 ```
 
+CLI で圧縮を試します。
+
 ```powershell
-cargo run -p prompt-compressor-cli -- "Fix the React search behavior while preserving URL query parameters."
+cargo run -p prompt-compressor-cli -- --profile internal_llm "React の検索ボタンを押したときだけ API を呼ぶように修正してください。URL クエリの状態は維持してください。"
 ```
+
+開発用 Web UI を起動します。
 
 ```powershell
 cargo run -p prompt-compressor-local-ui -- --host 127.0.0.1 --port 8787
 ```
 
-Then open:
+起動後、次を開きます。
 
 ```text
 http://127.0.0.1:8787
 ```
 
-For the Windows native desktop shell:
+Windows デスクトップシェルを起動します。
 
 ```powershell
 cargo run -p prompt-compressor-desktop
 ```
 
-The desktop shell does not start an HTTP server and does not bind a localhost
-port. It serves the same UI through an internal WebView2 custom protocol
-(`prompt-compressor://`) and routes app API calls in-process, so the packaged
-exe behaves like a normal Windows application instead of a browser-hosted web
-app.
+## Windows デスクトップ版
 
-UI settings are persisted under `application/local/state/ui-settings.json`.
-The saved values include the selected profile, mode, task type, compression
-level, and light/dark theme. Browser `localStorage` is still used as a fallback,
-but the application-side settings file keeps the same choices after the app is
-stopped and started again.
+デスクトップシェルは、通常の Web サーバーを起動しません。
 
-To create a separated runnable desktop package:
+UI は WebView2 上で表示しますが、HTTP ポートは使わず、`prompt-compressor://` の内部プロトコルとアプリ内 bridge で API を処理します。
+
+そのため、exe 化した後はブラウザで動く Web アプリではなく、通常の Windows アプリとして扱う方針です。
+
+## exe 出力
+
+分離した実行用フォルダを作るには、次を実行します。
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File application/tools/package-desktop-release.ps1 -Clean
 ```
 
-This writes the runnable app to the sibling folder
-`../prompt-compressor-project-exe/` and leaves the source project folder
-unchanged. The package contains `PromptCompressor.exe`, `application/config/`,
-`application/resources/`, and the configured local model. The runtime is
-embedded in the executable, so no `application/local/runtimes/` binaries are
-copied into the release package.
+標準では、ソースフォルダとは別の次の場所へ出力します。
 
-To use the release, open `PromptCompressor.exe` inside the package folder. You
-do not need to start the development Web UI, LM Studio, or any separate local
-LLM server. Keep the `application/` folder next to the exe; the GGUF model is
-too large to embed directly into the exe, so copying only `PromptCompressor.exe`
-to another folder will not be enough to compress text. If required files are
-missing, the desktop app writes `PromptCompressor_STARTUP_ERROR.txt` and opens
-it in Notepad.
+```text
+../prompt-compressor-project-exe/
+```
 
-To choose a different output folder:
+パッケージには次が入ります。
+
+- `PromptCompressor.exe`
+- `application/config/`
+- `application/resources/`
+- 設定済みのローカル GGUF モデル
+
+ランタイムは exe に組み込まれるため、`application/local/runtimes/` のような外部ランタイムバイナリはコピーしません。
+
+ただし GGUF モデルは大きいため、exe 本体へ直接埋め込まず、`application/` フォルダ内に配置します。
+
+別の場所へ出力したい場合は、次のように指定します。
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File application/tools/package-desktop-release.ps1 -Clean -OutputPath "C:\path\to\PromptCompressor"
 ```
 
-## Build Tools
+## ビルドに必要なもの
 
-The release package is self-contained at runtime, but building the embedded
-`llama.cpp` backend requires LLVM build tools on the development machine.
-The packaging script looks for `libclang.dll` and `llvm-nm.exe` under
-`C:\Program Files\LLVM\bin` or the folder pointed to by `LIBCLANG_PATH`.
+実行時は自己完結を目指していますが、開発環境で `llama.cpp` 組み込みバックエンドをビルドするには LLVM が必要です。
+
+ビルド時には次のパスを使います。
+
+```text
+C:\Program Files\LLVM\bin
+```
+
+必要に応じて次の環境変数を設定します。
+
+```powershell
+$env:NM_PATH='C:\Program Files\LLVM\bin\llvm-nm.exe'
+$env:OBJCOPY_PATH='C:\Program Files\LLVM\bin\llvm-objcopy.exe'
+```
+
+## 設定の保存
+
+UI 設定は次に保存します。
+
+```text
+application/local/state/ui-settings.json
+```
+
+保存対象は、現在の方針では次のようなアプリ設定です。
+
+- 選択中のプロファイル
+- 圧縮レベル
+- テーマ
+
+入力本文や圧縮結果は保存しない方針です。
 
 ## トークン削減の計算ロジック
 
-圧縮結果には、トークン（推定）と文字数を `入力 → 出力` の形式で表示する。表示する
-`比率` は、圧縮後が圧縮前の何パーセントかを表す。
+圧縮結果には、トークン推定と文字数を `入力 → 出力` の形式で表示します。
+
+表示する比率は、圧縮後が圧縮前の何パーセントかを表します。
 
 ```text
 トークン比 = 出力トークン推定 / 入力トークン推定 × 100
@@ -133,70 +175,141 @@ The packaging script looks for `libclang.dll` and `llvm-nm.exe` under
 削減率     = 100 - 比率
 ```
 
-たとえばトークン比が `78%` の場合、推定トークン数は約 `22%` 削減されている。ランタイムの
-失敗などで原文を返す場合は、入力と出力が同じになるため比率は `100%` になる。
+たとえばトークン比が `78%` の場合、推定トークン数は約 `22%` 削減されています。
+
+ランタイム失敗などで原文を返す場合は、入力と出力が同じになるため比率は `100%` になります。
 
 ### トークン推定
 
-現在はすべてのプロファイルで、モデル固有の厳密な tokenizer ではなく、ローカルで高速に動く
-共通のヒューリスティックな概算を使う。日本語を空白で区切らないために `1` トークンと誤表示
-しないよう、連続する文字種ごとに以下を加算する。
+現在は、モデル固有の厳密な tokenizer ではなく、ローカルで高速に動く共通の概算を使っています。
+
+日本語が空白で区切られないために `1` トークンと誤表示されないよう、連続する文字種ごとに次のように加算します。
 
 - 日本語文字列: `ceil(文字数 × 2 / 3)`
 - 英字と `_` の連続文字列: `ceil(文字数 / 4)`
 - 数字の連続文字列: `ceil(文字数 / 3)`
-- 空白以外の記号: 1 文字ごとに 1
+- 空白以外の記号: 1文字ごとに1
 
-実際の消費トークン数は、選択したモデルと tokenizer により異なる。将来はプロファイルごとに
-実 tokenizer を接続できるよう、推定器には `target_tokenizer_profile` を渡している。
+実際の消費トークン数は、選択したモデルと tokenizer によって異なります。
 
-### 文字数
+## 内蔵ローカル LLM
 
-文字数は Rust の Unicode 文字単位で数える。日本語、英字、数字、空白、改行、記号を含むため、
-トークン推定よりも入力と出力の長さを直感的に比較しやすい。
+`internal_llm` プロファイルは、同梱ローカルモデルを組み込み `llama.cpp` バックエンドで直接実行します。
 
-## Embedded Local LLM Runtime
+モデルは次の配下に置きます。
 
-The `internal_llm` profile runs the bundled local model directly through the
-embedded `llama.cpp` backend.
-
-1. Put the configured GGUF model under `application/local/models/`.
-2. Select `internal_llm` in the Web UI or pass `--profile internal_llm` to the CLI.
-
-When the Web UI starts, the local development server becomes available first
-and then preloads the default embedded GGUF model in the background. The
-desktop shell uses the same route handlers in-process through WebView2 instead
-of opening a port. In both modes, `/api/runtime-status` reports whether the
-model is loading, ready, skipped, or failed.
-
-Loaded embedded models are held in the shared runtime cache for the lifetime of
-the application process. The preload path and the compression path use the same
-cache, so a warmed model is reused instead of being loaded again.
-
-Runtime details, including thread count and model path, stay in the YAML
-settings rather than the UI.
-
-```powershell
-cargo run -p prompt-compressor-cli -- --profile internal_llm "Shorten this Codex request while preserving constraints."
+```text
+application/local/models/
 ```
 
-## Optional LM Studio Connection
+現在の主な採用モデル:
 
-The `lmstudio_local` profile is kept as a manual test path for local models
-that the user loads in LM Studio.
+```text
+sarashina2.2-3b-instruct
+```
 
-1. Start LM Studio and enable its local server on `http://127.0.0.1:1234/v1`.
-2. Load the model you want to compare.
-3. Select `LM Studio（ローカルモデル自由選択）` in the Web UI, or pass
-   `--profile lmstudio_local` to the CLI.
+CLI で `internal_llm` を使う例:
 
-This path is intentionally separate from the default bundled-model runtime.
-If LM Studio is not running, the app automatically falls back to `internal_llm`
-so the desktop package can still compress text without external services.
+```powershell
+cargo run -p prompt-compressor-cli -- --profile internal_llm "この依頼文を、条件を落とさず短くしてください。"
+```
 
-See `資料/企画資料/内部LLM実行方針.md` for the lifecycle and deployment notes.
+モデルが見つからない、またはローカルランタイムが失敗した場合は、危険な圧縮を避けるため原文を返し、JSON 出力では `should_send_original=true` を付けます。
 
-## Next Steps
+## LM Studio 接続
 
-1. Add a clearer user-facing startup error when WebView2 or the GGUF model is missing.
-2. Implement MCP stdio transport.
+`lmstudio_local` プロファイルは、ユーザーが LM Studio で読み込んだ任意のローカルモデルを試すために残しています。
+
+利用手順:
+
+1. LM Studio を起動する。
+2. `http://127.0.0.1:1234/v1` のローカルサーバーを有効にする。
+3. 試したいモデルを LM Studio で読み込む。
+4. UI で `LM Studio（ローカルモデル自由選択）` を選ぶ、または CLI で `--profile lmstudio_local` を指定する。
+
+この経路は比較・検証用です。
+
+標準の exe 利用では LM Studio は不要です。
+
+## プロンプト評価
+
+レベル2の圧縮品質は、次の fixture で評価しています。
+
+```text
+application/resources/evaluations/raw-prompts-level2-evaluation-v1.json
+```
+
+この評価では、実際のアプリと同じ LLM 経路を必ず使います。
+
+禁止すること:
+
+- モック結果で合格扱いにする
+- 手書きの期待出力だけで合格扱いにする
+- LM Studio 経路で `internal_llm` の代わりにする
+
+必須プロファイル:
+
+```text
+internal_llm
+```
+
+単体テストとCLIビルド:
+
+```powershell
+$env:NM_PATH='C:\Program Files\LLVM\bin\llvm-nm.exe'
+$env:OBJCOPY_PATH='C:\Program Files\LLVM\bin\llvm-objcopy.exe'
+cargo test -p prompt-compressor-core -p prompt-compressor-cli --no-default-features
+cargo build -p prompt-compressor-cli
+```
+
+特定ケースだけを実LLMで再評価する例:
+
+```powershell
+target/debug/prompt-compressor-cli.exe --profile internal_llm --eval-fixture application/resources/evaluations/raw-prompts-level2-evaluation-v1.json --eval-levels 2 --eval-case-offset 23 --eval-case-limit 1 --eval-progress
+```
+
+全30件を1件目から実行する場合:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File application/tools/run-raw-level2-real-llm-eval.ps1
+```
+
+失敗ケースを直した後は、最後に必ず全30件を1件目から再実行します。
+
+完了条件:
+
+```text
+passed=true
+case_count=30
+run_count=30
+failure_count=0
+```
+
+## 現在の未完了作業
+
+レベル2圧縮改善は作業中です。
+
+直近の実LLM個別再チェックでは、次は通過済みです。
+
+- `normal-18`
+- `normal-19`
+- `normal-20`
+
+残っている失敗:
+
+- `unexpected-04`: CSV インポートで「10MB超過時は読み込まず」が落ちている
+- `unexpected-05`: Next.js order API で「入力チェック/入力検証」と「テスト」が落ちている
+
+詳細は次を参照してください。
+
+```text
+資料/評価メモ/Codex引き継ぎ_レベル2圧縮改善.md
+```
+
+## 次にやること
+
+1. `unexpected-04` と `unexpected-05` の圧縮候補を修正する。
+2. 単体テストと CLI ビルドを再実行する。
+3. `internal_llm` で失敗ケースを個別再評価する。
+4. 個別再評価が通ったら、全30件を1件目から再実行する。
+5. 全件合格したら、評価結果を `資料/評価メモ/Codex引き継ぎ_レベル2圧縮改善.md` に追記する。

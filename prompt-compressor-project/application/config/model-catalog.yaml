@@ -10,7 +10,7 @@ models:
     quantization: q4_k_s
     context_length: 4096
     thinking: false
-    default_max_output: 160
+    default_max_output: 192
     prompt_template: sarashina-japanese-compression-v1
     prompt_style: concise
     supports_json_schema: false

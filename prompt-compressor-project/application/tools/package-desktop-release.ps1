@@ -154,7 +154,6 @@ function Test-PackagedLocalModelCompression {
     Write-Host "Running packaged local model compression smoke test..."
     $sampleBase64 = "UmVhY3Qg44Gu5qSc57Si55S76Z2i44Gn44CB5qSc57Si44Oc44K/44Oz44KS5oq844GX44Gf44Go44GN44Gg44GRIEFQSSDjgpLlkbzjgbPlh7rjgZfjgabjgY/jgaDjgZXjgYTjgILml6LlrZjjga4gdXNlU2VhcmNoUGFyYW1zIOOBq+OCiOOCiyBVUkwg44Kv44Ko44Oq566h55CG44Gv57at5oyB44GX44CB5aSn6KaP5qih44Gq44Oq44OV44Kh44Kv44K/44Oq44Oz44Kw44Gv6YG/44GR44Gm44GP44Gg44GV44GE44CC"
     $sample = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($sampleBase64))
-
     Push-Location $projectRoot
     try {
         Use-LlvmBuildTools

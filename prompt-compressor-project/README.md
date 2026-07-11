@@ -239,6 +239,16 @@ cargo run -p prompt-compressor-cli -- --profile internal_llm "この依頼文を
 application/resources/evaluations/raw-prompts-level2-evaluation-v1.json
 ```
 
+全レベル共通の長文・冗長入力は、次の fixture で評価します。通常入力20件と、誤字・脱字・無意味な文字列を含む入力5件を、同じ条件でレベル1、2、3へ通します。
+
+```text
+application/resources/evaluations/raw-long-redundant-evaluation-v1.json
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File application/tools/evaluate-prompt-profiles.ps1 -FixturePath application/resources/evaluations/raw-long-redundant-evaluation-v1.json -Levels 1,2,3
+```
+
 この評価では、実際のアプリと同じ LLM 経路を必ず使います。
 
 禁止すること:

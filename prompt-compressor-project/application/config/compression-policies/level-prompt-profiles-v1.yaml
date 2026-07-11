@@ -3,7 +3,7 @@ id: level-prompt-profiles-v1
 
 # Each profile inherits this baseline. The selected profile is sent to the
 # model in one request; the application does not run a second derivation pass.
-shared_instruction: "本題/対象/必須語/数値/禁止/維持/のみ/ではなくを本文へ各1回統合。必須語は語単体やラベルにせず、役割/対象と一緒に本文へ自然に含める。日時/ID/URL/ファイル名/エラー表記は変換禁止。挨拶/雑談/明白ノイズは削除可。原文外追加/重複/個別ケース暗記は禁止。"
+shared_instruction: "削除可=挨拶/現状説明/背景/敬語/重複/明白ノイズ。保持=対象/操作契機/条件と結果/例外/数値/必須語/禁止/維持/検証。必須語は表記を変えず対象と同じ節に各1回置き、同義語化/単独ラベル/末尾追記禁止。異なる条件と結果を統合せず、否定を反転しない。日時/ID/URL/ファイル名/エラー表記/識別子は改変禁止。原文外追加/意味変更/個別ケース暗記は禁止。"
 
 profiles:
   level_1_reference:
@@ -15,8 +15,8 @@ profiles:
   level_2_balanced:
     level: 2
     target_ratio: "通常40〜65%、雑入力50〜75%"
-    instruction: "普段使い標準。怠惰/曖昧/誤字混じり入力でも本題を抽出。背景/敬語/重複/明白ノイズだけ削り、条件は短く同じ文へ統合。条件行の各要素、タイミング、状態保持、例外、禁止/維持/のみ/ではなく/読み込まずは必ず残す。"
-    format_instruction: "1〜2文。短くしてよいが、条件欠落・対象不明・実装者が迷う省略は禁止。条件を末尾に原文のまま追記しない。テスト文だけに効く言い回しやケース固有の丸暗記は禁止。"
+    instruction: "[対象]→[要求]→[制約]→[検証]を原文順に各1回短縮。概要追加禁止。制約対象名は列挙も全て残し、述語/助詞だけ短縮。条件→結果は一対一、限定/禁止対象を混同せず、手段と目的を結び替えない。必須語は逐字使用。誤字は原文内で正解が確定する場合だけ補正。"
+    format_instruction: "2〜5文の1段落。対象と動作から始め、制約を独立節で続ける。条件欠落/対象不明/再要約/ラベル列挙/原文断片追記は禁止。実装とテストを判断できる密度を保ち、ケース固有暗記は禁止。"
     allow_semantic_shortening: false
   level_3_aggressive:
     level: 3

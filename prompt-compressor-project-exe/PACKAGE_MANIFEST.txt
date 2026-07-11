@@ -1,6 +1,6 @@
 ﻿Prompt Compressor desktop package
 
-Generated: 2026-07-02 18:26:36
+Generated: 2026-07-10 17:59:40
 Executable: PromptCompressor.exe
 Default profile: internal_llm
 Model: application/local/models/sarashina2.2-3b-instruct-v0.1/sarashina2.2-3b-instruct-v0.1-Q4_K_S.gguf

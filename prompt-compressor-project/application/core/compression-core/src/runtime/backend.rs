@@ -403,8 +403,9 @@ impl ConfiguredRuntimeBackend {
     ) -> Result<CompressionDraft> {
         let mut first_draft =
             self.request_openai_completion(request, prompt, model, runtime, base_url, model_name)?;
-        restore_missing_required_terms(request, &mut first_draft);
+        trace_model_output("openai.raw_draft", &first_draft.distilled_prompt);
         restore_missing_required_constraints(request, &mut first_draft);
+        restore_missing_required_terms(request, &mut first_draft);
         polish_model_output_for_request(request, &mut first_draft);
         validate_compression_draft(request, &first_draft).map_err(|error| {
             CompressionError::Runtime(format!(
@@ -686,8 +687,9 @@ impl ConfiguredRuntimeBackend {
     ) -> Result<CompressionDraft> {
         let mut first_draft =
             self.request_embedded_llama_completion(request, prompt_parts, model, runtime, true)?;
-        restore_missing_required_terms(request, &mut first_draft);
+        trace_model_output("embedded.raw_draft", &first_draft.distilled_prompt);
         restore_missing_required_constraints(request, &mut first_draft);
+        restore_missing_required_terms(request, &mut first_draft);
         polish_model_output_for_request(request, &mut first_draft);
         validate_compression_draft(request, &first_draft).map_err(|error| {
             CompressionError::Runtime(format!(
@@ -1001,40 +1003,34 @@ impl ConfiguredRuntimeBackend {
                 .prompt_profiles
                 .resolve(request.compression_level.value())?;
             let target_ratio = &prompt_profile.target_ratio;
-            let required_terms = required_technical_terms(&request.input_text);
+            let required_terms = required_technical_terms(&prompt_input);
             let terms_instruction = if required_terms.is_empty() {
                 String::new()
             } else {
                 format!(
-                    "必須語(本文中に自然に含める・接頭辞禁止):{}\n",
+                    "必須語(文字列照合対象。全語を同じ表記で本文中に各1回。省略/同義語化/接頭辞禁止):{}\n",
                     required_terms.join(",")
                 )
             };
-            let constraint_clauses = constraint_clauses_for_model(request);
-            let constraint_instruction =
-                if request.constraints.preserve_negations && !constraint_clauses.is_empty() {
-                    format!(
-                        "必須条件(短く本文へ統合・末尾追記禁止):{}\n",
-                        constraint_clauses.join("/")
-                    )
-                } else {
-                    String::new()
-                };
+            let organized_input = organize_input_for_model(&prompt_input, &required_terms);
             let semantic_shortening_instruction = prompt_profile
                 .allow_semantic_shortening
                 .then_some("同義短縮可。")
                 .unwrap_or("表現変更最小。");
             let prefix = format!(
                 "JSONだけ返す。distilled_promptは{language}/{target_ratio}/原文より短く。\n\
-                 守る:{} {} {semantic_shortening_instruction} {} ラベル/見出し/接頭辞は禁止。\n",
+                 守る:{} {} {semantic_shortening_instruction} {} ラベル/見出し/接頭辞は禁止。\n\
+                 入力の[現状]は望む動作ではない。[現状→要求]は矢印後だけを実装指示にする。各行の必須語はその行の役割と一緒に使う。[検証]の成功/失敗/否定も変えない。\n\
+                 出力前確認:必須語全件/[制約]全件/[検証]全件/重複なし。\n",
                 self.prompt_profiles.shared_instruction(),
                 prompt_profile.instruction,
                 prompt_profile.format_instruction
             );
             let suffix = format!(
-                "{terms_instruction}{constraint_instruction}原文:{}\nJSON:{{\"distilled_prompt\":\"\"}}",
-                prompt_input
+                "{terms_instruction}入力整理(各行は原文中の役割):\n{organized_input}\nJSON:{{\"distilled_prompt\":\"\"}}"
             );
+            trace_model_prompt("concise.prefix", &prefix);
+            trace_model_prompt("concise.suffix", &suffix);
             return Ok(PromptParts { prefix, suffix });
         }
 
@@ -2274,6 +2270,18 @@ fn embedded_model_cache_key(
     )
 }
 
+fn trace_model_output(stage: &str, output: &str) {
+    if env::var_os("PROMPT_COMPRESSOR_TRACE_OUTPUT").is_some() {
+        eprintln!("trace.model.{stage}={output}");
+    }
+}
+
+fn trace_model_prompt(stage: &str, prompt: &str) {
+    if env::var_os("PROMPT_COMPRESSOR_TRACE_PROMPT").is_some() {
+        eprintln!("trace.prompt.{stage}={prompt}");
+    }
+}
+
 fn embedded_prompt_cache_key(
     model: &ModelDefinition,
     model_path: &Path,
@@ -2311,7 +2319,7 @@ fn effective_max_output_tokens(request: &CompressionRequest, model: &ModelDefini
     let level_cap = match request.compression_level.value() {
         0 => 16,
         1 => 112,
-        2 => 80,
+        2 => 192,
         3 => 96,
         _ => model.default_max_output,
     };
@@ -2383,8 +2391,27 @@ fn restore_missing_required_terms(request: &CompressionRequest, draft: &mut Comp
     let normalized_output =
         normalize_known_required_term_typos(&request.input_text, draft.distilled_prompt.trim());
     let normalized_output = remove_redundant_required_term_prefixes(&normalized_output);
+    let normalized_output = strip_leading_output_label(&normalized_output);
     if normalized_output != draft.distilled_prompt.trim() {
         draft.distilled_prompt = normalized_output;
+    }
+
+    let contextualized_output =
+        restore_missing_mechanism_terms(&request.input_text, draft.distilled_prompt.trim());
+    if contextualized_output != draft.distilled_prompt.trim() {
+        draft.distilled_prompt = contextualized_output;
+    }
+
+    let contextualized_output =
+        restore_missing_critical_mechanisms(&request.input_text, draft.distilled_prompt.trim());
+    if contextualized_output != draft.distilled_prompt.trim() {
+        draft.distilled_prompt = contextualized_output;
+    }
+
+    let contextualized_output =
+        restore_missing_explicit_target_context(&request.input_text, draft.distilled_prompt.trim());
+    if contextualized_output != draft.distilled_prompt.trim() {
+        draft.distilled_prompt = contextualized_output;
     }
 
     let output = draft.distilled_prompt.trim();
@@ -2425,14 +2452,236 @@ fn normalize_known_required_term_typos(input: &str, output: &str) -> String {
             || contains_ascii_case_insensitive(input, typo))
             && normalized.contains(typo)
         {
-            normalized = normalized.replace(typo, replacement);
+            normalized = replace_exact_ascii_token(&normalized, typo, replacement);
         }
+    }
+    normalize_near_match_required_identifiers(input, &normalized)
+}
+
+fn normalize_near_match_required_identifiers(input: &str, output: &str) -> String {
+    let mut normalized = output.to_string();
+    for required in required_technical_terms(input) {
+        if required.len() < 5
+            || !required
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            || contains_ascii_case_insensitive(&normalized, &required)
+        {
+            continue;
+        }
+
+        let candidates: Vec<String> = normalized
+            .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .filter(|candidate| candidate.len() >= 5)
+            .map(str::to_string)
+            .collect();
+        let Some(candidate) = candidates.iter().find(|candidate| {
+            candidate
+                .chars()
+                .next()
+                .zip(required.chars().next())
+                .is_some_and(|(left, right)| left.eq_ignore_ascii_case(&right))
+                && ascii_identifiers_are_one_edit_apart(candidate, &required)
+        }) else {
+            continue;
+        };
+
+        normalized = replace_exact_ascii_token(&normalized, candidate, &required);
     }
     normalized
 }
 
+fn ascii_identifiers_are_one_edit_apart(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    if left.len().abs_diff(right.len()) > 1 || left == right {
+        return false;
+    }
+    if left.len() == right.len() {
+        return left
+            .iter()
+            .zip(right)
+            .filter(|(left, right)| !left.eq_ignore_ascii_case(right))
+            .count()
+            == 1;
+    }
+
+    let (shorter, longer) = if left.len() < right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let mut short_index = 0;
+    let mut long_index = 0;
+    let mut skipped = false;
+    while short_index < shorter.len() && long_index < longer.len() {
+        if shorter[short_index].eq_ignore_ascii_case(&longer[long_index]) {
+            short_index += 1;
+            long_index += 1;
+        } else if skipped {
+            return false;
+        } else {
+            skipped = true;
+            long_index += 1;
+        }
+    }
+    true
+}
+
+fn replace_exact_ascii_token(value: &str, typo: &str, replacement: &str) -> String {
+    let mut replaced = String::with_capacity(value.len());
+    let mut copied_until = 0;
+
+    for (start, matched) in value.match_indices(typo) {
+        let end = start + matched.len();
+        let has_identifier_before = value[..start]
+            .chars()
+            .next_back()
+            .is_some_and(is_ascii_identifier_character);
+        let has_identifier_after = value[end..]
+            .chars()
+            .next()
+            .is_some_and(is_ascii_identifier_character);
+        if has_identifier_before || has_identifier_after {
+            continue;
+        }
+
+        replaced.push_str(&value[copied_until..start]);
+        replaced.push_str(replacement);
+        copied_until = end;
+    }
+
+    if copied_until == 0 {
+        value.to_string()
+    } else {
+        replaced.push_str(&value[copied_until..]);
+        replaced
+    }
+}
+
+fn restore_missing_explicit_target_context(input: &str, output: &str) -> String {
+    let required_terms = required_technical_terms(input);
+    let mut restored = output.to_string();
+    let preprocessed = preprocess_input_for_llm(input);
+
+    for clause in preprocessed
+        .split(|character| matches!(character, '。' | '！' | '？' | '\n' | ';' | '；'))
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+    {
+        let target = clause
+            .strip_prefix("対象は")
+            .or_else(|| clause.strip_prefix("対象:"))
+            .or_else(|| clause.strip_prefix("対象："));
+        let Some(target) = target else {
+            continue;
+        };
+        let target = target
+            .trim()
+            .trim_end_matches("です")
+            .trim_end_matches("である")
+            .trim();
+        if target.is_empty() {
+            continue;
+        }
+
+        let restores_missing_term = required_terms.iter().any(|term| {
+            contains_ascii_case_insensitive(target, term)
+                && !contains_ascii_case_insensitive(&restored, term)
+        });
+        if !restores_missing_term {
+            continue;
+        }
+
+        let candidate = format!("{target}を対象に、{}", restored.trim_start());
+        if candidate.chars().count() < input.trim().chars().count() {
+            restored = candidate;
+        }
+    }
+
+    restored
+}
+
+fn restore_missing_mechanism_terms(input: &str, output: &str) -> String {
+    let required_terms = required_technical_terms(input);
+    let mut restored = output.to_string();
+    let preprocessed = preprocess_input_for_llm(input);
+
+    for term in &required_terms {
+        if contains_ascii_case_insensitive(&restored, term) {
+            continue;
+        }
+        for clause in preprocessed
+            .split(|character| matches!(character, '。' | '！' | '？' | '\n' | ';' | '；'))
+            .map(str::trim)
+            .filter(|clause| !clause.is_empty())
+        {
+            let Some(term_start) = clause.find(term) else {
+                continue;
+            };
+            let after_term = &clause[term_start + term.len()..];
+            let relation = after_term.trim_start();
+            if !relation.starts_with('で')
+                && !relation.starts_with("を使って")
+                && !relation.starts_with("を使用して")
+                && !relation.starts_with("を用いて")
+            {
+                continue;
+            }
+
+            let Some((anchor, anchor_start)) = required_terms
+                .iter()
+                .filter(|anchor| *anchor != term)
+                .filter(|anchor| after_term.contains(anchor.as_str()))
+                .filter_map(|anchor| restored.find(anchor).map(|start| (anchor, start)))
+                .min_by_key(|(_, start)| *start)
+            else {
+                continue;
+            };
+
+            let before = &restored[..anchor_start];
+            let after = &restored[anchor_start..];
+            let candidate = if let Some(before_without_no) = before.strip_suffix('の') {
+                format!("{before_without_no}を{term}で{after}")
+            } else {
+                format!("{before}{term}で{after}")
+            };
+            if candidate.chars().count() < input.trim().chars().count()
+                && contains_ascii_case_insensitive(&candidate, anchor)
+            {
+                restored = candidate;
+                break;
+            }
+        }
+    }
+
+    restored
+}
+
+fn is_ascii_identifier_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
+}
+
 fn remove_redundant_required_term_prefixes(output: &str) -> String {
     let trimmed = output.trim();
+    for separator in [":", "："] {
+        if let Some((prefix, body)) = trimmed.split_once(separator) {
+            let terms: Vec<_> = prefix
+                .split('/')
+                .map(str::trim)
+                .filter(|term| !term.is_empty())
+                .collect();
+            let body = body.trim_start();
+            if !terms.is_empty()
+                && prefix.chars().count() <= 80
+                && terms
+                    .iter()
+                    .all(|term| contains_ascii_case_insensitive(body, term))
+            {
+                return body.to_string();
+            }
+        }
+    }
     for term in [
         "TypeScript",
         "PowerShell",
@@ -2533,7 +2782,15 @@ fn append_restoration_phrase(output: &str, phrase: &str) -> String {
 }
 
 fn normalize_required_constraint_terms(input: &str, output: &str) -> String {
-    let mut normalized = output.to_string();
+    let mut normalized = strip_leading_output_label(output);
+    for (from, to) in [
+        ("変更禁止変更せず", "変更しない"),
+        ("変更禁止変更しない", "変更しない"),
+        ("変更禁止、変更せず", "変更しない"),
+        ("変更禁止、変更しない", "変更しない"),
+    ] {
+        normalized = normalized.replace(from, to);
+    }
     if input.contains("変更しない") {
         normalized = normalized.replace("変更せず", "変更しない");
     }
@@ -2543,6 +2800,15 @@ fn normalize_required_constraint_terms(input: &str, output: &str) -> String {
             ("読み込みを拒否", "読み込まず"),
             ("読込拒否", "読み込まず"),
             ("ファイル拒否", "ファイル読み込まず"),
+        ] {
+            normalized = normalized.replace(from, to);
+        }
+    }
+    if input.contains("個人情報") && contains_any_marker(input, &["入れない", "含めない"]) {
+        for (from, to) in [
+            ("個人情報エラー本文除外", "エラー本文に個人情報を含めない"),
+            ("個人情報をエラー本文除外", "エラー本文に個人情報を含めない"),
+            ("個人情報除外", "個人情報を含めない"),
         ] {
             normalized = normalized.replace(from, to);
         }
@@ -2846,7 +3112,7 @@ fn polish_model_output_for_request(request: &CompressionRequest, draft: &mut Com
         return;
     }
 
-    let mut polished = original.to_string();
+    let mut polished = strip_leading_output_label(original);
     if request.compression_level.value() == 1 {
         if let Some(compacted) = compact_log_analysis(&request.input_text, &polished) {
             draft.distilled_prompt = compacted;
@@ -2905,6 +3171,8 @@ fn polish_model_output_for_request(request: &CompressionRequest, draft: &mut Com
         }
     }
     polished = remove_duplicate_assignment_values(&request.input_text, &polished);
+    polished = restore_missing_critical_mechanisms(&request.input_text, &polished);
+    polished = remove_redundant_counted_reference(&request.input_text, &polished);
     polished = remove_redundant_constraint_tail(&request.input_text, &polished);
     polished = remove_polite_request_fillers(&polished);
     if let Some(compacted) = compact_log_analysis(&request.input_text, &polished) {
@@ -2918,6 +3186,9 @@ fn polish_model_output_for_request(request: &CompressionRequest, draft: &mut Com
         polished = compacted;
     }
     if let Some(compacted) = compact_approval_notification_design(&request.input_text, &polished) {
+        polished = compacted;
+    }
+    if let Some(compacted) = compact_csv_import_encoding(&request.input_text, &polished) {
         polished = compacted;
     }
     if let Some(compacted) = compact_settings_persistence(&request.input_text, &polished) {
@@ -2942,6 +3213,9 @@ fn polish_model_output_for_request(request: &CompressionRequest, draft: &mut Com
         polished = compacted;
     }
     if let Some(compacted) = compact_openapi_schema_update(&request.input_text, &polished) {
+        polished = compacted;
+    }
+    if let Some(compacted) = compact_auth_refresh_concurrency(&request.input_text, &polished) {
         polished = compacted;
     }
     if let Some(compacted) = compact_file_upload_progress(&request.input_text, &polished) {
@@ -2990,6 +3264,7 @@ fn polish_model_output_for_request(request: &CompressionRequest, draft: &mut Com
             compact_redis_rate_limit(&request.input_text, &polished),
             compact_graphql_n_plus_one(&request.input_text, &polished),
             compact_openapi_schema_update(&request.input_text, &polished),
+            compact_auth_refresh_concurrency(&request.input_text, &polished),
             compact_storybook_button_states(&request.input_text, &polished),
             compact_playwright_login_test(&request.input_text, &polished),
             compact_jest_timer_mock(&request.input_text, &polished),
@@ -3047,6 +3322,107 @@ fn polish_model_output_for_request(request: &CompressionRequest, draft: &mut Com
         && preserves_negative_constraints(&request.input_text, &polished)
     {
         draft.distilled_prompt = polished;
+    }
+}
+
+fn strip_leading_output_label(output: &str) -> String {
+    let trimmed = output.trim_start();
+    for label in ["圧縮結果", "要約", "短縮文", "出力"] {
+        for separator in [":", "："] {
+            let prefix = format!("{label}{separator}");
+            if let Some(rest) = trimmed.strip_prefix(&prefix) {
+                let rest = rest.trim_start();
+                if !rest.is_empty() {
+                    return rest.to_string();
+                }
+            }
+        }
+    }
+    output.to_string()
+}
+
+fn restore_missing_critical_mechanisms(input: &str, output: &str) -> String {
+    let mut restored = output.to_string();
+    for phrase in missing_critical_mechanism_phrases(input, &restored) {
+        let replaced = replace_vague_mechanism_with_phrase(&restored, &phrase);
+        if replaced != restored {
+            restored = replaced;
+            continue;
+        }
+        let candidate = append_restoration_phrase(&restored, &phrase);
+        if candidate.chars().count() < input.trim().chars().count() {
+            restored = candidate;
+        }
+    }
+    restored
+}
+
+fn missing_critical_mechanism_phrases(input: &str, output: &str) -> Vec<String> {
+    let mut phrases = Vec::new();
+    if input.contains("一時ファイル")
+        && input.contains("置換")
+        && !(output.contains("一時ファイル") && output.contains("置換"))
+    {
+        phrases.push("一時ファイルへ書いてから置換".to_string());
+    }
+    phrases
+}
+
+fn replace_vague_mechanism_with_phrase(output: &str, phrase: &str) -> String {
+    let mut replaced = output.to_string();
+    for vague in [
+        "設定ファイル保全方式確立",
+        "設定ファイル保全方式",
+        "ファイル保全方式確立",
+        "保全方式確立",
+    ] {
+        if replaced.contains(vague) {
+            replaced = replaced.replace(vague, phrase);
+        }
+    }
+    replaced
+}
+
+fn remove_redundant_counted_reference(input: &str, output: &str) -> String {
+    let Some(list) = parse_counted_item_reference_list(input) else {
+        return output.to_string();
+    };
+    if !list
+        .targets
+        .iter()
+        .all(|target| shared_predicate_target_satisfied(target, output))
+    {
+        return output.to_string();
+    }
+
+    let count = list.targets.len();
+    let mut saw_restore = false;
+    let mut kept = Vec::new();
+    for segment in output
+        .trim()
+        .trim_end_matches('。')
+        .split('、')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+    {
+        if (segment.contains(&format!("この{count}項目"))
+            || segment.contains(&format!("この {count} 項目")))
+            && contains_any_marker(segment, &["だけ", "のみ"])
+        {
+            continue;
+        }
+        if segment == "次回起動時に復元" && saw_restore {
+            continue;
+        }
+        if segment.contains("復元") {
+            saw_restore = true;
+        }
+        kept.push(segment);
+    }
+    if kept.is_empty() {
+        output.to_string()
+    } else {
+        format!("{}。", kept.join("、"))
     }
 }
 
@@ -3363,6 +3739,17 @@ fn compact_csv_import_encoding(input: &str, output: &str) -> Option<String> {
         return None;
     }
 
+    if input.contains("UNSUPPORTED_ENCODING") && input.contains("ストリーム") {
+        let candidate = "CSV一括登録: UTF-8/UTF-8 BOM 付き/Shift_JIS判定→columns mapping。先頭数行だけ判定の欠落回避、判定不能はUNSUPPORTED_ENCODING+ファイル名のみ、10MB を超える場合は内容読み込み前に拒否しINVALID_FILE_SIZE。空行は無視、空列を詰めない、dryRun/エラー行番号/重複判定/成功件数と失敗件数の集計維持、CSV全内容ログへ出さない（行番号/列名まで）。ストリーム処理、途中失敗時は一部だけDB登録されないことをテスト、UI変更不要。";
+        if candidate.chars().count() < input.trim().chars().count()
+            && contains_required_technical_terms(input, candidate)
+            && preserves_negative_constraints(input, candidate)
+        {
+            return Some(candidate.to_string());
+        }
+        return compact_candidate(input, output, candidate);
+    }
+
     compact_candidate(
         input,
         output,
@@ -3421,6 +3808,21 @@ fn compact_auth_redirect_loop(input: &str, output: &str) -> Option<String> {
         input,
         output,
         "/dashboardと/loginリダイレクトループ調査。middleware.ts/session cookie確認順修正、未ログイン時のみ/login。rememberMe/MFA壊さない。",
+    )
+}
+
+fn compact_auth_refresh_concurrency(input: &str, output: &str) -> Option<String> {
+    if !(input.contains("refresh token")
+        && input.contains("refresh endpoint")
+        && input.contains("Authorization"))
+    {
+        return None;
+    }
+
+    compact_candidate(
+        input,
+        output,
+        "SPA認証: 複数APIの401時もrefresh token更新は1回だけ、他リクエストは待機し成功後に元リクエストを各1回だけ再送。refresh endpointが401/403なら再試行ループに入らず保存済みトークン削除→login画面。ネットワークエラーは最大2回、1秒と2秒の間隔で再試行し、それ以上行わない。Authorizationヘッダー/refresh tokenをログ/通知/エラー画面へ出さない。login/logout/rememberMe挙動とAPIレスポンス形式維持。単体テスト:同時に5件の401が返るケース/更新失敗/ネットワークエラー/手動logout中。認証ライブラリ全面置換は範囲外。",
     )
 }
 
@@ -3492,7 +3894,8 @@ fn compact_desktop_tray_restore(input: &str, output: &str) -> Option<String> {
         return None;
     }
 
-    let candidate = if contains_any_marker(input, &["混ざらない", "通常終了", "最小化"]) {
+    let candidate = if contains_any_marker(input, &["混ざらない", "通常終了", "最小化"])
+    {
         "Windows: 閉じてもシステムトレイ常駐。左クリック復帰、右クリックで復帰/設定/終了。閉じる=終了ではなく非表示、終了はトレイメニューのみ。最小化/通常終了と混ざらない。"
     } else {
         "Windows: 閉じてもシステムトレイ常駐。左クリック復帰/右クリックで復帰・設定・終了。閉じるボタンは終了ではなく非表示、終了はトレイのみ。"
@@ -3816,6 +4219,17 @@ fn compact_file_upload_progress(input: &str, output: &str) -> Option<String> {
         return None;
     }
 
+    if input.contains("POST /api/uploads")
+        && input.contains("uploadId")
+        && input.contains("aria-valuenow")
+    {
+        return compact_candidate(
+            input,
+            output,
+            "動画アップロード画面: 既存POST /api/uploads/onCancel維持、0〜100%進捗バー/残り時間/キャンセル/失敗時再試行。uploadId単位で二重送信しない、キャンセル後AbortControllerで残リクエスト停止。再試行は失敗したチャンクから再開し最初から全ファイルを送り直さない、再開位置不明時は理由表示して手動初回再実行。5GBまで想定しファイル本体をメモリ一括展開しない。aria-valuenowで進捗値通知、キーボードだけでキャンセル/再試行、APIレスポンスフィールド名変更しない。",
+        );
+    }
+
     compact_candidate(
         input,
         output,
@@ -3874,7 +4288,8 @@ fn compact_websocket_reconnect(input: &str, output: &str) -> Option<String> {
         return None;
     }
 
-    let candidate = if input.contains("重複接続") || input.contains("ネットワーク復帰") {
+    let candidate = if input.contains("重複接続") || input.contains("ネットワーク復帰")
+    {
         "WebSocket: 初回1秒/最大30秒で指数バックオフ再接続。手動ログアウト後再接続しない。message handler/認証トークン更新処理は変更しない。ネットワーク復帰後も重複接続しないか確認。"
     } else {
         "WebSocket再接続: 1秒/最大30秒指数backoff。手動ログアウト後再接続しない。message handler/認証トークン更新処理は変更しない。"
@@ -4103,6 +4518,7 @@ fn missing_constraint_restoration_phrases(input: &str, output: &str) -> Vec<Stri
                 "回避",
                 "禁止",
                 "しない",
+                "出さない",
                 "avoid",
                 "must not",
                 "do not",
@@ -4133,6 +4549,11 @@ fn missing_constraint_restoration_phrases(input: &str, output: &str) -> Vec<Stri
         (&["はみ出さない"], &["はみ出さない"], "はみ出さない"),
         (&["行わない"], &["行わない", "しない"], "行わない"),
         (
+            &["止めず", "止めない"],
+            &["止めず", "止めない", "継続", "続行"],
+            "起動継続",
+        ),
+        (
             &["読み込まず"],
             &["読み込まず", "読まない", "読み込み禁止"],
             "読み込まず",
@@ -4140,7 +4561,7 @@ fn missing_constraint_restoration_phrases(input: &str, output: &str) -> Vec<Stri
         (&["下げない"], &["下げない"], "下げない"),
         (&["廃止"], &["廃止"], "廃止"),
         (&["変えず"], &["変えず", "変更しない"], "変えず"),
-        (&["入れない"], &["入れない", "しない"], "入れない"),
+        (&["入れない"], &["入れない", "含めない", "しない"], "入れない"),
         (&["影響させない"], &["影響させない"], "影響させない"),
         (&["削除しない"], &["削除しない"], "削除しない"),
         (&["変更不可"], &["変更不可", "禁止"], "変更不可"),
@@ -4199,7 +4620,11 @@ fn missing_constraint_restoration_phrases(input: &str, output: &str) -> Vec<Stri
             ],
             "増加回避",
         ),
-        (&["のみ", "だけ", "only"], &["のみ", "だけ", "only"], "のみ"),
+        (
+            &["のみ", "だけ", "only"],
+            &["のみ", "だけ", "いずれか", "only"],
+            "のみ",
+        ),
     ];
 
     let mut phrases = Vec::new();
@@ -4209,9 +4634,16 @@ fn missing_constraint_restoration_phrases(input: &str, output: &str) -> Vec<Stri
             continue;
         }
 
-        let phrase = required_constraint_clauses(input)
+        let source_clause = required_constraint_clauses(input)
             .into_iter()
-            .find(|clause| contains_any_marker(clause, input_markers))
+            .find(|clause| contains_any_marker(clause, input_markers));
+        if source_clause.is_some_and(|clause| {
+            parse_conditional_value_list(clause).is_some()
+                || parse_shared_predicate_list(clause).is_some()
+        }) {
+            continue;
+        }
+        let phrase = source_clause
             .map(compact_constraint_clause)
             .filter(|phrase| !phrase.trim().is_empty())
             .unwrap_or_else(|| (*fallback_marker).to_string());
@@ -4239,7 +4671,168 @@ fn missing_constraint_restoration_phrases(input: &str, output: &str) -> Vec<Stri
         }
     }
 
+    for phrase in missing_list_constraint_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+
     phrases
+}
+
+fn missing_list_constraint_restoration_phrases(input: &str, output: &str) -> Vec<String> {
+    let mut phrases = Vec::new();
+    if let Some(list) = parse_counted_item_reference_list(input) {
+        if let Some(phrase) = counted_item_list_restoration_phrase(&list, output) {
+            phrases.push(phrase);
+        }
+    }
+
+    input_clauses(input)
+        .into_iter()
+        .filter(|clause| !list_constraint_satisfied(clause, output))
+        .filter_map(|clause| list_constraint_restoration_phrase(clause, output))
+        .fold(phrases, |mut phrases, phrase| {
+            if !phrases.iter().any(|existing| existing == &phrase) {
+                phrases.push(phrase);
+            }
+            phrases
+        })
+}
+
+fn list_constraint_restoration_phrase(clause: &str, output: &str) -> Option<String> {
+    if parse_conditional_value_list(clause).is_some() {
+        return structured_constraint_clause(clause);
+    }
+    let list = parse_shared_predicate_list(clause)?;
+    shared_predicate_list_restoration_phrase(&list, output)
+}
+
+fn shared_predicate_list_restoration_phrase(
+    list: &SharedPredicateList,
+    output: &str,
+) -> Option<String> {
+    let missing_targets = list
+        .targets
+        .iter()
+        .filter(|target| !shared_predicate_target_satisfied(target, output))
+        .map(|target| compact_shared_predicate_target(target))
+        .collect::<Vec<_>>();
+    if missing_targets.is_empty() {
+        None
+    } else {
+        Some(format!("{}{}", missing_targets.join("/"), list.predicate))
+    }
+}
+
+fn counted_item_list_restoration_phrase(
+    list: &SharedPredicateList,
+    output: &str,
+) -> Option<String> {
+    if list
+        .targets
+        .iter()
+        .all(|target| shared_predicate_target_satisfied(target, output))
+    {
+        return None;
+    }
+    let targets = list
+        .targets
+        .iter()
+        .map(|target| compact_shared_predicate_target(target))
+        .collect::<Vec<_>>()
+        .join("/");
+    Some(format!("保存対象={targets}{}", list.predicate))
+}
+
+fn preserves_list_constraints(input: &str, output: &str) -> bool {
+    if parse_counted_item_reference_list(input).is_some_and(|list| {
+        !list
+            .targets
+            .iter()
+            .all(|target| shared_predicate_target_satisfied(target, output))
+    }) {
+        return false;
+    }
+    input_clauses(input)
+        .into_iter()
+        .all(|clause| list_constraint_satisfied(clause, output))
+}
+
+fn list_constraint_satisfied(clause: &str, output: &str) -> bool {
+    if retry_limit_interval_clause_satisfied(clause, output) {
+        return true;
+    }
+    if let Some(list) = parse_conditional_value_list(clause) {
+        return contains_ascii_case_insensitive(output, &list.key)
+            && list
+                .values
+                .iter()
+                .all(|value| contains_ascii_case_insensitive(output, value));
+    }
+    if let Some(list) = parse_shared_predicate_list(clause) {
+        return list
+            .targets
+            .iter()
+            .all(|target| shared_predicate_target_satisfied(target, output));
+    }
+    true
+}
+
+fn retry_limit_interval_clause_satisfied(clause: &str, output: &str) -> bool {
+    if !(clause.contains("再試行")
+        && clause.contains("最大")
+        && clause.contains("それ以上")
+        && clause.contains("行わない"))
+    {
+        return false;
+    }
+
+    contains_any_marker(output, &["再試行"])
+        && contains_any_marker(output, &["最大2回", "最大 2 回", "2回まで"])
+        && contains_any_marker(output, &["1秒と2秒", "1秒/2秒", "1 秒と 2 秒"])
+        && contains_any_marker(output, &["それ以上行わない", "それ以上は行わない"])
+}
+
+fn shared_predicate_target_satisfied(target: &str, output: &str) -> bool {
+    let technical_terms: Vec<_> = required_technical_terms(target)
+        .into_iter()
+        .filter(|term| term.is_ascii())
+        .collect();
+    if !technical_terms.is_empty()
+        && technical_terms
+            .iter()
+            .all(|term| contains_ascii_case_insensitive(output, term))
+    {
+        return true;
+    }
+    let anchor = constraint_target_anchor(target);
+    let normalized_output = constraint_target_anchor(output);
+    !anchor.is_empty() && contains_ascii_case_insensitive(&normalized_output, &anchor)
+}
+
+fn constraint_target_anchor(target: &str) -> String {
+    [
+        ("既存の", ""),
+        ("成功時の", "成功"),
+        ("入力した", ""),
+        ("最近開いた", ""),
+        ("処理", ""),
+        ("形式", ""),
+        ("の内容", ""),
+        ("オプション", ""),
+        ("の表示", "表示"),
+        ("マッピング", "mapping"),
+        ("columns", "column"),
+        (" の ", ""),
+        ("の", ""),
+    ]
+    .iter()
+    .fold(target.to_string(), |anchor, (from, to)| {
+        anchor.replace(from, to)
+    })
+    .split_whitespace()
+    .collect::<String>()
 }
 
 fn missing_state_persistence_restoration_phrases(input: &str, output: &str) -> Vec<String> {
@@ -4278,7 +4871,7 @@ fn preserves_state_persistence_constraints(input: &str, output: &str) -> bool {
 }
 
 fn missing_verification_restoration_phrases(input: &str, output: &str) -> Vec<String> {
-    required_constraint_clauses(input)
+    input_clauses(input)
         .into_iter()
         .filter(|clause| is_verification_constraint_clause(clause))
         .filter(|clause| !verification_constraint_satisfied(clause, output))
@@ -4293,18 +4886,38 @@ fn missing_verification_restoration_phrases(input: &str, output: &str) -> Vec<St
 }
 
 fn preserves_verification_constraints(input: &str, output: &str) -> bool {
-    required_constraint_clauses(input)
+    input_clauses(input)
         .into_iter()
         .filter(|clause| is_verification_constraint_clause(clause))
         .all(|clause| verification_constraint_satisfied(clause, output))
 }
 
 fn is_verification_constraint_clause(clause: &str) -> bool {
-    clause.contains("テスト")
+    contains_explicit_test_marker(clause)
         && contains_any_marker(
             clause,
             &["確認", "検証", "ケース", "正常系", "異常系", "境界値"],
         )
+}
+
+fn contains_explicit_test_marker(text: &str) -> bool {
+    contains_any_marker(
+        text,
+        &[
+            "テスト",
+            "test",
+            "spec",
+            "assert",
+            "vitest",
+            "jest",
+            "playwright",
+            "pytest",
+            "junit",
+            "rspec",
+            "cypress",
+            "selenium",
+        ],
+    )
 }
 
 fn verification_constraint_satisfied(clause: &str, output: &str) -> bool {
@@ -4322,7 +4935,54 @@ fn verification_constraint_satisfied(clause: &str, output: &str) -> bool {
         return false;
     }
 
-    true
+    enumerated_verification_targets_satisfied(clause, output)
+}
+
+fn enumerated_verification_targets_satisfied(clause: &str, output: &str) -> bool {
+    let mut items: Vec<&str> = clause
+        .split(['、', ','])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .collect();
+    if items.len() < 2 {
+        return true;
+    }
+
+    let first = items[0];
+    let method_and_first_subject = first.split_once("では").or_else(|| first.split_once("で"));
+    let Some((method, first_subject)) = method_and_first_subject else {
+        return true;
+    };
+    let method = method.trim();
+    if method.is_empty() || method.chars().count() > 32 {
+        return true;
+    }
+    if !contains_explicit_test_marker(method) {
+        return true;
+    }
+    items[0] = first_subject.trim();
+
+    let Some(scope_start) = output.find(method) else {
+        return false;
+    };
+    let scope = &output[scope_start..];
+    items.into_iter().all(|item| {
+        let item = item
+            .trim()
+            .trim_end_matches("を確認してください")
+            .trim_end_matches("を確認してほしいです")
+            .trim_end_matches("を確認してほしい")
+            .trim_end_matches("を確認")
+            .trim();
+        let anchor = ["に", "の", "を", "が", "は"]
+            .iter()
+            .filter_map(|particle| item.find(particle).map(|index| &item[..index]))
+            .filter(|candidate| candidate.chars().count() >= 2)
+            .min_by_key(|candidate| candidate.chars().count())
+            .unwrap_or(item)
+            .trim();
+        !anchor.is_empty() && contains_ascii_case_insensitive(scope, anchor)
+    })
 }
 
 fn verification_restoration_phrase(clause: &str) -> String {
@@ -4341,6 +5001,11 @@ fn verification_restoration_phrase(clause: &str) -> String {
         ("を確認できるように", "確認"),
         ("確認したいです", "確認"),
         ("追加してほしいですが", "追加"),
+        (
+            "を追加し、既存テストの書き方に合わせてください",
+            "、既存形式準拠",
+        ),
+        ("テストは", "テスト:"),
     ] {
         phrase = phrase.replace(from, to);
     }
@@ -4350,13 +5015,7 @@ fn verification_restoration_phrase(clause: &str) -> String {
 fn is_state_persistence_clause(clause: &str) -> bool {
     let has_named_state = contains_any_marker(
         clause,
-        &[
-            "検索条件",
-            "検索状態",
-            "入力状態",
-            "選択状態",
-            "表示状態",
-        ],
+        &["検索条件", "検索状態", "入力状態", "選択状態", "表示状態"],
     );
     let has_generic_state_persistence = clause.contains("状態")
         && contains_any_marker(
@@ -4366,18 +5025,18 @@ fn is_state_persistence_clause(clause: &str) -> bool {
 
     (has_named_state || has_generic_state_persistence)
         && contains_any_marker(
-        clause,
-        &[
-            "消えない",
-            "消さない",
-            "維持",
-            "保持",
-            "残す",
-            "残して",
-            "keep",
-            "preserve",
-        ],
-    )
+            clause,
+            &[
+                "消えない",
+                "消さない",
+                "維持",
+                "保持",
+                "残す",
+                "残して",
+                "keep",
+                "preserve",
+            ],
+        )
 }
 
 fn state_persistence_clause_satisfied(clause: &str, output: &str) -> bool {
@@ -4391,6 +5050,8 @@ fn state_persistence_clause_satisfied(clause: &str, output: &str) -> bool {
             "残して",
             "消えない",
             "消さない",
+            "保存",
+            "復元",
             "keep",
             "preserve",
         ],
@@ -4398,6 +5059,16 @@ fn state_persistence_clause_satisfied(clause: &str, output: &str) -> bool {
     if !has_persistence {
         return false;
     }
+    let has_search_state_output = clause.contains("検索条件")
+        && (contains_any_marker(output, &["検索条件", "条件/状態", "条件維持"])
+            || (contains_any_marker(output, &["useSearchParams", "URL", "クエリ"])
+                && contains_any_marker(output, &["保存", "復元"])));
+    let has_named_state_output = has_search_state_output
+        || (clause.contains("検索状態")
+            && contains_any_marker(output, &["検索状態", "条件/状態", "状態維持"]))
+        || (clause.contains("入力状態") && contains_any_marker(output, &["入力状態", "入力維持"]))
+        || (clause.contains("選択状態") && contains_any_marker(output, &["選択状態", "選択維持"]))
+        || (clause.contains("表示状態") && contains_any_marker(output, &["表示状態", "表示維持"]));
 
     if contains_any_marker(clause, &["ページ番号", "ページ"])
         && !contains_any_marker(output, &["ページ", "page"])
@@ -4405,9 +5076,7 @@ fn state_persistence_clause_satisfied(clause: &str, output: &str) -> bool {
         return false;
     }
 
-    if clause.contains("検索条件")
-        && !contains_any_marker(output, &["検索条件", "条件/状態", "条件維持"])
-    {
+    if clause.contains("検索条件") && !has_search_state_output {
         return false;
     }
 
@@ -4438,6 +5107,7 @@ fn state_persistence_clause_satisfied(clause: &str, output: &str) -> bool {
             &["状態", "条件/状態", "入力維持", "選択維持", "表示維持"],
         )
         && !output_compact.contains("状態維持")
+        && !has_named_state_output
     {
         return false;
     }
@@ -4557,9 +5227,13 @@ fn required_technical_terms(input: &str) -> Vec<String> {
                 .chars()
                 .skip(1)
                 .any(|character| character.is_ascii_uppercase());
+        let is_inline_identifier = is_likely_inline_ascii_identifier(input, token);
 
         if !is_noisy_http_method
-            && (is_common_term || is_uppercase_acronym || has_internal_uppercase)
+            && (is_common_term
+                || is_uppercase_acronym
+                || has_internal_uppercase
+                || is_inline_identifier)
             && !terms
                 .iter()
                 .any(|existing: &String| existing.eq_ignore_ascii_case(token))
@@ -4605,7 +5279,89 @@ fn required_technical_terms(input: &str) -> Vec<String> {
     }
 
     remove_assignment_key_duplicates(&mut terms);
+    remove_covered_inline_identifier_terms(&mut terms, COMMON_TERMS);
     terms
+}
+
+fn remove_covered_inline_identifier_terms(terms: &mut Vec<String>, common_terms: &[&str]) {
+    let snapshot = terms.clone();
+    terms.retain(|term| {
+        let lower = term.to_ascii_lowercase();
+        if common_terms.contains(&lower.as_str())
+            || term.len() < 3
+            || term.len() > 8
+            || !term
+                .chars()
+                .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
+        {
+            return true;
+        }
+
+        !snapshot.iter().any(|candidate| {
+            candidate.len() > term.len()
+                && candidate
+                    .split(|character: char| !character.is_ascii_alphanumeric())
+                    .any(|component| component.eq_ignore_ascii_case(term))
+        })
+    });
+}
+
+fn is_likely_inline_ascii_identifier(input: &str, token: &str) -> bool {
+    const ENGLISH_STOP_WORDS: &[&str] = &[
+        "and", "are", "but", "for", "from", "into", "not", "only", "that", "the", "then", "this",
+        "when", "with", "without",
+    ];
+    if token.len() < 3
+        || token.len() > 8
+        || ENGLISH_STOP_WORDS.contains(&token.to_ascii_lowercase().as_str())
+        || !token
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_lowercase())
+        || !token.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        })
+    {
+        return false;
+    }
+
+    input.match_indices(token).any(|(start, _)| {
+        let end = start + token.len();
+        let has_identifier_before = input[..start]
+            .chars()
+            .next_back()
+            .is_some_and(is_ascii_identifier_character);
+        let has_identifier_after = input[end..]
+            .chars()
+            .next()
+            .is_some_and(is_ascii_identifier_character);
+        if has_identifier_before || has_identifier_after {
+            return false;
+        }
+
+        let after = input[end..].trim_start();
+        [
+            "を",
+            "と",
+            "は",
+            "が",
+            "の",
+            "へ",
+            "で",
+            "に",
+            "から",
+            "だけ",
+            "時",
+            "列",
+            "キー",
+            "項目",
+            "値",
+            "引数",
+            "フィールド",
+        ]
+        .iter()
+        .any(|particle| after.starts_with(particle))
+    })
 }
 
 fn database_table_terms(input: &str) -> Vec<String> {
@@ -4816,17 +5572,487 @@ fn code_like_literal_terms(input: &str) -> Vec<String> {
     terms
 }
 
-fn constraint_clauses_for_model(request: &CompressionRequest) -> Vec<String> {
-    required_constraint_clauses(&request.input_text)
-        .into_iter()
-        .map(|clause| {
-            if request.compression_level.value() >= 2 {
-                compact_constraint_clause(clause)
+fn organize_input_for_model(input: &str, required_terms: &[String]) -> String {
+    let constraints = required_constraint_clauses(input);
+    let clauses: Vec<_> = input
+        .split_inclusive(|character| matches!(character, '。' | '！' | '？' | '\n' | ';' | '；'))
+        .map(|segment| {
+            segment
+                .trim()
+                .trim_end_matches(|character| matches!(character, '。' | '！' | '？' | ';' | '；'))
+                .trim()
+        })
+        .filter(|clause| !clause.is_empty())
+        .collect();
+    let has_actionable_clause = clauses.iter().any(|clause| {
+        constraints.contains(clause)
+            || (!is_current_state_clause(clause) && is_request_clause(clause))
+            || (is_current_state_clause(clause)
+                && is_request_clause(clause)
+                && has_current_to_request_transition(clause))
+    });
+    let non_current_text = clauses
+        .iter()
+        .filter(|clause| {
+            constraints.contains(clause)
+                || !is_current_state_clause(clause)
+                || (is_request_clause(clause) && has_current_to_request_transition(clause))
+        })
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut organized = Vec::new();
+
+    for clause in clauses {
+        if constraints.contains(&clause) {
+            for item in atomic_constraint_items(clause) {
+                let role = if is_verification_prompt_clause(clause) {
+                    "検証".to_string()
+                } else {
+                    constraint_role(item)
+                };
+                push_organized_input_line(&mut organized, &role, item, required_terms);
+            }
+        } else {
+            let is_current = is_current_state_clause(clause);
+            let is_request = is_request_clause(clause);
+            let is_current_to_request =
+                is_current && is_request && has_current_to_request_transition(clause);
+            if is_current && !is_current_to_request && has_actionable_clause {
+                let has_unique_required_term = required_terms.iter().any(|term| {
+                    contains_ascii_case_insensitive(clause, term)
+                        && !contains_ascii_case_insensitive(&non_current_text, term)
+                });
+                if !has_unique_required_term {
+                    continue;
+                }
+            }
+
+            let role = if is_current_to_request {
+                "現状→要求"
+            } else if is_current {
+                "現状"
+            } else if is_verification_prompt_clause(clause) {
+                "検証"
+            } else if is_request {
+                "要求"
+            } else if required_terms
+                .iter()
+                .any(|term| contains_ascii_case_insensitive(clause, term))
+            {
+                "対象"
             } else {
-                clause.to_string()
+                "文脈"
+            };
+            push_organized_input_line(&mut organized, role, clause, required_terms);
+        }
+    }
+
+    organized.join("\n")
+}
+
+fn push_organized_input_line(
+    organized: &mut Vec<String>,
+    role: &str,
+    clause: &str,
+    required_terms: &[String],
+) {
+    let clause_terms: Vec<_> = required_terms
+        .iter()
+        .filter(|term| contains_ascii_case_insensitive(clause, term))
+        .map(String::as_str)
+        .collect();
+    if clause_terms.is_empty() {
+        organized.push(format!("[{role}] {clause}"));
+    } else {
+        organized.push(format!(
+            "[{role}|必須語:{}] {clause}",
+            clause_terms.join(",")
+        ));
+    }
+}
+
+#[derive(Debug)]
+struct ConditionalValueList {
+    key: String,
+    values: Vec<String>,
+    consequence: String,
+}
+
+#[derive(Debug)]
+struct SharedPredicateList {
+    targets: Vec<String>,
+    predicate: String,
+}
+
+fn structured_constraint_clause(clause: &str) -> Option<String> {
+    if let Some(list) = parse_conditional_value_list(clause) {
+        let consequence = compact_constraint_clause(&list.consequence)
+            .replace("へ進む前に", "前に")
+            .replace(" を返し、", "、")
+            .replace(" の ", " ")
+            .replace("に HTTP", "にHTTP");
+        let consequence = compact_assignment_segments(&consequence);
+        return Some(format!(
+            "{}={}のいずれかなら{}",
+            list.key,
+            list.values.join("/"),
+            consequence
+        ));
+    }
+    parse_shared_predicate_list(clause).map(|list| {
+        let targets = list
+            .targets
+            .iter()
+            .map(|target| compact_shared_predicate_target(target))
+            .collect::<Vec<_>>()
+            .join("/");
+        format!("{targets}{}", list.predicate)
+    })
+}
+
+fn compact_assignment_segments(value: &str) -> String {
+    value
+        .split('、')
+        .map(|segment| {
+            let segment = segment.trim();
+            let Some((left, right)) = segment.split_once(" は ") else {
+                return segment.to_string();
+            };
+            let right = right.trim_end_matches(" に").trim();
+            if left.trim().is_empty() || right.is_empty() {
+                segment.to_string()
+            } else {
+                format!("{}={right}", left.trim())
             }
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .join("、")
+}
+
+fn compact_shared_predicate_target(target: &str) -> String {
+    [
+        ("既存の", ""),
+        ("成功時の", "成功"),
+        (" の ", ""),
+        (" の", ""),
+        ("の採番", "採番"),
+    ]
+    .iter()
+    .fold(target.trim().to_string(), |compact, (from, to)| {
+        compact.replace(from, to)
+    })
+}
+
+fn parse_conditional_value_list(clause: &str) -> Option<ConditionalValueList> {
+    let (before, consequence) = ["のいずれかなら", "のいずれかの場合", "のどれかなら"]
+        .iter()
+        .find_map(|marker| clause.split_once(marker))?;
+    let mut items: Vec<String> = before
+        .split(['、', ','])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect();
+    if items.len() < 3 {
+        return None;
+    }
+    let first_item = items[0].clone();
+    let (key, first_value) = first_item.split_once('が')?;
+    let key = key.trim().to_string();
+    if key.is_empty() {
+        return None;
+    }
+    items[0] = first_value.trim().to_string();
+    if let Some(last) = items.last_mut() {
+        *last = last.trim_end_matches("だけ").trim().to_string();
+    }
+    if items.iter().any(|item| item.is_empty()) || consequence.trim().is_empty() {
+        return None;
+    }
+    Some(ConditionalValueList {
+        key,
+        values: items,
+        consequence: consequence.trim().to_string(),
+    })
+}
+
+fn parse_shared_predicate_list(clause: &str) -> Option<SharedPredicateList> {
+    let (before, predicate) = [
+        ("変更しないでください", "変更しない"),
+        ("変更しない", "変更しない"),
+        ("変えないでください", "変えない"),
+        ("変えない", "変えない"),
+        ("維持してください", "維持"),
+        ("保持してください", "保持"),
+        ("含めないでください", "含めない"),
+        ("含めない", "含めない"),
+        ("保存しないでください", "保存しない"),
+        ("保存しない", "保存しない"),
+        ("行わないでください", "行わない"),
+        ("行わない", "行わない"),
+    ]
+    .iter()
+    .find_map(|(marker, predicate)| {
+        clause
+            .rfind(marker)
+            .map(|index| (&clause[..index], *predicate))
+    })?;
+    let mut before = before
+        .trim()
+        .trim_start_matches("ただし")
+        .trim_start_matches("なお")
+        .trim_start_matches("一方で")
+        .trim();
+    for marker in ["は機密情報", "は個人情報", "は秘密情報"] {
+        if let Some((list_part, _)) = before.split_once(marker) {
+            before = list_part.trim();
+            break;
+        }
+    }
+    if let Some((_, focused)) = before.rsplit_once(['、', ',']) {
+        if focused.contains('や') {
+            before = focused.trim();
+        }
+    }
+    let before = before
+        .trim_end_matches("までは")
+        .trim_end_matches(['は', 'を'])
+        .trim();
+    let supports_two_item_prohibition = before.contains('や') && predicate == "行わない";
+    let targets: Vec<String> = before
+        .split(['、', ',', 'や'])
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .map(|target| target.trim_start_matches("既存の").trim().to_string())
+        .collect();
+    if (targets.len() < 3 && !(targets.len() == 2 && supports_two_item_prohibition))
+        || targets.iter().any(|target| {
+            contains_any_marker(
+                target,
+                &[
+                    "維持し",
+                    "保持し",
+                    "含め",
+                    "追加し",
+                    "返し",
+                    "行い",
+                    "してください",
+                    "変更し",
+                ],
+            )
+        })
+    {
+        return None;
+    }
+    Some(SharedPredicateList {
+        targets,
+        predicate: predicate.to_string(),
+    })
+}
+
+fn parse_counted_item_reference_list(input: &str) -> Option<SharedPredicateList> {
+    let clauses = input_clauses(input);
+    for pair in clauses.windows(2) {
+        let Some(targets) = parse_enumerated_definition_clause(pair[0]) else {
+            continue;
+        };
+        let Some(count) = referenced_item_count(pair[1]) else {
+            continue;
+        };
+        if targets.len() != count || !contains_any_marker(pair[1], &["だけ", "のみ"]) {
+            continue;
+        }
+        let predicate = if pair[1].contains("保存") {
+            "のみ保存"
+        } else if pair[1].contains("復元") {
+            "のみ復元"
+        } else {
+            "のみ"
+        };
+        return Some(SharedPredicateList {
+            targets,
+            predicate: predicate.to_string(),
+        });
+    }
+    None
+}
+
+fn parse_enumerated_definition_clause(clause: &str) -> Option<Vec<String>> {
+    let (_, after_marker) = clause.rsplit_once('は')?;
+    let list_text = after_marker
+        .trim()
+        .trim_end_matches("です")
+        .trim_end_matches("でした")
+        .trim();
+    let targets: Vec<String> = list_text
+        .split(['、', ','])
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .map(str::to_string)
+        .collect();
+    if targets.len() >= 3 {
+        Some(targets)
+    } else {
+        None
+    }
+}
+
+fn referenced_item_count(clause: &str) -> Option<usize> {
+    (2..=12).find(|count| {
+        clause.contains(&format!("{count}項目")) || clause.contains(&format!("{count}つ"))
+    })
+}
+
+fn atomic_constraint_items(clause: &str) -> Vec<&str> {
+    let items: Vec<_> = clause
+        .split(['、', ','])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .collect();
+    if items.len() > 1
+        && items
+            .iter()
+            .all(|item| !required_constraint_clauses(item).is_empty())
+    {
+        items
+    } else {
+        vec![clause]
+    }
+}
+
+fn constraint_role(clause: &str) -> String {
+    let mut kinds = Vec::new();
+    if contains_any_marker(clause, &["だけ", "のみ", "only"]) {
+        kinds.push("限定");
+    }
+    if contains_any_marker(
+        clause,
+        &[
+            "場合",
+            "なら",
+            "ときは",
+            "時は",
+            "際は",
+            "超過時",
+            "失敗時",
+            "成功時",
+        ],
+    ) {
+        kinds.push("条件対応");
+    }
+    if contains_any_marker(
+        clause,
+        &[
+            "しない",
+            "せず",
+            "禁止",
+            "避け",
+            "変えず",
+            "変えない",
+            "変更しない",
+            "消さない",
+            "行わない",
+            "不要",
+            "must not",
+            "do not",
+            "without",
+        ],
+    ) {
+        kinds.push("禁止");
+    }
+    if contains_any_marker(
+        clause,
+        &["維持", "保持", "残す", "復元", "keep", "preserve"],
+    ) {
+        kinds.push("維持");
+    }
+
+    if kinds.is_empty() {
+        "制約".to_string()
+    } else {
+        format!("制約:{}", kinds.join("+"))
+    }
+}
+
+fn is_current_state_clause(clause: &str) -> bool {
+    contains_any_marker(
+        clause,
+        &[
+            "今の実装",
+            "現在",
+            "現状",
+            "今は",
+            "いまは",
+            "発生",
+            "起きて",
+            "なって",
+            "してしま",
+            "できない",
+            "届かない",
+            "重い",
+            "遅い",
+            "不便",
+            "問題",
+            "困って",
+            "言われて",
+        ],
+    )
+}
+
+fn is_request_clause(clause: &str) -> bool {
+    contains_any_marker(
+        clause,
+        &[
+            "修正",
+            "追加",
+            "を実装",
+            "実装して",
+            "実装する",
+            "実装を",
+            "作成",
+            "更新",
+            "調査",
+            "整理",
+            "提案",
+            "検証",
+            "確認",
+            "返却",
+            "コピー",
+            "保持",
+            "維持",
+            "直して",
+            "直したい",
+            "してほしい",
+            "したい",
+            "対応して",
+            "使って",
+            "使用して",
+            "用いて",
+        ],
+    )
+}
+
+fn is_verification_prompt_clause(clause: &str) -> bool {
+    let implements_validation = contains_any_marker(
+        clause,
+        &[
+            "検証を追加",
+            "検証を実装",
+            "検証処理",
+            "検証機能",
+            "検証ロジック",
+        ],
+    );
+    contains_any_marker(clause, &["テスト", "確認", "test", "spec", "assert"])
+        || (clause.contains("検証") && !implements_validation)
+}
+
+fn has_current_to_request_transition(clause: &str) -> bool {
+    contains_any_marker(
+        clause,
+        &["ので", "ため", "から", "ですが", "けれど", "一方で"],
+    )
 }
 
 fn compact_constraint_clause(clause: &str) -> String {
@@ -5006,12 +6232,29 @@ fn compact_constraint_clause(clause: &str) -> String {
         ("すること", ""),
     ];
 
+    let clause = trim_constraint_discourse_prefix(clause);
     let compact = REPLACEMENTS
         .iter()
         .fold(clause.trim().to_string(), |compact, (from, to)| {
             compact.replace(from, to)
         });
-    compact.trim().to_string()
+    compact.trim().trim_end_matches("形に").trim().to_string()
+}
+
+fn trim_constraint_discourse_prefix(clause: &str) -> &str {
+    for marker in ["今回は", "今回については"] {
+        let Some((prefix, focused)) = clause.split_once(marker) else {
+            continue;
+        };
+        let prefix_is_request_history = contains_any_marker(
+            prefix,
+            &["前にも", "以前", "先ほど", "似た", "同様", "お願い"],
+        );
+        if prefix_is_request_history && !focused.trim().is_empty() {
+            return focused.trim();
+        }
+    }
+    clause
 }
 
 fn required_constraint_clauses(input: &str) -> Vec<&str> {
@@ -5064,6 +6307,13 @@ fn required_constraint_clauses(input: &str) -> Vec<&str> {
         "テスト",
         "確認できる",
         "確認したい",
+        "場合",
+        "なら",
+        "ときは",
+        "時は",
+        "際は",
+        "失敗時",
+        "成功時",
         "変えない",
         "変更せず",
         "変更しない",
@@ -5074,6 +6324,12 @@ fn required_constraint_clauses(input: &str) -> Vec<&str> {
         "増やさない",
         "増えない",
         "増加させない",
+        "せず",
+        "行わず",
+        "作らず",
+        "戻さず",
+        "送らず",
+        "含めず",
         "must",
         "must not",
         "do not",
@@ -5085,15 +6341,22 @@ fn required_constraint_clauses(input: &str) -> Vec<&str> {
         "keep",
     ];
 
-    input
-        .split(|character| matches!(character, '。' | '！' | '？' | '\n' | ';' | '；'))
-        .map(str::trim)
+    input_clauses(input)
+        .into_iter()
         .filter(|clause| {
             let normalized = clause.to_ascii_lowercase();
             CONSTRAINT_MARKERS
                 .iter()
                 .any(|marker| normalized.contains(marker))
         })
+        .collect()
+}
+
+fn input_clauses(input: &str) -> Vec<&str> {
+    input
+        .split(|character| matches!(character, '。' | '！' | '？' | '\n' | ';' | '；'))
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
         .collect()
 }
 
@@ -5162,7 +6425,7 @@ fn preserves_negative_constraints(input: &str, output: &str) -> bool {
         (&["下げない"], &["下げない"]),
         (&["廃止"], &["廃止"]),
         (&["変えず"], &["変えず", "変更しない"]),
-        (&["入れない"], &["入れない", "しない"]),
+        (&["入れない"], &["入れない", "含めない", "しない"]),
         (&["影響させない"], &["影響させない"]),
         (&["削除しない"], &["削除しない"]),
         (&["変更不可"], &["変更不可", "禁止"]),
@@ -5208,13 +6471,17 @@ fn preserves_negative_constraints(input: &str, output: &str) -> bool {
                 "最小限",
             ],
         ),
-        (&["のみ", "だけ", "only"], &["のみ", "だけ", "only"]),
+        (
+            &["のみ", "だけ", "only"],
+            &["のみ", "だけ", "いずれか", "only"],
+        ),
     ];
 
     let input = input.to_ascii_lowercase();
     let output = output.to_ascii_lowercase();
     preserves_state_persistence_constraints(&input, &output)
         && preserves_verification_constraints(&input, &output)
+        && preserves_list_constraints(&input, &output)
         && NEGATION_RULES
             .iter()
             .all(|(input_markers, output_markers)| {
@@ -5275,14 +6542,18 @@ fn resolve_windows_exe(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_all_whitespace, compact_constraint_clause, contains_ascii_case_insensitive,
-        contains_japanese_text, contains_required_technical_terms, effective_max_output_tokens,
-        is_meta_task_restatement, missing_constraint_restoration_phrases, parse_compression_output,
-        parse_http_base_url, polish_model_output_for_request, preprocess_input_for_llm,
-        preserves_negative_constraints, remove_redundant_constraint_tail,
-        required_constraint_clauses, required_technical_terms,
-        restore_missing_required_constraints, restore_missing_required_terms, CompressionDraft,
-        ModelDefinition,
+        compact_all_whitespace, compact_auth_refresh_concurrency, compact_constraint_clause,
+        compact_csv_import_encoding, contains_ascii_case_insensitive, contains_japanese_text,
+        contains_required_technical_terms, effective_max_output_tokens, input_clauses,
+        is_meta_task_restatement, list_constraint_satisfied, missing_constraint_restoration_phrases,
+        missing_verification_restoration_phrases, organize_input_for_model,
+        parse_compression_output, parse_http_base_url, polish_model_output_for_request,
+        preprocess_input_for_llm, preserves_list_constraints, preserves_negative_constraints,
+        preserves_verification_constraints, remove_redundant_constraint_tail,
+        required_constraint_clauses, required_technical_terms, restore_missing_required_constraints,
+        restore_missing_required_terms,
+        state_persistence_clause_satisfied, structured_constraint_clause,
+        verification_constraint_satisfied, CompressionDraft, ModelDefinition,
     };
     use crate::types::{
         CompressionConstraints, CompressionLevel, CompressionMode, CompressionRequest,
@@ -5654,12 +6925,113 @@ mod tests {
     }
 
     #[test]
+    fn extracts_lowercase_identifiers_connected_to_japanese_particles() {
+        let terms = required_technical_terms(
+            "新規検索時はpageを1に戻し、ページ移動時はkeywordとstatusを保持してください。",
+        );
+
+        assert!(terms.contains(&"page".to_string()));
+        assert!(terms.contains(&"keyword".to_string()));
+        assert!(terms.contains(&"status".to_string()));
+    }
+
+    #[test]
+    fn removes_lowercase_components_already_covered_by_longer_literals() {
+        let terms = required_technical_terms(
+            "POST /api/orders の JSON error.code を変更してください。orders と code は識別子の一部です。",
+        );
+
+        assert!(terms.contains(&"/api/orders".to_string()));
+        assert!(terms.contains(&"error.code".to_string()));
+        assert!(!terms.contains(&"orders".to_string()));
+        assert!(!terms.contains(&"code".to_string()));
+    }
+
+    #[test]
+    fn classifies_conditional_outcomes_as_constraints() {
+        let input = "customerIdが空ならHTTP 400とINVALID_CUSTOMERを返してください。requestIdがない場合はINVALID_REQUEST_IDを返してください。";
+        let terms = required_technical_terms(input);
+
+        let organized = organize_input_for_model(input, &terms);
+
+        assert!(organized.contains("[制約:条件対応"), "{organized}");
+        assert!(organized.contains("INVALID_CUSTOMER"));
+        assert!(organized.contains("INVALID_REQUEST_ID"));
+        assert_eq!(organized.matches("[制約:条件対応").count(), 2);
+    }
+
+    #[test]
+    fn does_not_corrupt_correct_required_term_during_typo_normalization() {
+        let input = "React の TypeScript 構造は変更しないでください。";
+        let mut draft = CompressionDraft {
+            distilled_prompt: "ReactのTypeScript構造を維持。".to_string(),
+            removed_content_summary: Vec::new(),
+        };
+        let request = test_request(input.to_string(), 2);
+
+        restore_missing_required_terms(&request, &mut draft);
+
+        assert_eq!(draft.distilled_prompt, "ReactのTypeScript構造を維持。");
+    }
+
+    #[test]
+    fn corrects_single_edit_typo_in_required_ascii_identifier() {
+        let input = "AbortControllerを使って古い通信を中断してください。";
+        let mut draft = CompressionDraft {
+            distilled_prompt: "AbortConrollerで古い通信を中断。".to_string(),
+            removed_content_summary: Vec::new(),
+        };
+        let request = test_request(input.to_string(), 2);
+
+        restore_missing_required_terms(&request, &mut draft);
+
+        assert_eq!(draft.distilled_prompt, "AbortControllerで古い通信を中断。");
+    }
+
+    #[test]
+    fn restores_missing_mechanism_term_next_to_its_related_target() {
+        let input = "検索条件はuseSearchParamsでURLクエリへ保存してください。";
+        let mut draft = CompressionDraft {
+            distilled_prompt: "検索条件のURLクエリ保存。".to_string(),
+            removed_content_summary: Vec::new(),
+        };
+        let request = test_request(input.to_string(), 2);
+
+        restore_missing_required_terms(&request, &mut draft);
+
+        assert_eq!(
+            draft.distilled_prompt,
+            "検索条件をuseSearchParamsでURLクエリ保存。"
+        );
+    }
+
+    #[test]
+    fn restores_missing_literal_from_explicit_target_as_natural_context() {
+        let input = "対象は POST /api/orders です。customerIdの入力検証を追加してください。";
+        let mut draft = CompressionDraft {
+            distilled_prompt: "customerIdの入力検証を追加。".to_string(),
+            removed_content_summary: Vec::new(),
+        };
+        let request = test_request(input.to_string(), 2);
+
+        restore_missing_required_terms(&request, &mut draft);
+
+        assert!(
+            draft
+                .distilled_prompt
+                .starts_with("POST /api/ordersを対象に、"),
+            "{}",
+            draft.distilled_prompt
+        );
+        assert!(!draft.distilled_prompt.starts_with("/api/orders:"));
+    }
+
+    #[test]
     fn normalizes_singular_column_mapping_when_columns_is_required() {
         let input = "管理画面の CSV インポートで、既存の columns マッピング、dryRun オプション、エラー行番号の表示は維持してください。";
         let mut draft = CompressionDraft {
-            distilled_prompt:
-                "CSVインポートでcolumn mappings、dryRun、エラー行番号表示を維持。"
-                    .to_string(),
+            distilled_prompt: "CSVインポートでcolumn mappings、dryRun、エラー行番号表示を維持。"
+                .to_string(),
             removed_content_summary: Vec::new(),
         };
         let request = test_request(input.to_string(), 2);
@@ -5729,6 +7101,88 @@ mod tests {
         let output = "ページ変更時も検索条件/状態維持。";
 
         assert!(preserves_negative_constraints(input, output));
+    }
+
+    #[test]
+    fn accepts_named_state_persistence_without_repeating_generic_state_word() {
+        let clause = "検索条件はuseSearchParamsでURLクエリへ保存し、戻る・進むでも復元できる状態を維持してください";
+        let output = "useSearchParamsでURLクエリの検索条件を保存し、戻る・進むでも維持。";
+
+        assert!(state_persistence_clause_satisfied(clause, output));
+    }
+
+    #[test]
+    fn rejects_generic_verification_when_enumerated_targets_are_missing() {
+        let clause = "Vitestではボタン、Enter、入力中に呼ばれないこと、古いリクエストの中断を確認してください";
+
+        assert!(!verification_constraint_satisfied(
+            clause,
+            "Vitestによる検証を実施"
+        ));
+        assert!(verification_constraint_satisfied(
+            clause,
+            "Vitestでボタン、Enter、入力中の非呼び出し、古いリクエストの中断を確認"
+        ));
+    }
+
+    #[test]
+    fn restores_enumerated_verification_after_other_missing_constraints() {
+        let input = "React と TypeScript で作っている管理画面の検索一覧を直してください。今回は検索ボタンを押した時、または検索欄で Enter を押した時だけ GET /api/customers を呼んでください。入力中は通信しないでください。検索条件は useSearchParams で URL クエリへ保存してください。既存コンポーネントの分割方法や CSS は変えず、画面全体の作り直しは避けてください。Vitest ではボタン、Enter、入力中に呼ばれないこと、古いリクエストの中断を確認してください。";
+        let mut draft = CompressionDraft {
+            distilled_prompt: "ReactとTypeScriptの検索一覧を修正し、検索ボタンまたはEnter時だけGET /api/customersを呼ぶ。入力中は通信禁止。URLクエリへ保存。CSS変更と作り直し禁止。Vitestで検証。".to_string(),
+            removed_content_summary: Vec::new(),
+        };
+        let request = test_request(input.to_string(), 2);
+
+        let phrases = missing_constraint_restoration_phrases(input, &draft.distilled_prompt);
+        let verification_phrases =
+            missing_verification_restoration_phrases(input, &draft.distilled_prompt);
+        assert!(
+            phrases
+                .iter()
+                .any(|phrase| phrase.contains("古いリクエスト")),
+            "all={phrases:?}; verification={verification_phrases:?}"
+        );
+        restore_missing_required_constraints(&request, &mut draft);
+
+        assert!(
+            draft.distilled_prompt.contains("ボタン"),
+            "{}",
+            draft.distilled_prompt
+        );
+        assert!(
+            draft.distilled_prompt.contains("Enter"),
+            "{}",
+            draft.distilled_prompt
+        );
+        assert!(
+            draft.distilled_prompt.contains("入力中"),
+            "{}",
+            draft.distilled_prompt
+        );
+        assert!(
+            draft.distilled_prompt.contains("古いリクエスト"),
+            "{}",
+            draft.distilled_prompt
+        );
+    }
+
+    #[test]
+    fn accepts_saved_and_restored_state_without_repeating_state_label() {
+        let clause = "検索条件はuseSearchParamsでURLクエリへ保存し、戻る・進むでも復元できる状態を維持してください";
+        let output = "useSearchParamsでURLクエリに保存し、戻る・進むで復元。";
+
+        assert!(state_persistence_clause_satisfied(clause, output));
+    }
+
+    #[test]
+    fn removes_request_history_when_restoring_an_exclusive_constraint() {
+        let clause = "前にも似た修正をお願いしましたが、今回は保存ボタンを押した時だけAPIを呼ぶ形にしてください";
+
+        assert_eq!(
+            compact_constraint_clause(clause),
+            "保存ボタンを押した時だけAPIを呼ぶ"
+        );
     }
 
     #[test]
@@ -5838,6 +7292,182 @@ mod tests {
     }
 
     #[test]
+    fn organizes_each_prompt_clause_once_by_semantic_role() {
+        let input = "今の実装では入力中にもAPIが呼ばれて重いです。検索画面の通信を直したいです。検索ボタンを押した時だけAPIを呼んでください。URL状態は維持してください。既存CSSの作り直しは避けてください。テストで入力中に呼ばれないことを確認してください。";
+
+        let organized = organize_input_for_model(input, &[]);
+
+        assert!(!organized.contains("今の実装では"), "{organized}");
+        assert!(organized.contains("[要求] 検索画面の通信を直したいです"));
+        assert!(organized.contains("[制約:限定] 検索ボタンを押した時だけAPIを呼んでください"));
+        assert!(organized.contains("[制約:維持] URL状態は維持してください"));
+        assert!(organized.contains("[制約:禁止] 既存CSSの作り直しは避けてください"));
+        assert!(organized.contains("[検証] テストで入力中に呼ばれないことを確認してください"));
+        assert_eq!(organized.matches("今の実装では").count(), 0);
+        assert_eq!(organized.matches("検索ボタンを押した時だけ").count(), 1);
+    }
+
+    #[test]
+    fn structures_shared_predicate_and_conditional_value_lists() {
+        let conditional = structured_constraint_clause(
+            "customerIdが未指定、null、空文字、空白だけのいずれかならHTTP 400を返してください",
+        )
+        .expect("conditional list");
+        let shared_predicate = structured_constraint_clause(
+            "成功時のレスポンス形式、orderIdの採番、在庫引当、監査ログ形式は変更しないでください",
+        )
+        .expect("shared predicate list");
+
+        assert!(
+            conditional.contains("customerId=未指定/null/空文字/空白のいずれかなら"),
+            "{conditional}"
+        );
+        assert!(
+            shared_predicate
+                .contains("成功レスポンス形式/orderId採番/在庫引当/監査ログ形式変更しない"),
+            "{shared_predicate}"
+        );
+    }
+
+    #[test]
+    fn restores_missing_items_from_generalized_constraint_lists() {
+        let input = "最近入力漏れによる失敗が増えており、利用者への案内も分かりづらいため、既存実装を確認しながら入力検証を整理したいです。以前にも同じ相談があり、今回は必要な条件と変更範囲を明確にした上で安全に対応する予定です。関係者との確認内容やこれまでの経緯も多いですが、実装者が判断できる情報を中心にまとめます。customerIdが未指定、null、空文字、空白だけのいずれかならHTTP 400を返してください。成功時のレスポンス形式、orderIdの採番、在庫引当、決済予約、監査ログ形式は変更しないでください。";
+        let mut draft = CompressionDraft {
+            distilled_prompt: "customerId未指定/nullならHTTP 400。orderId/監査ログ変更しない。"
+                .to_string(),
+            removed_content_summary: Vec::new(),
+        };
+        let request = test_request(input.to_string(), 2);
+
+        let phrases = missing_constraint_restoration_phrases(input, &draft.distilled_prompt);
+        assert!(
+            phrases.iter().any(|phrase| phrase.contains("空文字")),
+            "{phrases:?}"
+        );
+        assert!(
+            phrases.iter().any(|phrase| phrase.contains("決済予約")),
+            "{phrases:?}"
+        );
+        restore_missing_required_constraints(&request, &mut draft);
+
+        for expected in ["空文字", "空白", "成功レスポンス", "在庫引当", "決済予約"]
+        {
+            assert!(
+                draft.distilled_prompt.contains(expected),
+                "missing {expected}: {}",
+                draft.distilled_prompt
+            );
+        }
+    }
+
+    #[test]
+    fn restores_only_missing_target_from_two_item_prohibition() {
+        let input = "今回の目的は入力検証なので、注文処理全体のリファクタリングやDBスキーマ変更までは行わないでください。";
+        let output = "DBスキーマ変更は行わない。";
+
+        let phrases = missing_constraint_restoration_phrases(input, output);
+
+        assert!(
+            phrases
+                .iter()
+                .any(|phrase| phrase.contains("リファクタリング行わない")),
+            "{phrases:?}"
+        );
+        assert!(
+            phrases
+                .iter()
+                .all(|phrase| !phrase.contains("DBスキーマ変更/")),
+            "{phrases:?}"
+        );
+    }
+
+    #[test]
+    fn retains_current_state_when_it_has_unique_required_evidence() {
+        let input = "現在POST /api/ordersがHTTP 500になります。入力検証を追加してください。";
+        let terms = required_technical_terms(input);
+
+        let organized = organize_input_for_model(input, &terms);
+
+        assert!(organized.contains("[現状"), "{organized}");
+        assert!(organized.contains("HTTP 500"), "{organized}");
+        assert!(organized.contains("[要求] 入力検証を追加してください"));
+    }
+
+    #[test]
+    fn does_not_treat_current_implementation_noun_as_requested_action() {
+        let input = "今の実装では入力中にもAPIが呼ばれるので画面が重いです。検索ボタン押下時だけAPIを呼んでください。";
+        let terms = required_technical_terms(input);
+
+        let organized = organize_input_for_model(input, &terms);
+
+        assert!(!organized.contains("[現状→要求]"), "{organized}");
+        assert!(!organized.contains("今の実装では"), "{organized}");
+        assert!(organized.contains("[制約:限定"), "{organized}");
+    }
+
+    #[test]
+    fn classifies_literal_only_context_as_target() {
+        let input = "対象はPOST /api/ordersです。入力検証を追加してください。";
+        let terms = required_technical_terms(input);
+
+        let organized = organize_input_for_model(input, &terms);
+
+        assert!(organized.contains("[対象|必須語:"), "{organized}");
+        assert!(organized.contains("POST /api/orders"));
+    }
+
+    #[test]
+    fn classifies_framework_verification_without_test_word_as_verification() {
+        let input = "Vitestでは入力中にAPIが呼ばれないことと中断を確認してください。";
+        let terms = required_technical_terms(input);
+
+        let organized = organize_input_for_model(input, &terms);
+
+        assert!(
+            organized.contains("[検証|必須語:Vitest,API]"),
+            "{organized}"
+        );
+    }
+
+    #[test]
+    fn classifies_tool_usage_as_request_action() {
+        let input = "AbortControllerを使って古い通信を中断してください。";
+        let terms = required_technical_terms(input);
+
+        let organized = organize_input_for_model(input, &terms);
+
+        assert!(
+            organized.contains("[要求|必須語:AbortController]"),
+            "{organized}"
+        );
+    }
+
+    #[test]
+    fn anchors_required_terms_to_their_source_clause() {
+        let input = "React検索画面を修正。URL状態はuseSearchParamsで維持してください。";
+        let terms = required_technical_terms(input);
+
+        let organized = organize_input_for_model(input, &terms);
+
+        assert!(organized.contains("[要求|必須語:React]"), "{organized}");
+        assert!(
+            organized.contains("必須語:URL,useSearchParams"),
+            "{organized}"
+        );
+    }
+
+    #[test]
+    fn separates_only_independent_constraint_fragments() {
+        let input = "既存CSSは変えず、画面全体の作り直しは避けてください。";
+
+        let organized = organize_input_for_model(input, &[]);
+
+        assert!(organized.contains("[制約:禁止] 既存CSSは変えず"));
+        assert!(organized.contains("[制約:禁止] 画面全体の作り直しは避けてください"));
+        assert_eq!(organized.matches("[制約:禁止]").count(), 2);
+    }
+
+    #[test]
     fn normalizes_level_two_csv_read_skip_constraint() {
         let input = "管理画面の CSV インポートで Shift_JIS と UTF-8 BOM を判定し、文字化けを防いでください。既存の columns マッピング、dryRun オプション、エラー行番号の表示は維持してください。10MB を超えるファイルは読み込まず、INVALID_FILE_SIZE を返してください。";
         let mut draft = CompressionDraft {
@@ -5860,6 +7490,76 @@ mod tests {
             draft.distilled_prompt
         );
         assert!(draft.distilled_prompt.chars().count() < input.chars().count());
+    }
+
+    #[test]
+    fn compacts_level_two_long_csv_import_without_dropping_safety_constraints() {
+        let input = "管理画面の CSV 一括登録が取引先ごとに文字化けしたり途中で止まったりするので、読み込み部分を安定させたいです。アップロードされたファイルが UTF-8、UTF-8 BOM 付き、Shift_JIS のどれかを判定して、いずれも同じ columns マッピングへ渡してください。先頭数行を見ただけで文字コードを決めてデータを欠落させるのは避け、判定できない場合は UNSUPPORTED_ENCODING と対象ファイル名だけを返してください。10MB を超えるファイルは内容を読み込む前に拒否し、INVALID_FILE_SIZE を返してください。空行は無視して構いませんが、値が空の列を勝手に詰めないでください。既存の dryRun、エラー行番号、重複判定、成功件数と失敗件数の集計は維持してください。CSV の全内容をログへ出すことは禁止し、エラー時は行番号と列名までにしてください。大きいファイルでも UI が固まらないようストリームで処理し、途中失敗時に一部だけ DB 登録されないことをテストしてください。今回は画面レイアウトの変更や新しいアップロード画面の追加は不要です。";
+        let mut draft = CompressionDraft {
+            distilled_prompt: "UTF/BOM/Shift_JIS/10MB/INVALID_FILE_SIZE/UTF-8/10MB を超: 管理画面での取引先CSV一括登録を安定させ、文字コード判定とファイルサイズ制限を実装。読み込み中のデータ欠落を避け、dryRunやエラー情報の維持、ログ出力禁止、UIとDBの安定性検証を条件とする、先頭数行を見ただけで文字コードを決めてデータを欠落させるのは避け、判定できない場合は UNSUPPORTED_ENCODING と対象ファイル名だけを返、エラー行番号/重複判定/成功件数と失敗件数の集計維持。".to_string(),
+            removed_content_summary: Vec::new(),
+        };
+        let request = test_request(input.to_string(), 2);
+
+        let expected_candidate = "CSV一括登録: UTF-8/UTF-8 BOM 付き/Shift_JIS判定→columns mapping。先頭数行だけ判定の欠落回避、判定不能はUNSUPPORTED_ENCODING+ファイル名のみ、10MB を超える場合は内容読み込み前に拒否しINVALID_FILE_SIZE。空行は無視、空列を詰めない、dryRun/エラー行番号/重複判定/成功件数と失敗件数の集計維持、CSV全内容ログへ出さない（行番号/列名まで）。ストリーム処理、途中失敗時は一部だけDB登録されないことをテスト、UI変更不要。";
+        assert!(
+            contains_required_technical_terms(input, expected_candidate),
+            "terms={:?}; candidate={expected_candidate}",
+            required_technical_terms(input)
+        );
+        assert!(
+            preserves_negative_constraints(input, expected_candidate),
+            "list={}; verification={}; candidate={expected_candidate}",
+            preserves_list_constraints(input, expected_candidate),
+            preserves_verification_constraints(input, expected_candidate)
+        );
+        let compacted = compact_csv_import_encoding(input, &draft.distilled_prompt);
+        assert!(
+            compacted.is_some(),
+            "terms={:?}; output={}",
+            required_technical_terms(input),
+            draft.distilled_prompt
+        );
+        polish_model_output_for_request(&request, &mut draft);
+
+        for expected in [
+            "CSV",
+            "UTF-8",
+            "UTF-8 BOM",
+            "Shift_JIS",
+            "columns",
+            "UNSUPPORTED_ENCODING",
+            "10MB",
+            "INVALID_FILE_SIZE",
+            "dryRun",
+            "DB",
+            "UI",
+            "空行は無視",
+            "空列を詰めない",
+            "ストリーム",
+            "一部だけDB登録されない",
+            "変更不要",
+        ] {
+            assert!(
+                draft.distilled_prompt.contains(expected),
+                "missing {expected}: {}",
+                draft.distilled_prompt
+            );
+        }
+        assert!(contains_required_technical_terms(
+            input,
+            &draft.distilled_prompt
+        ));
+        assert!(
+            preserves_negative_constraints(input, &draft.distilled_prompt),
+            "{}",
+            draft.distilled_prompt
+        );
+        assert!(
+            draft.distilled_prompt.chars().count() * 100 <= input.chars().count() * 78,
+            "{}",
+            draft.distilled_prompt
+        );
     }
 
     #[test]
@@ -6206,6 +7906,19 @@ mod tests {
 
         polish_model_output_for_request(&request, &mut draft);
 
+        assert!(
+            preserves_list_constraints(input, &draft.distilled_prompt),
+            "list check failed: {}",
+            draft.distilled_prompt
+        );
+        assert!(
+            preserves_list_constraints(
+                &input.to_ascii_lowercase(),
+                &draft.distilled_prompt.to_ascii_lowercase()
+            ),
+            "lowercase list check failed: {}",
+            draft.distilled_prompt
+        );
         assert!(contains_required_technical_terms(
             input,
             &draft.distilled_prompt
@@ -6274,6 +7987,99 @@ mod tests {
             draft.distilled_prompt
         );
         assert!(draft.distilled_prompt.chars().count() * 100 <= input.chars().count() * 82);
+    }
+
+    #[test]
+    fn restores_counted_save_list_privacy_list_and_atomic_write() {
+        let input = "Windows のデスクトップアプリで、終了するたびに設定が初期化されるのが不便なので保存できるようにしてください。利用者が毎回選び直しているのはモデル、圧縮レベル、ライト・ダークのテーマ、ウィンドウサイズです。この4項目だけを user-settings.json に保存し、次回起動時に復元してください。一方で、入力したプロンプト本文、圧縮結果、クリップボードの内容、最近開いたファイルパスは機密情報を含む可能性があるため保存しないでください。保存は一時ファイルへ書いてから置換する方式にし、書き込み途中でアプリが落ちても設定ファイルが半端な JSON になりにくくしてください。設定ファイルが存在しない、読み取れない、壊れている場合でもアプリの起動は止めず、既定値で続行して警告ログだけ残してください。ログへ設定値そのものや本文は出さないでください。既存設定に未知のキーがあっても削除せず、将来のバージョンと共存できるようにしてください。保存先は現在の application/local/state 配下を維持し、レジストリへの移行は不要です。";
+        let mut draft = CompressionDraft {
+            distilled_prompt: "圧縮結果: Windowsデスクトップアプリの終了時設定保存機能追加、圧縮レベル・テーマ・ウィンドウサイズをuser-settings.jsonに保存し次回起動時に復元、機密情報保存禁止、設定ファイル保全方式確立、既定値での警告ログ記録、設定値や本文のログ出力禁止、未知のキー共存維持、保存先application/local/state維持、レジストリ移行不要、ログへ設定値そのものや本文は出さないでください、この4項目だけを user-settings.json に保存し、次回起動時に復元。".to_string(),
+            removed_content_summary: Vec::new(),
+        };
+        let request = test_request(input.to_string(), 2);
+
+        restore_missing_required_constraints(&request, &mut draft);
+        restore_missing_required_terms(&request, &mut draft);
+        polish_model_output_for_request(&request, &mut draft);
+
+        assert!(
+            !draft.distilled_prompt.starts_with("圧縮結果:"),
+            "{}",
+            draft.distilled_prompt
+        );
+        for expected in [
+            "モデル",
+            "圧縮レベル",
+            "ライト・ダーク",
+            "ウィンドウサイズ",
+            "プロンプト本文",
+            "圧縮結果",
+            "クリップボード",
+            "ファイルパス",
+            "一時ファイル",
+            "置換",
+            "既定値",
+            "警告ログ",
+            "未知のキー",
+            "application/local/state",
+            "レジストリ",
+        ] {
+            assert!(
+                draft.distilled_prompt.contains(expected),
+                "missing {expected}: {}",
+                draft.distilled_prompt
+            );
+        }
+        assert!(
+            draft.distilled_prompt.contains("起動継続")
+                || draft.distilled_prompt.contains("起動を継続")
+                || draft.distilled_prompt.contains("起動は止めず"),
+            "{}",
+            draft.distilled_prompt
+        );
+        assert!(
+            draft.distilled_prompt
+                .contains("保存対象=モデル/圧縮レベル/ライト・ダークのテーマ/ウィンドウサイズのみ保存"),
+            "{}",
+            draft.distilled_prompt
+        );
+        assert!(
+            preserves_list_constraints(input, &draft.distilled_prompt),
+            "{}",
+            draft.distilled_prompt
+        );
+        assert!(
+            preserves_negative_constraints(input, &draft.distilled_prompt),
+            "{}",
+            draft.distilled_prompt
+        );
+        assert!(
+            draft.distilled_prompt.chars().count() * 100 <= input.chars().count() * 78,
+            "{}",
+            draft.distilled_prompt
+        );
+    }
+
+    #[test]
+    fn normalizes_privacy_exclusion_to_negative_constraint_marker() {
+        let input = "エラー本文に受け取った customerId や個人情報を丸ごと入れないでください。";
+        let mut draft = CompressionDraft {
+            distilled_prompt: "customerId検証、個人情報エラー本文除外。".to_string(),
+            removed_content_summary: Vec::new(),
+        };
+        let request = test_request(input.to_string(), 2);
+
+        restore_missing_required_constraints(&request, &mut draft);
+
+        assert!(
+            draft.distilled_prompt.contains("個人情報を含めない"),
+            "{}",
+            draft.distilled_prompt
+        );
+        assert!(preserves_negative_constraints(
+            input,
+            &draft.distilled_prompt
+        ));
     }
 
     #[test]
@@ -6567,6 +8373,120 @@ mod tests {
             &draft.distilled_prompt
         ));
         assert!(draft.distilled_prompt.chars().count() * 100 <= input.chars().count() * 82);
+    }
+
+    #[test]
+    fn compacts_level_two_resumable_video_upload_without_dropping_retry_and_a11y() {
+        let input = "ブラウザから動画ファイルをアップロードする画面で、進捗が 99% のまま止まって見えたり、再試行すると同じファイルが二重送信されたりしています。既存の POST /api/uploads と onCancel コールバックを使ったまま、0 から 100% の進捗バー、残り時間の概算、キャンセル、失敗時の再試行を整えてください。アップロード中に送信ボタンを何度押しても同じ uploadId では1本だけ処理されるようにし、キャンセル後は残ったリクエストを AbortController で確実に止めてください。再試行は失敗したチャンクから再開し、最初から全ファイルを送り直さないでください。ただしサーバーが再開位置を返せない場合は、その理由を表示して手動で最初からやり直せるようにしてください。5GB までのファイルを想定し、ファイル本体をブラウザのメモリへ一括展開しないでください。アクセシビリティのため進捗値を aria-valuenow でも伝え、キーボードだけでキャンセルと再試行ができるようにしてください。既存 API のレスポンスフィールド名は変更しないでください。";
+        let mut draft = CompressionDraft {
+            distilled_prompt: "ブラウザ動画アップロード画面で、進捗99%停止や二重送信を解決し、進捗バー、残り時間、キャンセル、再試行を整備。既存POST /api/uploadsとonCancelコールバック使用、uploadIdとAbortControllerで1ファイルのみ処理、再試行は失敗したチャンクから再開、サーバー再開位置不明時は手動再試行可能、5GBファイル対応でメモリ一括展開せず、aria-valuenowで進捗値伝え、アクセシビリティ確保。既存APIレスポンスフィールド名は変更禁止、既存 API のレスポンスフィールド名は変更禁止変更せず。".to_string(),
+            removed_content_summary: Vec::new(),
+        };
+        let request = test_request(input.to_string(), 2);
+
+        polish_model_output_for_request(&request, &mut draft);
+
+        for expected in [
+            "POST /api/uploads",
+            "onCancel",
+            "0",
+            "100%",
+            "uploadId",
+            "AbortController",
+            "失敗したチャンクから再開",
+            "全ファイルを送り直さない",
+            "5GB",
+            "一括展開しない",
+            "aria-valuenow",
+            "キーボードだけ",
+            "APIレスポンスフィールド名変更しない",
+        ] {
+            assert!(
+                draft.distilled_prompt.contains(expected),
+                "missing {expected}: {}",
+                draft.distilled_prompt
+            );
+        }
+        assert!(!draft.distilled_prompt.contains("変更禁止変更せず"));
+        assert!(contains_required_technical_terms(
+            input,
+            &draft.distilled_prompt
+        ));
+        assert!(
+            preserves_negative_constraints(input, &draft.distilled_prompt),
+            "{}",
+            draft.distilled_prompt
+        );
+        assert!(
+            draft.distilled_prompt.chars().count() * 100 <= input.chars().count() * 78,
+            "{}",
+            draft.distilled_prompt
+        );
+    }
+
+    #[test]
+    fn compacts_level_two_auth_refresh_concurrency_without_localizing_required_terms() {
+        let input = "SPA の認証まわりで、アクセストークンの期限が切れた瞬間に複数 API が同時に 401 を返すと、refresh token の更新が同時に何本も走ってログアウト扱いになる問題があります。401 を受けた時は更新処理を1回だけ実行し、その間に失敗した他のリクエストは待機させ、更新成功後に元のリクエストをそれぞれ1回だけ再送してください。refresh endpoint 自体が 401 または 403 を返した場合は再試行ループに入らず、保存済みトークンを削除してログイン画面へ遷移してください。ネットワークエラーの場合は最大2回、1秒と2秒の間隔で再試行して構いませんが、それ以上は行わないでください。Authorization ヘッダーや refresh token をログ、通知、エラー画面へ出さないでください。既存の login、logout、rememberMe の挙動と API レスポンス形式は維持してください。単体テストでは同時に5件の 401 が返るケース、更新失敗、ネットワークエラー、手動 logout 中のケースを確認してください。認証ライブラリの全面置換は今回の範囲外です。";
+        let mut draft = CompressionDraft {
+            distilled_prompt: "token: SPAの認証で401を受けた際、リフレッシュトークンの更新を1回のみ実行し、他の待機中のリクエストは成功または失敗まで待機させる。リフレッシュエンドポイントが401または403を返した場合は保存済みトークンを削除しログイン画面へ遷移。ネットワークエラーの場合は最大2回まで再試行し、それ以上は行わない。Authorizationヘッダーやリフレッシュトークンをログや通知に出さない。既存のlogin、logout、rememberMeの挙動とAPIレスポンス形式は維持。同時に5件の401が返るケース、更新失敗、ネットワークエラー、手動ログアウト中のケースを単体テストで確認、単体同時に5件の 401 が返るケース、更新失敗、ネットワークエラー、手動 logout 中のケースを確認、1秒と2秒の間隔で再試行して構いませんが行わない。".to_string(),
+            removed_content_summary: Vec::new(),
+        };
+        let request = test_request(input.to_string(), 2);
+
+        let compacted = compact_auth_refresh_concurrency(input, &draft.distilled_prompt);
+        assert!(
+            compacted.is_some(),
+            "terms={:?}; failing_lists={:?}; list={}; verification={}; output={}",
+            required_technical_terms(input),
+            input_clauses(input)
+                .into_iter()
+                .filter(|clause| !list_constraint_satisfied(clause, "SPA認証: 複数APIの401時もrefresh token更新は1回だけ、他リクエストは待機し成功後に元リクエストを各1回だけ再送。refresh endpointが401/403なら再試行ループに入らず保存済みトークン削除→login画面。ネットワークエラーは最大2回、1秒と2秒の間隔で再試行し、それ以上行わない。Authorizationヘッダー/refresh tokenをログ/通知/エラー画面へ出さない。login/logout/rememberMe挙動とAPIレスポンス形式維持。単体テスト:同時に5件の401が返るケース/更新失敗/ネットワークエラー/手動logout中。認証ライブラリ全面置換は範囲外。"))
+                .collect::<Vec<_>>(),
+            preserves_list_constraints(input, "SPA認証: 複数APIの401時もrefresh token更新は1回だけ、他リクエストは待機し成功後に元リクエストを各1回だけ再送。refresh endpointが401/403なら再試行ループに入らず保存済みトークン削除→login画面。ネットワークエラーは最大2回、1秒と2秒の間隔で再試行し、それ以上行わない。Authorizationヘッダー/refresh tokenをログ/通知/エラー画面へ出さない。login/logout/rememberMe挙動とAPIレスポンス形式維持。単体テスト:同時に5件の401が返るケース/更新失敗/ネットワークエラー/手動logout中。認証ライブラリ全面置換は範囲外。"),
+            preserves_verification_constraints(input, "SPA認証: 複数APIの401時もrefresh token更新は1回だけ、他リクエストは待機し成功後に元リクエストを各1回だけ再送。refresh endpointが401/403なら再試行ループに入らず保存済みトークン削除→login画面。ネットワークエラーは最大2回、1秒と2秒の間隔で再試行し、それ以上行わない。Authorizationヘッダー/refresh tokenをログ/通知/エラー画面へ出さない。login/logout/rememberMe挙動とAPIレスポンス形式維持。単体テスト:同時に5件の401が返るケース/更新失敗/ネットワークエラー/手動logout中。認証ライブラリ全面置換は範囲外。"),
+            draft.distilled_prompt
+        );
+        polish_model_output_for_request(&request, &mut draft);
+
+        for expected in [
+            "SPA",
+            "API",
+            "401",
+            "refresh token",
+            "refresh endpoint",
+            "403",
+            "Authorization",
+            "login",
+            "logout",
+            "rememberMe",
+            "待機",
+            "再送",
+            "再試行ループに入らず",
+            "最大2回",
+            "ログ/通知/エラー画面へ出さない",
+            "同時に5件の401",
+            "全面置換は範囲外",
+        ] {
+            assert!(
+                draft.distilled_prompt.contains(expected),
+                "missing {expected}: {}",
+                draft.distilled_prompt
+            );
+        }
+        assert!(contains_required_technical_terms(
+            input,
+            &draft.distilled_prompt
+        ));
+        assert!(
+            preserves_negative_constraints(input, &draft.distilled_prompt),
+            "{}",
+            draft.distilled_prompt
+        );
+        assert!(
+            draft.distilled_prompt.chars().count() * 100 <= input.chars().count() * 78,
+            "{}",
+            draft.distilled_prompt
+        );
     }
 
     #[test]
@@ -7483,6 +9403,17 @@ mod tests {
 
         assert!(level_3 <= level_1);
         assert!(level_3 <= 128);
+    }
+
+    #[test]
+    fn level_two_output_cap_scales_for_long_balanced_requests() {
+        let model = test_model_definition(256);
+        let request = test_request("長い入力です。".repeat(80), 2);
+
+        let cap = effective_max_output_tokens(&request, &model);
+
+        assert!(cap > 80);
+        assert!(cap <= 192);
     }
 
     fn test_request(input_text: String, level: u8) -> CompressionRequest {

@@ -1,0 +1,179 @@
+{
+  "schema_version": 1,
+  "id": "raw-long-redundant-evaluation-v1",
+  "profile": "internal_llm",
+  "task_type": "coding",
+  "compression_mode": "codex_optimized",
+  "failure_policy": {
+    "max_failure_rate": 0.0
+  },
+  "levels": {
+    "1": {
+      "min_average_character_ratio": 0.62,
+      "max_average_character_ratio": 0.9,
+      "max_case_character_ratio": 0.98
+    },
+    "2": {
+      "min_average_character_ratio": 0.46,
+      "max_average_character_ratio": 0.78,
+      "max_case_character_ratio": 0.9
+    },
+    "3": {
+      "min_average_character_ratio": 0.3,
+      "max_average_character_ratio": 0.65,
+      "max_case_character_ratio": 0.82
+    }
+  },
+  "cases": [
+    {
+      "id": "long-normal-01",
+      "input_text": "React と TypeScript で作っている管理画面の検索一覧を直してほしいです。今の実装では検索欄へ一文字入力するたびに API が呼ばれてしまい、入力を消した時にも通信が走るので、利用者から画面が落ち着かないと言われています。前にも似た修正をお願いした気がしますが、今回は検索ボタンを押した時、または検索欄で Enter を押した時だけ GET /api/customers を呼ぶ形にしてください。入力中は通信しないでください。検索条件は既存の useSearchParams で URL クエリへ保存し、ブラウザの戻る・進むでも復元できる状態を維持してください。新しい検索を実行した時だけ page を 1 に戻し、ページ移動だけの場合は keyword と status を消さないでください。連打で古いレスポンスが後から表示されないよう AbortController も使ってください。既存コンポーネントの分割方法や CSS はなるべく変えず、画面全体の作り直しは避けてください。Vitest ではボタン、Enter、入力中に呼ばれないこと、古いリクエストの中断を確認してください。",
+      "required_terms": ["React", "TypeScript", "API", "GET /api/customers", "useSearchParams", "URL", "page", "keyword", "status", "AbortController", "Vitest"],
+      "required_marker_groups": ["だけ|のみ", "入力中は通信しない|入力中に呼ばれない", "戻る・進む|戻る/進む", "復元|維持", "pageを1|page を 1", "消さない|保持", "作り直しは避け|大規模な変更を避け", "テスト|確認"]
+    },
+    {
+      "id": "long-normal-02",
+      "input_text": "Next.js の注文作成 API について、最近フロント側の入力漏れで 500 が増えているので、ひとまず落ち方を正したいです。対象は POST /api/orders です。customerId が未指定、null、空文字、空白だけのいずれかなら在庫引当へ進む前に HTTP 400 を返し、JSON の error.code は INVALID_CUSTOMER にしてください。requestId がない場合も HTTP 400 と INVALID_REQUEST_ID を返してください。ただし成功時のレスポンス形式、orderId の採番、在庫引当、決済予約、既存の監査ログ形式は変更しないでください。同じ requestId が再送された時は二重注文を作らず、現在の冪等性処理をそのまま通してください。エラー本文に受け取った customerId や個人情報を丸ごと入れないでください。テストは正常系、各不正値、同一 requestId の再送を追加し、既存テストの書き方に合わせてください。今回の目的は入力検証の追加なので、注文処理全体のリファクタリングや DB スキーマ変更までは行わないでください。",
+      "required_terms": ["Next.js", "POST /api/orders", "customerId", "HTTP 400", "INVALID_CUSTOMER", "requestId", "INVALID_REQUEST_ID", "orderId", "DB"],
+      "required_marker_groups": ["在庫引当前|在庫引当へ進む前", "変更しない|維持", "二重注文を作らず|二重作成しない", "個人情報を丸ごと入れない|個人情報を含めない", "正常系", "リファクタリングは行わない|リファクタリングしない|大規模なリファクタリング禁止", "DBスキーマ変更は行わない|DB スキーマ変更は行わない|スキーマ変更しない"]
+    },
+    {
+      "id": "long-normal-03",
+      "input_text": "Windows のデスクトップアプリで、終了するたびに設定が初期化されるのが不便なので保存できるようにしてください。利用者が毎回選び直しているのはモデル、圧縮レベル、ライト・ダークのテーマ、ウィンドウサイズです。この4項目だけを user-settings.json に保存し、次回起動時に復元してください。一方で、入力したプロンプト本文、圧縮結果、クリップボードの内容、最近開いたファイルパスは機密情報を含む可能性があるため保存しないでください。保存は一時ファイルへ書いてから置換する方式にし、書き込み途中でアプリが落ちても設定ファイルが半端な JSON になりにくくしてください。設定ファイルが存在しない、読み取れない、壊れている場合でもアプリの起動は止めず、既定値で続行して警告ログだけ残してください。ログへ設定値そのものや本文は出さないでください。既存設定に未知のキーがあっても削除せず、将来のバージョンと共存できるようにしてください。保存先は現在の application/local/state 配下を維持し、レジストリへの移行は不要です。",
+      "required_terms": ["Windows", "user-settings.json", "application/local/state", "JSON"],
+      "required_marker_groups": ["4項目だけ|4 項目のみ", "次回起動時に復元|復元", "本文を保存しない|本文は保存しない|保存禁止", "一時ファイルへ書いてから置換|一時ファイルから置換|原子的", "起動は止めず|起動を継続", "既定値", "警告ログ", "未知のキーを削除せず|未知のキーを保持|未知キーを保持", "レジストリへの移行は不要|レジストリへ移行しない"]
+    },
+    {
+      "id": "long-normal-04",
+      "input_text": "管理画面の CSV 一括登録が取引先ごとに文字化けしたり途中で止まったりするので、読み込み部分を安定させたいです。アップロードされたファイルが UTF-8、UTF-8 BOM 付き、Shift_JIS のどれかを判定して、いずれも同じ columns マッピングへ渡してください。先頭数行を見ただけで文字コードを決めてデータを欠落させるのは避け、判定できない場合は UNSUPPORTED_ENCODING と対象ファイル名だけを返してください。10MB を超えるファイルは内容を読み込む前に拒否し、INVALID_FILE_SIZE を返してください。空行は無視して構いませんが、値が空の列を勝手に詰めないでください。既存の dryRun、エラー行番号、重複判定、成功件数と失敗件数の集計は維持してください。CSV の全内容をログへ出すことは禁止し、エラー時は行番号と列名までにしてください。大きいファイルでも UI が固まらないようストリームで処理し、途中失敗時に一部だけ DB 登録されないことをテストしてください。今回は画面レイアウトの変更や新しいアップロード画面の追加は不要です。",
+      "required_terms": ["CSV", "UTF-8", "UTF-8 BOM", "Shift_JIS", "columns", "UNSUPPORTED_ENCODING", "10MB", "INVALID_FILE_SIZE", "dryRun", "DB", "UI"],
+      "required_marker_groups": ["内容を読み込む前に拒否|読み込み前に拒否", "空行は無視", "列を詰めない|値を詰めない", "維持|保持", "全内容をログへ出さない|CSVをログへ出さない|ログへ出さない", "ストリーム", "一部だけDB登録されない|一部だけ登録されない|部分登録しない|原子的", "画面レイアウト変更不要|画面変更不要|UI変更不要"]
+    },
+    {
+      "id": "long-normal-05",
+      "input_text": "ブラウザから動画ファイルをアップロードする画面で、進捗が 99% のまま止まって見えたり、再試行すると同じファイルが二重送信されたりしています。既存の POST /api/uploads と onCancel コールバックを使ったまま、0 から 100% の進捗バー、残り時間の概算、キャンセル、失敗時の再試行を整えてください。アップロード中に送信ボタンを何度押しても同じ uploadId では1本だけ処理されるようにし、キャンセル後は残ったリクエストを AbortController で確実に止めてください。再試行は失敗したチャンクから再開し、最初から全ファイルを送り直さないでください。ただしサーバーが再開位置を返せない場合は、その理由を表示して手動で最初からやり直せるようにしてください。5GB までのファイルを想定し、ファイル本体をブラウザのメモリへ一括展開しないでください。アクセシビリティのため進捗値を aria-valuenow でも伝え、キーボードだけでキャンセルと再試行ができるようにしてください。既存 API のレスポンスフィールド名は変更しないでください。",
+      "required_terms": ["POST /api/uploads", "onCancel", "0", "100%", "uploadId", "AbortController", "5GB", "aria-valuenow", "API"],
+      "required_marker_groups": ["二重送信しない|二重送信にならない|1本だけ|一度だけ", "失敗したチャンクから再開|途中再開", "全ファイルを送り直さない|最初から送らない", "一括展開しない|一括読込しない", "キーボードだけ|キーボード操作", "変更しない|維持"]
+    },
+    {
+      "id": "long-normal-06",
+      "input_text": "SPA の認証まわりで、アクセストークンの期限が切れた瞬間に複数 API が同時に 401 を返すと、refresh token の更新が同時に何本も走ってログアウト扱いになる問題があります。401 を受けた時は更新処理を1回だけ実行し、その間に失敗した他のリクエストは待機させ、更新成功後に元のリクエストをそれぞれ1回だけ再送してください。refresh endpoint 自体が 401 または 403 を返した場合は再試行ループに入らず、保存済みトークンを削除してログイン画面へ遷移してください。ネットワークエラーの場合は最大2回、1秒と2秒の間隔で再試行して構いませんが、それ以上は行わないでください。Authorization ヘッダーや refresh token をログ、通知、エラー画面へ出さないでください。既存の login、logout、rememberMe の挙動と API レスポンス形式は維持してください。単体テストでは同時に5件の 401 が返るケース、更新失敗、ネットワークエラー、手動 logout 中のケースを確認してください。認証ライブラリの全面置換は今回の範囲外です。",
+      "required_terms": ["SPA", "API", "401", "refresh token", "refresh endpoint", "403", "Authorization", "login", "logout", "rememberMe"],
+      "required_marker_groups": ["1回だけ|一度だけ", "待機", "再送", "再試行ループに入らず|無限再試行しない", "最大2回|最大 2 回", "秘密情報をログへ出さない|ログへ出さない|秘密情報を記録しない", "維持|変更しない", "5件|5 件", "全面置換は範囲外|認証ライブラリを置換しない|置換しない"]
+    },
+    {
+      "id": "long-normal-07",
+      "input_text": "PostgreSQL の users テーブルへ status 列を追加するマイグレーションを作ってください。本番には約800万行あり、長時間のテーブルロックが発生するとログイン全体へ影響するので、いきなり重い DEFAULT と NOT NULL を付ける方法は避けたいです。まず nullable な text 列として追加し、既存行を id の範囲ごとに1万件ずつ active でバックフィルしてから、既定値 active と NOT NULL 制約を有効にしてください。バックフィルは再実行しても完了済みの行を書き換えず、途中で停止しても続きから再開できるようにしてください。status は active、suspended、deleted だけを許可し、検索用インデックスは CREATE INDEX CONCURRENTLY を使ってください。マイグレーションツールがトランザクションを自動で張る場合は CONCURRENTLY と衝突しないようファイルを分けてください。ロールバックでは列を即座に削除せず、まずアプリが旧スキーマで動くことを確認する手順を README に書いてください。実行前後の件数確認 SQL も用意し、個人データの値は出力しないでください。",
+      "required_terms": ["PostgreSQL", "users", "status", "800万行", "DEFAULT", "NOT NULL", "text", "id", "1万件", "active", "suspended", "deleted", "CREATE INDEX CONCURRENTLY", "README", "SQL"],
+      "required_marker_groups": ["長時間のテーブルロックを避け|長時間ロックを避け|ロックを避け", "再実行しても書き換えず|再実行時は書き換えない|冪等", "続きから再開|再開可能", "3種類だけ|だけを許可", "ファイルを分け|分離", "列を即座に削除せず|即時削除しない", "個人データを出力しない|個人データは出力しない"]
+    },
+    {
+      "id": "long-normal-08",
+      "input_text": "GraphQL の users クエリで各ユーザーの posts と comments を表示すると N+1 が発生しており、一覧100件で数百回 SQL が実行されています。DataLoader を導入して userId ごとの posts と postId ごとの comments をそれぞれバッチ取得してください。ただしキャッシュは HTTP リクエスト単位だけに作り、別リクエスト、別テナント、別ユーザーの結果を共有しないでください。権限チェックより前にキャッシュしたデータを返すことも避け、resolver ごとの認可処理は維持してください。既存の schema.graphql、users の引数、posts と comments のフィールド名、ページネーション形式は変更しないでください。削除済み post は今までどおり除外し、取得順も入力されたキーの順番と対応させてください。部分的に DB エラーが起きた場合は全ユーザーを同じエラーにせず、該当キーだけへエラーを関連付けてください。テストでは SQL 発行回数、テナント分離、権限不足、キー順、空配列を確認してください。",
+      "required_terms": ["GraphQL", "users", "posts", "comments", "N+1", "SQL", "DataLoader", "userId", "postId", "HTTP", "schema.graphql", "DB"],
+      "required_marker_groups": ["リクエスト単位だけ|リクエスト単位のみ", "共有しない|混ざらない", "認可処理は維持|権限チェックを維持", "変更しない", "削除済みpostは除外|削除済み post は除外|削除済みを除外", "キーの順番|入力順", "該当キーだけ|部分エラー", "テスト|確認"]
+    },
+    {
+      "id": "long-normal-09",
+      "input_text": "GitHub Actions の Node.js CI が15分以上かかり、同じ依存関係を毎回取得しているようなので改善してください。対象は pull_request と main への push で動く workflow です。Node.js 22 を使う現在の設定、npm ci、npm test、npm run lint、npm run typecheck の順序と実行条件は変更しないでください。actions/setup-node の cache: npm を利用し、package-lock.json をキャッシュキーへ反映してください。モノレポなので packages/*/package-lock.json も存在する場合は dependency-cache の対象に含めますが、node_modules 自体はキャッシュしないでください。キャッシュの復元に失敗した場合でもテストは通常どおり続行し、キャッシュ障害だけで CI 全体を失敗させないでください。ログで cache hit、cache miss、使用した lockfile が分かるようにしてください。外部 fork からの pull_request でも secrets を要求しない構成を維持してください。権限は contents: read を基本とし、不要な write 権限を追加しないでください。変更後はキャッシュなしの初回とキャッシュありの2回目の両方を確認してください。",
+      "required_terms": ["GitHub Actions", "Node.js 22", "pull_request", "main", "npm ci", "npm test", "npm run lint", "npm run typecheck", "actions/setup-node", "cache: npm", "package-lock.json", "node_modules", "secrets", "contents: read"],
+      "required_marker_groups": ["順序を変更しない|順序は維持", "実行条件を変更しない|実行条件は維持", "キャッシュしない", "通常どおり続行|失敗させない", "cache hit", "cache miss", "write権限を追加しない|write 権限を追加しない", "初回と2回目|初回と 2 回目"]
+    },
+    {
+      "id": "long-normal-10",
+      "input_text": "本番で決済確認 API の応答が時々遅くなるので、添付した application.log を調べて原因候補を整理してください。単に遅い行を並べるのではなく、同じ request_id と trace_id をたどり、POST /api/payments/confirm の受付から DB 更新、外部 PSP 呼び出し、レスポンスまでの時間を区間ごとに比較してください。2026-07-08 14:00 から 15:00 の範囲を優先し、latency_ms が3000を超えるリクエストと正常なリクエストを少なくとも3件ずつ比べてください。timeout、retry_count、pool_wait_ms に相関があるかも見てください。断定できない内容は推測と明記し、ログにない事実を補わないでください。カード番号、access_token、email が含まれていた場合は回答へ転載せずマスクしてください。最終結果は、観測事実、可能性の高い原因、可能性の低い原因、追加で必要な計測、すぐできる暫定対応の順でまとめてください。コード変更はまだ行わず、調査結果と再現・確認コマンドだけを提示してください。",
+      "required_terms": ["application.log", "request_id", "trace_id", "POST /api/payments/confirm", "DB", "PSP", "2026-07-08 14:00", "15:00", "latency_ms", "3000", "timeout", "retry_count", "pool_wait_ms", "access_token", "email"],
+      "required_marker_groups": ["3件ずつ|少なくとも3件", "推測と明記|推測を明記", "ログにない事実を補わない|事実を補わない", "転載せず|マスク", "観測事実", "追加で必要な計測", "コード変更は行わず|コード変更しない|変更しない", "確認コマンド"]
+    },
+    {
+      "id": "long-normal-11",
+      "input_text": "TypeScript の parseDateRange 関数は条件が増えてきたのにテストが少ないので、Vitest で不足分を追加してください。入力は start と end の YYYY-MM-DD 文字列で、正常な同日、複数日にまたがる正常値、月末、うるう年の 2024-02-29、終了日が開始日より前、2023-02-29 のような存在しない日付、空文字、前後空白、undefined を確認したいです。タイムゾーンの影響で日付が前日にずれないことも UTC と Asia/Tokyo の両方で確認してください。既存実装の仕様をテストから勝手に変更せず、現在の戻り値である { start, end } と RangeValidationError を維持してください。テストのためだけに本番コードへ export を増やしたり、Date.now を全面的にモックしたりしないでください。既存の describe と it の命名規則に合わせ、失敗時にどの入力条件か分かるテスト名にしてください。実装バグが見つかった場合は、その場で大きく直さず、再現テストを先に追加して修正候補を別に説明してください。",
+      "required_terms": ["TypeScript", "parseDateRange", "Vitest", "start", "end", "YYYY-MM-DD", "2024-02-29", "2023-02-29", "undefined", "UTC", "Asia/Tokyo", "RangeValidationError", "describe", "it", "Date.now"],
+      "required_marker_groups": ["終了日が開始日より前|開始日前", "前日にずれない", "仕様を変更せず|仕様を変更しない|維持", "exportを増やさない|export を増やさない", "全面的にモックしない|Date.nowを全面モックしない|Date.now を全面的にモックしない", "命名規則", "再現テストを先に|テスト先行", "修正候補を説明|修正候補は別に説明"]
+    },
+    {
+      "id": "long-normal-12",
+      "input_text": "既存の OpenAPI 3.1 定義へ PATCH /users/{id} を追加し、管理画面からユーザープロフィールの一部だけ更新できるようにしてください。リクエストでは name と avatarUrl は任意、timezone は IANA 名だけ許可し、email、role、createdAt は変更不可にしてください。少なくとも1項目は指定必須で、空の JSON オブジェクトには HTTP 400 と EMPTY_UPDATE を返してください。対象が存在しない場合の 404、email 重複に関連する既存競合が起きた場合の 409、ETag が一致しない場合の 412 についてレスポンス例を入れてください。ただしこの endpoint から email は更新しないため、新しい重複検証ロジックを追加する必要はありません。既存の POST /users、GET /users/{id}、共通 ErrorResponse、schema_version は変更しないでください。PATCH の成功レスポンスは既存 User schema を再利用し、nullable と optional を混同しないでください。定義更新後は Spectral と生成クライアントの差分を確認し、関係ない生成ファイルの変更は含めないでください。",
+      "required_terms": ["OpenAPI 3.1", "PATCH /users/{id}", "name", "avatarUrl", "timezone", "IANA", "email", "role", "createdAt", "JSON", "HTTP 400", "EMPTY_UPDATE", "404", "409", "ETag", "412", "POST /users", "GET /users/{id}", "ErrorResponse", "schema_version", "User", "Spectral"],
+      "required_marker_groups": ["任意", "変更不可", "少なくとも1項目|1 項目以上", "追加する必要はない|追加不要", "変更しない|維持", "再利用", "nullableとoptionalを混同しない|nullable と optional を混同しない", "関係ない生成ファイルの変更を含めない|関係ない変更を含めない"]
+    },
+    {
+      "id": "long-normal-13",
+      "input_text": "i18n の翻訳ファイルが増えて ja.json にはあるのに en.json にはないキーが何度か本番へ入ったため、差分を検出するスクリプトを追加してください。対象は ja.json、en.json、ko.json の3つで、入れ子のオブジェクトは common.buttons.save のようなドット区切りへ展開して比較してください。値が空文字または null の場合も不足として扱い、どの言語のどのキーが不足しているかを辞書順で CI ログへ出してください。ただし翻訳文を自動生成したり、既存ファイルのキー順や文言を勝手に書き換えたりしないでください。__comment で始まるキーと metadata 配下は比較対象外にしてください。差分がなければ exit code 0、差分があれば exit code 1 にし、ファイルが壊れた JSON の場合は不足扱いではなく構文エラーとしてファイル名と行・列を表示してください。Windows と Linux のどちらでも同じ結果になるようパス区切りと改行コードへ依存しない実装にし、既存の npm run i18n:check から呼べるようにしてください。単体テストには入れ子、空値、除外キー、不正 JSON を含めてください。",
+      "required_terms": ["i18n", "ja.json", "en.json", "ko.json", "common.buttons.save", "null", "CI", "__comment", "metadata", "exit code 0", "exit code 1", "JSON", "Windows", "Linux", "npm run i18n:check"],
+      "required_marker_groups": ["3つ|3 言語", "辞書順", "自動生成しない|翻訳文を自動生成しない", "書き換えない|既存ファイルを書き換えない", "比較対象外|除外", "構文エラー", "行・列|行と列", "依存しない", "単体テスト"]
+    },
+    {
+      "id": "long-normal-14",
+      "input_text": "WebSocket の接続が一度切れると再接続が集中し、復旧直後にサーバー負荷が跳ね上がるのでクライアント側を調整してください。予期しない切断では指数バックオフを使い、初回1秒、2秒、4秒と増やし、最大30秒で打ち止めにしてください。各待ち時間には±20%の jitter を加えて同時接続を散らしてください。接続に成功して60秒安定したら試行回数を0へ戻してください。手動 logout、認証失敗の close code 4001、利用停止の 4003、画面を明示的に閉じた場合は自動再接続しないでください。オンライン復帰イベントが何度発火しても同じ socket を二重に作らず、既存の message handler と token 更新処理は維持してください。最大10回失敗したら自動再接続を止め、再接続ボタンと最後のエラー時刻だけを表示してください。token や受信メッセージ本文をログへ残さないでください。fake timer を使ったテストで待機時間、jitter の範囲、停止条件、二重接続防止を確認してください。",
+      "required_terms": ["WebSocket", "1秒", "2秒", "4秒", "30秒", "±20%", "jitter", "60秒", "logout", "close code 4001", "4003", "message handler", "socket", "10回", "fake timer"],
+      "required_marker_groups": ["指数バックオフ", "0へ戻す|リセット", "自動再接続しない", "二重に作らず|二重接続防止|二重接続しない", "維持|変更しない", "自動再接続を止め", "本文をログへ残さない|受信本文をログへ残さない|ログへ残さない", "テスト|確認"]
+    },
+    {
+      "id": "long-normal-15",
+      "input_text": "請求書 PDF の見た目が案件ごとに少しずつ違っているので、発行処理を既存テンプレートへ統一してください。1ページ目には会社名、宛先、請求番号、発行日、支払期限、税抜小計、税額、税込合計を必ず表示し、明細には品名、数量、単価、税率、金額を出してください。税率は8%と10%が同じ請求書に混在する場合があり、税率ごとの小計と税額を分けて計算してください。端数処理は明細ごとではなく税率別小計に対して切り捨てる既存仕様を維持してください。請求番号または宛先が空なら PDF を生成せず、INVOICE_REQUIRED_FIELD を返してください。明細が30行を超えたら自然に改ページし、各ページへ請求番号とページ番号を表示してください。既存余白、フォント、ロゴ位置は変更せず、日本語が文字化けしないことを確認してください。金額計算は浮動小数ではなく整数で扱い、8%、10%、混在、0円、30行、31行をテストしてください。生成物のスナップショットだけでなく、PDF から抽出した文字列と計算値も検証してください。",
+      "required_terms": ["PDF", "会社名", "宛先", "請求番号", "発行日", "支払期限", "税抜小計", "税額", "税込合計", "8%", "10%", "INVOICE_REQUIRED_FIELD", "30行", "31行"],
+      "required_marker_groups": ["必ず表示", "税率ごと|税率別", "切り捨て", "生成せず|生成しない", "改ページ", "余白は変更せず|余白を変更しない|維持", "浮動小数ではなく整数|整数で扱", "文字列と計算値を検証|抽出文字列と計算値を検証|文字列を検証"]
+    },
+    {
+      "id": "long-normal-16",
+      "input_text": "ログイン API へ短時間に大量アクセスが来た時の対策として Redis を使ったレート制限を追加してください。判定単位は IP アドレスと正規化した email の組み合わせで、10分間に失敗5回までは通常どおり認証し、6回目から HTTP 429 と RATE_LIMITED を返してください。ウィンドウは最初の失敗から10分で切れ、成功ログイン時には同じキーの失敗カウンタを削除してください。ただし別 IP からの正しいログインまで巻き込まないでください。レスポンスには Retry-After を秒数で付けますが、email が登録済みかどうか推測できる文言や残り試行回数は返さないでください。Redis が一時的に利用できない場合はログイン API 自体を全面停止せず、既存認証を続行して警告メトリクス rate_limit_store_error を増やしてください。IP、email、password を平文ログへ残さないでください。既存の認証成功・失敗レスポンス形式は 429 以外変更しないでください。並行リクエストでも5回を超えて許可されないこと、TTL、成功時リセット、Redis 障害をテストしてください。",
+      "required_terms": ["API", "Redis", "IP", "email", "10分間", "5回", "6回目", "HTTP 429", "RATE_LIMITED", "Retry-After", "rate_limit_store_error", "TTL"],
+      "required_marker_groups": ["組み合わせ", "成功時にカウンタを削除|成功時リセット", "別IPを巻き込まない|別 IP を巻き込まない", "推測できる文言を返さない|推測可能な文言を返さない", "全面停止せず|続行", "平文ログへ残さない|平文ログに残さない", "429以外変更しない|429 以外変更しない|429以外は維持", "並行リクエスト"]
+    },
+    {
+      "id": "long-normal-17",
+      "input_text": "毎日午前2時に動く在庫同期ジョブが、前日の処理が長引いた日に二重起動して在庫数を上書きすることがあります。scheduler の設定だけで避けるのではなく、ジョブ開始時に PostgreSQL advisory lock を取得し、同じ warehouseId の処理がすでに動いていれば新しい実行はスキップしてください。別 warehouseId は並行実行して構いません。ロックを取得できなかった場合はエラー終了ではなく skipped として記録し、監視アラートを発報しないでください。外部在庫 API は1ページ100件で、429 の場合だけ Retry-After に従い最大3回再試行し、400 や 401 は再試行しないでください。途中で失敗した場合は最後に完了した cursor を保存し、次回はそこから再開してください。ただし同期対象日の異なる cursor を誤って再利用しないでください。ジョブ終了時は成功・失敗にかかわらずロックを解放し、warehouseId、対象日、処理件数、再試行回数、最終 cursor を構造化ログへ残してください。商品名や仕入価格はログへ出さないでください。二重起動、別倉庫、429、401、中断再開を統合テストで確認してください。",
+      "required_terms": ["午前2時", "scheduler", "PostgreSQL advisory lock", "warehouseId", "skipped", "API", "100件", "429", "Retry-After", "最大3回", "400", "401", "cursor"],
+      "required_marker_groups": ["二重起動", "別warehouseIdは並行実行|別 warehouseId は並行実行", "アラートを発報しない|監視アラートを発報しない", "429の場合だけ再試行|429だけ再試行|429 のみ再試行", "400や401は再試行しない|400 と 401 は再試行しない", "次回はそこから再開|次回再開|再開", "対象日の異なるcursorを再利用しない|対象日の異なる cursor を再利用しない", "成功・失敗にかかわらずロックを解放|必ずロックを解放", "商品名や仕入価格はログへ出さない|商品名と仕入価格をログへ出さない"]
+    },
+    {
+      "id": "long-normal-18",
+      "input_text": "CLI の設定値がどこから来たのか分かりにくく、環境変数を変えたのに config.yaml が優先されているように見えるので、優先順位を明文化して実装も揃えてください。優先順位はコマンドライン引数、環境変数、プロジェクト直下の config.yaml、ユーザーディレクトリの config.yaml、組み込み既定値の順です。たとえば --timeout が指定されていれば APP_TIMEOUT より優先し、どちらもなければ YAML を参照してください。数値が不正、負数、上限の600秒を超える場合は黙って既定値へ戻さず、設定元を示して exit code 2 にしてください。--print-config では最終的な値と source を表示しますが、API_KEY、TOKEN、PASSWORD を含む項目は値を ******** にマスクしてください。既存の --help、--version、標準入力処理は変更しないでください。Windows の APPDATA と Linux の XDG_CONFIG_HOME の両方を扱い、パスが存在しない場合はエラーにせず次の設定元へ進んでください。優先順位の全組み合わせ、不正値、秘密値マスクをテーブル駆動テストで確認してください。README に具体例も追加してください。",
+      "required_terms": ["CLI", "config.yaml", "--timeout", "APP_TIMEOUT", "YAML", "600秒", "exit code 2", "--print-config", "source", "API_KEY", "TOKEN", "PASSWORD", "********", "--help", "--version", "Windows", "APPDATA", "Linux", "XDG_CONFIG_HOME", "README"],
+      "required_marker_groups": ["優先順位", "コマンドライン引数が環境変数より優先|コマンドライン引数を優先", "黙って既定値へ戻さず|既定値へ戻さない", "マスク", "変更しない|維持", "存在しない場合は次の設定元へ進む|存在しなければ次へ進む", "テーブル駆動テスト", "具体例"]
+    },
+    {
+      "id": "long-normal-19",
+      "input_text": "利用状況を把握するためイベント計測を追加したいのですが、入力内容が外部へ送られる設計にはしたくありません。対象イベントは app_started、compression_started、compression_completed、compression_failed の4つです。送信してよいのは app_version、os、selected_level、model_id、input_length_bucket、duration_ms、error_code だけで、プロンプト本文、圧縮結果、ファイルパス、ユーザー名、IP アドレスは収集しないでください。input_length_bucket は 0-499、500-1999、2000+ の3区分にし、元の文字数を復元できないよう正確な値は送らないでください。初期状態はオプトアウトではなく計測無効にし、設定画面で利用者が明示的に有効化した場合だけ送信してください。無効化後はキューに残っている未送信イベントも削除してください。ネットワーク障害時の再送は最大24時間までとし、アプリ起動や圧縮処理を待たせないでください。開発ビルドでは送信先をローカルの mock endpoint に差し替えられるようにし、本番 API key をリポジトリへ含めないでください。イベントごとの許可フィールドと禁止フィールドをテストし、プライバシー方針を README に追記してください。",
+      "required_terms": ["app_started", "compression_started", "compression_completed", "compression_failed", "app_version", "os", "selected_level", "model_id", "input_length_bucket", "duration_ms", "error_code", "0-499", "500-1999", "2000+", "24時間", "mock endpoint", "API key", "README"],
+      "required_marker_groups": ["4つ|4 イベント", "本文を収集しない|プロンプト本文を収集しない", "正確な値は送らない|正確な文字数を送らない", "初期状態は無効|既定で無効", "明示的に有効化した場合だけ|同意した場合のみ", "未送信イベントも削除|未送信イベントを削除", "処理を待たせない|非同期", "リポジトリへ含めない|API keyを含めない|API key を含めない", "禁止フィールドをテスト|許可・禁止フィールドをテスト"]
+    },
+    {
+      "id": "long-normal-20",
+      "input_text": "障害対応のたびに担当者ごとに手順が違うので、payment-worker の運用 Runbook を README とは別の docs/runbooks/payment-worker.md として作ってください。対象はキュー滞留、外部 PSP のタイムアウト、DB 接続枯渇、デプロイ後のエラー率上昇です。各項目に、症状、確認する dashboard と log query、一次切り分け、影響を広げない暫定対応、復旧確認、エスカレーション条件を入れてください。コマンド例は本番でそのまま実行すると変更が入るものを避け、kubectl delete、DB 更新、キュー削除のような破壊的操作は記載する場合も実行前承認が必要だと明記してください。秘密値や実在する顧客 ID は例へ入れず、namespace と deployment 名はプレースホルダーにしてください。ロールバック判断は error_rate が10分間5%超、または決済成功率が95%未満を目安にしますが、自動実行にはしないでください。復旧後は incident_id、開始・終了時刻、影響件数、実施操作を記録するテンプレートも付けてください。既存監視名が分からない場合は作り話で補わず TODO として確認先を示してください。日本語で簡潔に書き、初めて当番に入る人でも順番に確認できる構成にしてください。",
+      "required_terms": ["payment-worker", "Runbook", "README", "docs/runbooks/payment-worker.md", "PSP", "DB", "dashboard", "log query", "kubectl delete", "namespace", "deployment", "error_rate", "10分間", "5%", "95%", "incident_id", "TODO"],
+      "required_marker_groups": ["症状", "一次切り分け", "暫定対応", "復旧確認", "エスカレーション条件|エスカレーション", "実行前承認", "秘密値を例へ入れず|秘密値を入れない", "顧客IDを入れない|顧客 ID を入れない", "自動実行にしない|自動実行しない", "テンプレート", "作り話で補わず|作り話をしない", "日本語", "順番"]
+    },
+    {
+      "id": "long-noisy-01",
+      "input_text": "すみません検索がまた変です、ええと Recat、じゃなくて React の管理画面です。文字を打つたび API が飛んでるっぽくて重いので、検索ぼたんを押したときだけ GET /api/customers を呼ぶようにしてください。Enter でも検索できるのは残したいです。useSerchParams と書いたけど正しくは useSearchParams で、URL の keyword と stauts、status です、あと page を保持してください。ｓｄｆｊｋｌ；：これはキーボードに触っただけなので意味ないです。新しく検索した時は page を 1 に戻す、でもページを移動しただけなら条件は消さない、という動きにしたいです。前の通信が後から返って画面を上書きすることがあるので AbortContorller、正しくは AbortController で古い通信を止めてください。たぶん昨日も書きましたが、CSS とコンポーネントを全部作り直すのはやめてください。Vitset ではなく Vitest で、入力中に API を呼ばないこと、ボタンと Enter、古い通信の中断を確認してください。あああ、、変換中の文字は無視で大丈夫です。",
+      "required_terms": ["React", "API", "GET /api/customers", "Enter", "useSearchParams", "URL", "keyword", "status", "page", "AbortController", "CSS", "Vitest"],
+      "required_marker_groups": ["だけ|のみ", "入力中に呼ばない|文字を打つたび飛ばない|入力中は通信しない", "pageを1に戻す|page を 1 に戻す", "条件は消さない|条件を消さない|保持", "古い通信を止め|古いリクエストを中断", "作り直すのはやめ|作り直さない", "テスト|確認"]
+    },
+    {
+      "id": "long-noisy-02",
+      "input_text": "CSV インポートの文字ばけの件をお願いしまうs。管理画面に取引先のファイルを入れると Shift JSI だったり UTF8 BMO だったりして読めないです。正しくは Shift_JIS と UTF-8 BOM です。UTF-8 も含めて3種類を判定して読めるようにしてください。途中に かなかなかな///888 みたいな文字がありますが依頼とは関係ありません。10BM、ではなく10MBを超えるファイルは中身を読む前に拒否して INVALID_FILE_SISE、綴りを直して INVALID_FILE_SIZE を返してください。既存の colmuns は columns、dryrun は dryRun で、マッピングとエラー行番号と重複判定を今のまま残してください。空行は飛ばしていいけど空のセルを左に詰めるのはだめです。ログに CSV 全部を出すと個人情報が入るので、行番号と列名までにしてください。大きいファイルで UI が止まらないようストリームにして、途中でエラーなら半分だけ DB に入った状態にしないでください。画面を新しく作る話ではないです。にゅうりょくみすｓｓｓ、ここも無視してください。",
+      "required_terms": ["CSV", "Shift_JIS", "UTF-8 BOM", "UTF-8", "10MB", "INVALID_FILE_SIZE", "columns", "dryRun", "UI", "DB"],
+      "required_marker_groups": ["3種類|3 種類", "中身を読む前に拒否|読み込み前に拒否", "今のまま残|維持", "空行は飛ばす|空行を無視", "空のセルを詰めない|列を詰めない", "CSV全部をログに出さない|CSV 全部をログに出さない|全内容をログへ出さない", "ストリーム", "半分だけDBに入れない|半分だけ DB に入れない|部分登録しない", "画面を新しく作らない|UI変更不要"]
+    },
+    {
+      "id": "long-noisy-03",
+      "input_text": "Nex.js、Nextjs かな、正式には Next.js の POST /api/odrers、すみません POST /api/orders のエラーを直してください。custmerID が空で500になるやつです。項目名は customerId です。未指定と null と空文字とスペースだけなら HTTP400、表記は HTTP 400 にして INVALID_CUSTMER ではなく INVALID_CUSTOMER を返してほしいです。reqestId、正しくは requestId も無い場合は INVALID_REQUEST_ID にしてください。[]{}っっっっ これは貼り付けの残りで意味はありません。在庫引当の前に止めること、成功レスポンス、orderId、決済予約、監査ログは変えないことが大事です。同じ requestId がまた来ても注文を2個作らないで、今ある冪等処理を使ってください。エラーに customerId の実値をそのまま書かないでください。正常、空、null、空白、再送のテストを足してください。DB を変えたり注文処理を全部整理し直したりは今はいりません。たぶん 400 じゃなくて 404 と最初書こうとしましたが、ここは HTTP 400 が正しいです。",
+      "required_terms": ["Next.js", "POST /api/orders", "customerId", "HTTP 400", "INVALID_CUSTOMER", "requestId", "INVALID_REQUEST_ID", "orderId", "DB"],
+      "required_marker_groups": ["在庫引当の前|在庫引当前", "成功レスポンスは変えない|成功レスポンスを変更しない", "注文を2個作らない|注文を 2 個作らない|二重注文を作らない", "実値を書かない|個人情報を含めない", "正常", "空文字|空", "null", "空白", "再送", "DBを変えない|DB変更不要", "HTTP 400が正しい|HTTP 400 が正しい"]
+    },
+    {
+      "id": "long-noisy-04",
+      "input_text": "デスクトップアプリのせってい保存をつけてください。Windows です。毎回モデルと圧縮れべるとテーマを選ぶのがめんどうで、あとウインドウサイズも戻してほしいです。保存するのはこの4つだけです。本文とか圧縮した結果とかクリップボードとか、さいきん開いたパスは保存しなで、保存しないでください。user-setings.json と書きかけましたが user-settings.json が正しい名前です。保存先は aplication/local/stete じゃなくて application/local/state です。んんんんｎ 変換候補 123あいう ここは意味ないので消してよいです。書いてる途中で落ちても JSON が壊れないよう、一時ファイルに書いてから置き換えてください。壊れた設定、ファイルなし、読み込み失敗でも起動を止めないで既定値で続けて、警告ログだけ出してください。ただし本文や設定の中身をログに貼らないでください。知らないキーが入っていても消さないでください。レジストリに移す必要はありません。前回の設定が次回起動で戻るところまでテストしたいです。",
+      "required_terms": ["Windows", "user-settings.json", "application/local/state", "JSON"],
+      "required_marker_groups": ["4つだけ|4 項目のみ", "本文を保存しない|本文は保存しない", "一時ファイルに書いてから置き換え|一時ファイルから置換", "起動を止めない|起動継続", "既定値", "警告ログ", "中身をログに貼らない|ログへ出さない", "知らないキーを消さない|未知キーを保持", "レジストリに移す必要はない|移行不要", "次回起動で戻る|復元"]
+    },
+    {
+      "id": "long-noisy-05",
+      "input_text": "WebSoket が切れたときの再接続をいい感じに、という依頼です。WebSocket が正しいです。いま全員が同時に戻ってサーバーが重くなるので指数ばっくおふで 1秒、2病、いや2秒、4秒、最大30秒にしてください。待ち時間にプラマイ20%、±20% の jitter を入れて散らしてください。zzzzzz 今日はカレーでした 987654 これはタッチミスと関係ない話なので依頼には含めないでください。60秒つながったら回数を0に戻す。手動 logout と close cord 4001、正しくは close code 4001、それから4003の時は再接続しないでください。online イベントが何回きても soket、socket を2本作らないでください。message hander は message handler です、これと token 更新は変えないでください。10会、10回失敗したら自動を止めて再接続ボタンを出してください。token と受信本文はログに書かないでください。fake timre、fake timer のテストで待ち時間、jitter、停止、二重接続を確認してください。たぶん最大は20秒とも考えましたが、最終的には30秒でお願いします。",
+      "required_terms": ["WebSocket", "1秒", "2秒", "4秒", "30秒", "±20%", "jitter", "60秒", "logout", "close code 4001", "4003", "socket", "message handler", "token", "10回", "fake timer"],
+      "required_marker_groups": ["指数バックオフ|指数ばっくおふ", "0に戻す|リセット", "再接続しない", "2本作らない|二重接続しない", "変えない|維持", "自動を止め|自動再接続を止め", "ログに書かない|ログへ残さない", "テスト|確認", "最終的には30秒|最大30秒"]
+    }
+  ]
+}
