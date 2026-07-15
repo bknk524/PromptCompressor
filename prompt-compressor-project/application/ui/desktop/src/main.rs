@@ -32,6 +32,7 @@ use tao::{
 const APP_USER_MODEL_ID: &str = "PromptCompressor.Desktop";
 const APP_WINDOW_TITLE: &str = "Prompt Compressor";
 const SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\PromptCompressor.Desktop.SingleInstance";
+const ALREADY_RUNNING_MESSAGE: &str = "Prompt Compressor はすでに起動しています。";
 const PROTOCOL_WORKER_COUNT: usize = 4;
 const PROTOCOL_QUEUE_CAPACITY: usize = 16;
 const MAX_NOTIFICATION_TITLE_CHARS: usize = 128;
@@ -122,6 +123,7 @@ fn run(args: Args) -> Result<()> {
         return run_packaged_local_model_smoke_test(args.settings_dir);
     }
 
+    // ウィンドウ作成前に判定し、モデルの二重読み込みも防ぐ。
     let Some(_single_instance) = acquire_single_instance()? else {
         return Ok(());
     };
@@ -148,26 +150,35 @@ impl Drop for SingleInstanceGuard {
 
 #[cfg(windows)]
 fn acquire_single_instance() -> Result<Option<SingleInstanceGuard>> {
+    let instance = try_acquire_named_mutex(SINGLE_INSTANCE_MUTEX_NAME)?;
+    if instance.is_none() {
+        show_already_running_notice();
+    }
+    Ok(instance)
+}
+
+#[cfg(windows)]
+fn try_acquire_named_mutex(name: &str) -> Result<Option<SingleInstanceGuard>> {
     use std::ptr;
     use windows_sys::Win32::{
         Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS},
         System::Threading::CreateMutexW,
     };
 
-    let name = wide_null(SINGLE_INSTANCE_MUTEX_NAME);
+    let name = wide_null(name);
     let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
+    let last_error = unsafe { GetLastError() };
     if handle.is_null() {
         anyhow::bail!(
             "failed to create desktop single-instance mutex: {}",
-            unsafe { GetLastError() }
+            last_error
         );
     }
 
-    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+    if last_error == ERROR_ALREADY_EXISTS {
         unsafe {
             let _ = CloseHandle(handle);
         }
-        restore_existing_instance();
         return Ok(None);
     }
 
@@ -175,11 +186,11 @@ fn acquire_single_instance() -> Result<Option<SingleInstanceGuard>> {
 }
 
 #[cfg(windows)]
-fn restore_existing_instance() {
+fn show_already_running_notice() {
     use std::ptr;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         FindWindowW, MessageBoxW, SetForegroundWindow, ShowWindow, MB_ICONINFORMATION, MB_OK,
-        SW_RESTORE,
+        MB_SETFOREGROUND, SW_RESTORE,
     };
 
     let title = wide_null(APP_WINDOW_TITLE);
@@ -189,16 +200,15 @@ fn restore_existing_instance() {
             let _ = ShowWindow(window, SW_RESTORE);
             let _ = SetForegroundWindow(window);
         }
-        return;
     }
 
-    let message = wide_null("Prompt Compressor は既に起動しています。");
+    let message = wide_null(ALREADY_RUNNING_MESSAGE);
     unsafe {
         let _ = MessageBoxW(
             ptr::null_mut(),
             message.as_ptr(),
             title.as_ptr(),
-            MB_OK | MB_ICONINFORMATION,
+            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
         );
     }
 }
@@ -1220,6 +1230,27 @@ fn protocol_response(response: LocalAppResponse) -> Response<Cow<'static, [u8]>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn named_mutex_allows_only_one_desktop_instance() {
+        let mutex_name = format!(
+            "Local\\PromptCompressor.Desktop.Test.{}",
+            std::process::id()
+        );
+        let first = try_acquire_named_mutex(&mutex_name)
+            .expect("create first mutex")
+            .expect("first instance should acquire mutex");
+
+        assert!(try_acquire_named_mutex(&mutex_name)
+            .expect("check duplicate mutex")
+            .is_none());
+
+        drop(first);
+        assert!(try_acquire_named_mutex(&mutex_name)
+            .expect("reacquire released mutex")
+            .is_some());
+    }
 
     fn valid_smoke_result() -> serde_json::Value {
         serde_json::json!({

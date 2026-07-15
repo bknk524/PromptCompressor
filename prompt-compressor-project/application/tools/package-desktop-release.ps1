@@ -49,8 +49,75 @@ function Copy-Directory {
     if (-not (Test-Path $Source)) {
         throw "Required directory not found: $Source"
     }
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Destination) | Out-Null
-    Copy-Item -LiteralPath $Source -Destination $Destination -Recurse -Force
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    foreach ($entry in Get-ChildItem -LiteralPath $Source -Force) {
+        $entryDestination = Join-Path $Destination $entry.Name
+        if ($entry.PSIsContainer) {
+            Copy-Directory -Source $entry.FullName -Destination $entryDestination
+        } else {
+            Copy-Item -LiteralPath $entry.FullName -Destination $entryDestination -Force
+        }
+    }
+}
+
+function Remove-PackageEntry {
+    param(
+        [Parameter(Mandatory = $true)][string]$PackageRoot,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    Assert-ChildPath -Parent $PackageRoot -Child $Path
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Remove-Item -LiteralPath $Path -Force
+        return
+    }
+    Remove-Item -LiteralPath $Path -Recurse -Force
+}
+
+function Reset-PackageManagedContent {
+    param([Parameter(Mandatory = $true)][string]$PackagePath)
+
+    $packageItem = Get-Item -LiteralPath $PackagePath -Force
+    if (($packageItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Package path must not be a reparse point: $PackagePath"
+    }
+
+    # PCごとのモデルや状態を残し、ビルドで管理するファイルだけを更新する。
+    foreach ($entry in Get-ChildItem -LiteralPath $PackagePath -Force) {
+        if ($entry.Name -ieq "application" -and $entry.PSIsContainer) {
+            continue
+        }
+        Remove-PackageEntry -PackageRoot $PackagePath -Path $entry.FullName
+    }
+
+    $packageApplicationPath = Join-Path $PackagePath "application"
+    if (-not (Test-Path -LiteralPath $packageApplicationPath -PathType Container)) {
+        return
+    }
+    $applicationItem = Get-Item -LiteralPath $packageApplicationPath -Force
+    if (($applicationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Package application path must not be a reparse point: $packageApplicationPath"
+    }
+
+    foreach ($entry in Get-ChildItem -LiteralPath $packageApplicationPath -Force) {
+        if ($entry.Name -ieq "local" -and $entry.PSIsContainer) {
+            continue
+        }
+        if ($entry.Name -ieq "config" -and $entry.PSIsContainer) {
+            if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Package config path must not be a reparse point: $($entry.FullName)"
+            }
+            foreach ($configEntry in Get-ChildItem -LiteralPath $entry.FullName -Force) {
+                if ($configEntry.Name -ieq "user" -and $configEntry.PSIsContainer) {
+                    continue
+                }
+                Remove-PackageEntry -PackageRoot $PackagePath -Path $configEntry.FullName
+            }
+            continue
+        }
+        Remove-PackageEntry -PackageRoot $PackagePath -Path $entry.FullName
+    }
 }
 
 function Copy-RelativeFile {
@@ -317,7 +384,7 @@ if (Test-Path $packagePath) {
         throw "Package path already exists. Re-run with -Clean to replace it: $packagePath"
     }
     Stop-PackageProcesses -PackagePath $packagePath
-    Remove-Item -LiteralPath $packagePath -Recurse -Force
+    Reset-PackageManagedContent -PackagePath $packagePath
 }
 
 New-Item -ItemType Directory -Force -Path $packagePath | Out-Null
@@ -375,6 +442,7 @@ Default profile: $defaultProfile
 Model: downloaded from Hugging Face on first launch to application/$modelPath
 Runtime: $runtimeManifest
 Desktop transport: WebView2 custom protocol (no HTTP server, no localhost port)
+Update behavior: application/local and application/config/user are preserved by -Clean
 
 This folder is a runnable package. It is intentionally separate from the source
 project folder and contains only the desktop executable plus runtime assets.
@@ -382,13 +450,18 @@ project folder and contains only the desktop executable plus runtime assets.
 $manifest | Set-Content -Encoding UTF8 (Join-Path $packagePath "PACKAGE_MANIFEST.txt")
 
 if (-not $SkipLocalModelSmokeTest) {
-    Copy-RelativeFile -RelativePath $modelPath
+    $preservedModel = Test-Path -LiteralPath $packagedModelPath -PathType Leaf
+    if (-not $preservedModel) {
+        Copy-RelativeFile -RelativePath $modelPath
+    }
     Assert-PackagedFile -RelativePath "application\$modelPath" -MinimumBytes 1048576
     try {
         Test-PackagedLocalModelCompression `
             -PackagePath $packagePath
     } finally {
-        Remove-PackagedModel -PackagePath $packagePath -ModelPath $packagedModelPath
+        if (-not $preservedModel) {
+            Remove-PackagedModel -PackagePath $packagePath -ModelPath $packagedModelPath
+        }
     }
 }
 

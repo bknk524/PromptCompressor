@@ -256,6 +256,14 @@ input {
   flex: 0 0 auto;
 }
 
+.topbar-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
 .topbar-actions {
   position: relative;
   display: flex;
@@ -280,14 +288,27 @@ p {
 }
 
 h1 {
+  flex: 0 0 auto;
   font-size: 24px;
   line-height: 1.1;
   letter-spacing: 0;
+  white-space: nowrap;
 }
 
-.topbar p {
-  margin-top: 4px;
+.current-settings {
+  min-width: 0;
+  max-width: min(440px, 44vw);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 9px;
+  background: var(--panel);
   color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .status-pill {
@@ -502,8 +523,7 @@ label {
 }
 
 select,
-textarea,
-input[type="range"] {
+textarea {
   width: 100%;
 }
 
@@ -518,8 +538,7 @@ select {
 
 select:focus,
 textarea:focus,
-button:focus-visible,
-input[type="range"]:focus-visible {
+button:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
 }
@@ -527,38 +546,66 @@ input[type="range"]:focus-visible {
 .level-control {
   align-content: start;
   grid-column: 1 / -1;
+  min-width: 0;
+  margin: 0;
+  border: 0;
+  padding: 0;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
 }
 
-.level-label-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+.level-control legend {
+  margin-bottom: 6px;
+  padding: 0;
 }
 
-.level-label-row strong {
+.level-switch {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--control);
+}
+
+.level-option {
+  min-height: 38px;
+  border: 0;
+  border-radius: 0;
+  background: var(--control);
+  color: var(--muted);
+}
+
+.level-option + .level-option {
+  border-left: 1px solid var(--border);
+}
+
+.level-option:not([aria-pressed="true"]):hover {
+  border-color: var(--border);
+  background: var(--chrome-hover);
   color: var(--text);
-  font-size: 16px;
-  line-height: 1;
+}
+
+.level-option[aria-pressed="true"],
+.level-option[aria-pressed="true"]:hover {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--panel);
+}
+
+.level-option:focus-visible {
+  position: relative;
+  z-index: 1;
+  outline-offset: -3px;
 }
 
 .level-help {
+  display: block;
+  margin-top: 6px;
   color: var(--text);
   font-size: 12px;
   line-height: 1.35;
-}
-
-.level-scale {
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-  color: var(--muted);
-  font-size: 11px;
-  line-height: 1.25;
-}
-
-input[type="range"] {
-  accent-color: var(--accent);
 }
 
 button {
@@ -628,6 +675,28 @@ button.secondary:hover {
 .head-actions .sample-select {
   width: auto;
   min-width: 164px;
+}
+
+.input-section-head > div:first-child,
+.input-section-head .head-actions button {
+  flex: 0 0 auto;
+}
+
+.input-section-head h2 {
+  white-space: nowrap;
+}
+
+.input-section-head .head-actions {
+  flex: 1 1 auto;
+  min-width: 0;
+  flex-wrap: nowrap;
+  justify-content: flex-end;
+}
+
+.input-section-head .head-actions .sample-select {
+  flex: 1 1 164px;
+  width: auto;
+  min-width: 0;
 }
 
 .result-title-row {
@@ -770,6 +839,16 @@ textarea[readonly] {
     font-size: 20px;
   }
 
+  .topbar-brand {
+    gap: 8px;
+  }
+
+  .current-settings {
+    max-width: min(38vw, 300px);
+    padding: 4px 7px;
+    font-size: 11px;
+  }
+
   .topbar-actions,
   .status-group {
     gap: 6px;
@@ -839,6 +918,15 @@ textarea[readonly] {
     flex-direction: column;
   }
 
+  .topbar-brand {
+    width: 100%;
+  }
+
+  .current-settings {
+    flex: 1 1 auto;
+    max-width: none;
+  }
+
   .topbar-actions {
     align-items: center;
     justify-content: space-between;
@@ -875,6 +963,22 @@ textarea[readonly] {
 
   .head-actions button {
     width: 100%;
+  }
+
+  .input-section-head {
+    align-items: center;
+    flex-direction: row;
+    gap: 8px;
+  }
+
+  .input-section-head .head-actions {
+    display: flex;
+    grid-template-columns: none;
+  }
+
+  .input-section-head .head-actions .sample-select,
+  .input-section-head .head-actions button {
+    width: auto;
   }
 
   .settings-grid {

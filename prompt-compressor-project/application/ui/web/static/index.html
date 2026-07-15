@@ -41,8 +41,15 @@
     </div>
     <main class="app-shell">
       <header class="topbar">
-        <div>
+        <div class="topbar-brand">
           <h1>Prompt Compressor</h1>
+          <p
+            class="current-settings"
+            id="settingsSummary"
+            aria-label="現在のモデルと圧縮モード"
+          >
+            内部モデル / 標準
+          </p>
         </div>
         <div class="topbar-actions">
           <div class="status-group" aria-label="状態">
@@ -63,7 +70,7 @@
           <div class="settings-menu" id="settingsMenu" hidden>
             <div class="settings-menu-head">
               <h2>設定</h2>
-              <p>モデル、表示、圧縮強度</p>
+              <p>モデル、圧縮モード、表示</p>
             </div>
             <div class="settings-grid" aria-label="Compression settings">
               <label>
@@ -77,19 +84,29 @@
                   <input id="themeToggle" type="checkbox" role="switch" />
                 </span>
               </label>
-              <label class="level-control" for="levelInput">
-                <span class="level-label-row">
-                  <span>圧縮レベル</span>
-                  <strong id="levelValue">2</strong>
-                </span>
-                <input id="levelInput" type="range" min="1" max="3" value="2" />
-                <span class="level-help" id="levelHelp">2 標準: 要件を保ちながら短く圧縮</span>
-                <span class="level-scale" aria-hidden="true">
-                  <span>1 控えめ</span>
-                  <span>2 標準</span>
-                  <span>3 強め</span>
-                </span>
-              </label>
+              <fieldset class="level-control">
+                <legend>圧縮モード</legend>
+                <input id="levelInput" type="hidden" value="2" />
+                <div class="level-switch" role="group" aria-label="圧縮モード">
+                  <button
+                    class="level-option"
+                    type="button"
+                    data-compression-level="2"
+                    aria-pressed="true"
+                  >
+                    標準
+                  </button>
+                  <button
+                    class="level-option"
+                    type="button"
+                    data-compression-level="3"
+                    aria-pressed="false"
+                  >
+                    高圧縮
+                  </button>
+                </div>
+                <span class="level-help" id="levelHelp">要件を保ちながらバランスよく圧縮</span>
+              </fieldset>
             </div>
           </div>
         </div>
@@ -110,20 +127,19 @@
       <div class="workspace-grid">
         <section class="primary-flow" aria-label="Compression workspace">
           <div class="input-card">
-            <div class="section-head">
+            <div class="section-head input-section-head">
               <div>
                 <h2>圧縮予定の文</h2>
-                <p id="settingsSummary">Standard / Level 2 標準</p>
               </div>
               <div class="head-actions">
                 <select class="sample-select" id="sampleSelect" aria-label="サンプル文章">
                   <option value="">サンプルを選択</option>
-                  <option value="search">検索条件と URL</option>
-                  <option value="bugfix">API のバグ修正</option>
-                  <option value="tests">テスト追加</option>
-                  <option value="refactor">コンポーネント整理</option>
-                  <option value="logs">障害ログ解析</option>
-                  <option value="design">設計検討</option>
+                  <option value="search">検索画面の改修</option>
+                  <option value="bugfix">注文 API の入力検証</option>
+                  <option value="settings">アプリ設定の保存</option>
+                  <option value="csv">CSV インポート</option>
+                  <option value="ci">CI のキャッシュ</option>
+                  <option value="logs">障害ログの調査</option>
                 </select>
                 <button class="secondary" id="clearInputButton" type="button">クリア</button>
                 <button id="compressButton" type="button">圧縮する</button>
@@ -175,5 +191,6 @@
       </div>
     </main>
     <script src="/app.js"></script>
+    <script src="/sample-prompts.js"></script>
   </body>
 </html>

@@ -1,4 +1,3 @@
-prompt-compressor-project-exe/application/local/state/
-prompt-compressor-project-exe/application/local/cache/
-prompt-compressor-project-exe/application/local/logs/
+prompt-compressor-project-exe/application/local/
+prompt-compressor-project-exe/application/config/user/
 *.gguf

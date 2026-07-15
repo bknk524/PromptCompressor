@@ -37,6 +37,7 @@ use windows_sys::Win32::{
 const INDEX_HTML: &str = include_str!("../static/index.html");
 const STYLES_CSS: &str = include_str!("../static/styles.css");
 const APP_JS: &str = include_str!("../static/app.js");
+const SAMPLE_PROMPTS_JS: &str = include_str!("../static/sample-prompts.js");
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_REQUEST_PATH_BYTES: usize = 2 * 1024;
@@ -914,6 +915,11 @@ fn route_application_request(
             200,
             "application/javascript; charset=utf-8",
             APP_JS.as_bytes(),
+        ),
+        ("GET", "/sample-prompts.js") => http_response(
+            200,
+            "application/javascript; charset=utf-8",
+            SAMPLE_PROMPTS_JS.as_bytes(),
         ),
         ("GET", "/api/profiles") => json_response(200, &profiles_json(&state.registry)),
         ("GET", "/api/runtime-status") => json_response(200, &state.warmup.json()),
@@ -1905,6 +1911,68 @@ mod tests {
         assert!(!APP_JS.contains("/api/windows-notification"));
         assert!(APP_JS.contains("settingsSaveDelayMs = 250"));
         assert!(APP_JS.contains("scheduleSettingsSave(settings)"));
+    }
+
+    #[test]
+    fn sample_prompts_only_populate_the_input() {
+        assert!(INDEX_HTML.contains("src=\"/sample-prompts.js\""));
+        assert!(SAMPLE_PROMPTS_JS.contains("promptInput.value = sample;"));
+        assert!(!APP_JS.contains("sampleSelect"));
+        for forbidden in [
+            "levelInput",
+            "profileSelect",
+            "saveSettings",
+            "scheduleCompressionPrepare",
+            "clearResultLists",
+            "fetch(",
+        ] {
+            assert!(
+                !SAMPLE_PROMPTS_JS.contains(forbidden),
+                "sample helper must not use {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_model_and_level_are_shown_next_to_the_app_title() {
+        let title = INDEX_HTML
+            .find("<h1>Prompt Compressor</h1>")
+            .expect("app title");
+        let settings_summary = INDEX_HTML
+            .find("id=\"settingsSummary\"")
+            .expect("current settings summary");
+        let workspace = INDEX_HTML
+            .find("class=\"workspace-grid\"")
+            .expect("workspace");
+
+        assert!(INDEX_HTML.contains("class=\"topbar-brand\""));
+        assert!(INDEX_HTML.contains("内部モデル / 標準"));
+        assert!(title < settings_summary && settings_summary < workspace);
+        assert!(STYLES_CSS.contains(".current-settings"));
+        assert!(APP_JS.contains("? \"内部モデル\" : \"自由選択\""));
+        assert!(APP_JS.contains("levelDetail?.name || \"標準\""));
+        assert!(APP_JS.contains("settingsSummary.title = summary"));
+    }
+
+    #[test]
+    fn input_heading_and_actions_are_kept_on_one_line() {
+        assert!(INDEX_HTML.contains("class=\"section-head input-section-head\""));
+        assert!(STYLES_CSS.contains(".input-section-head h2"));
+        assert!(STYLES_CSS.contains(".input-section-head .head-actions"));
+        assert!(STYLES_CSS.contains("flex-wrap: nowrap"));
+    }
+
+    #[test]
+    fn compression_level_ui_only_offers_standard_and_high_compression() {
+        assert!(INDEX_HTML.contains("data-compression-level=\"2\""));
+        assert!(INDEX_HTML.contains("data-compression-level=\"3\""));
+        assert!(!INDEX_HTML.contains("data-compression-level=\"1\""));
+        assert!(INDEX_HTML.contains("標準"));
+        assert!(INDEX_HTML.contains("高圧縮"));
+        assert!(APP_JS.contains("compressionLevelMin = 2"));
+        assert!(APP_JS.contains("name: \"高圧縮\""));
+        assert!(STYLES_CSS.contains(".level-switch"));
+        assert!(STYLES_CSS.contains(".level-option[aria-pressed=\"true\"]"));
     }
 
     #[test]

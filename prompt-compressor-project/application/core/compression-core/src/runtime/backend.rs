@@ -2,15 +2,14 @@ use std::collections::{hash_map::DefaultHasher, BTreeMap};
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::compression::verifier::preserves_requested_numbers;
 use crate::config::profile::ProfileDefinition;
@@ -26,6 +25,20 @@ use super::model_download::{
 };
 pub use super::model_download::{ModelDownloadCancellation, ModelDownloadProgress};
 use super::prompt_structure::PromptStructure;
+
+mod compression_cache;
+mod http_client;
+mod openai_compatible;
+mod output_parser;
+
+#[cfg(test)]
+use compression_cache::MAX_COMPRESSION_CACHE_ENTRIES;
+use compression_cache::{CompressionCacheKey, CompressionDraftCache};
+use http_client::{http_json_request, parse_http_base_url};
+use openai_compatible::{request_openai_completion, resolve_lmstudio_model_name};
+#[cfg(feature = "embedded-llama")]
+use output_parser::first_complete_json_object_end;
+use output_parser::{output_snippet, parse_compression_output};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompressionDraft {
@@ -80,6 +93,27 @@ impl RuntimeCompressionObservation {
             transformations: Vec::new(),
         }
     }
+
+    fn runtime_fallback(final_draft: CompressionDraft) -> Self {
+        Self {
+            raw_model_draft: None,
+            final_draft,
+            transformations: vec![RuntimeTransformation::RuntimeFallback],
+        }
+    }
+
+    fn is_cacheable(&self) -> bool {
+        self.raw_model_draft.is_some()
+            && !self
+                .transformations
+                .contains(&RuntimeTransformation::RuntimeFallback)
+    }
+}
+
+#[cfg(feature = "embedded-llama")]
+enum EmbeddedCompletion {
+    RawModel(CompressionDraft),
+    RuntimeFallback(CompressionDraft),
 }
 
 pub trait RuntimeBackend {
@@ -134,6 +168,7 @@ pub struct ConfiguredRuntimeBackend {
     managed_runtimes: Arc<ManagedRuntimeManager>,
     embedded_models: Arc<EmbeddedModelManager>,
     model_files: Arc<ModelFileCoordinator>,
+    compression_cache: Arc<Mutex<CompressionDraftCache>>,
 }
 
 #[derive(Debug, Default)]
@@ -398,6 +433,7 @@ impl ConfiguredRuntimeBackend {
             managed_runtimes: Arc::new(ManagedRuntimeManager::default()),
             embedded_models: Arc::new(EmbeddedModelManager::default()),
             model_files: Arc::new(ModelFileCoordinator::default()),
+            compression_cache: Arc::new(Mutex::new(CompressionDraftCache::default())),
         })
     }
 
@@ -579,7 +615,7 @@ impl ConfiguredRuntimeBackend {
                 runtime.id
             ))
         })?;
-        let model_name = self.resolve_lmstudio_model_name(model, runtime)?;
+        let model_name = resolve_lmstudio_model_name(model, runtime)?;
         self.compress_with_openai_compatible(
             request,
             profile,
@@ -613,110 +649,9 @@ impl ConfiguredRuntimeBackend {
         model_name: &str,
     ) -> Result<RuntimeCompressionObservation> {
         let first_draft =
-            self.request_openai_completion(request, prompt, model, runtime, base_url, model_name)?;
+            request_openai_completion(request, prompt, model, runtime, base_url, model_name)?;
         trace_model_output("openai.raw_draft", &first_draft.distilled_prompt);
         finalize_observed_model_draft(request, first_draft)
-    }
-
-    fn request_openai_completion(
-        &self,
-        request: &CompressionRequest,
-        prompt: &str,
-        model: &ModelDefinition,
-        runtime: &RuntimeDefinition,
-        base_url: &str,
-        model_name: &str,
-    ) -> Result<CompressionDraft> {
-        let payload = ChatCompletionRequest {
-            model: model_name,
-            messages: vec![
-                ChatMessage {
-                    role: "system",
-                    content: "返答は JSON オブジェクトだけにしてください。日本語入力には日本語で返答し、コード、識別子、API 名、ファイル名は原文のまま保持してください。",
-                },
-                ChatMessage {
-                    role: "user",
-                    content: prompt,
-                },
-            ],
-            temperature: 0.0,
-            max_tokens: effective_max_output_tokens(request, model),
-            stream: false,
-            response_format: model
-                .supports_json_schema
-                .then(compression_response_schema),
-        };
-        let body = serde_json::to_vec(&payload).map_err(|error| {
-            CompressionError::Runtime(format!(
-                "failed to serialize local runtime request: {error}"
-            ))
-        })?;
-        let response_body = http_json_request(
-            "POST",
-            base_url,
-            "/chat/completions",
-            runtime.api_token_env.as_deref(),
-            Some(&body),
-            Duration::from_millis(runtime.timeout_ms),
-        )?;
-        let completion: ChatCompletionResponse =
-            serde_json::from_str(&response_body).map_err(|error| {
-                CompressionError::Runtime(format!(
-                    "local runtime response was not valid chat completion JSON: {error}"
-                ))
-            })?;
-        let content = completion
-            .choices
-            .first()
-            .and_then(|choice| choice.message.content.as_deref())
-            .ok_or_else(|| {
-                CompressionError::Runtime(
-                    "local runtime response did not include choices[0].message.content".into(),
-                )
-            })?;
-
-        parse_compression_output(content)
-    }
-
-    fn resolve_lmstudio_model_name(
-        &self,
-        model: &ModelDefinition,
-        runtime: &RuntimeDefinition,
-    ) -> Result<String> {
-        let configured = model.api_model.as_deref().unwrap_or(model.id.as_str());
-        if configured != "auto" {
-            return Ok(configured.to_string());
-        }
-
-        let base_url = runtime.base_url.as_deref().ok_or_else(|| {
-            CompressionError::InvalidConfig(format!(
-                "runtime '{}' is missing base_url for LM Studio",
-                runtime.id
-            ))
-        })?;
-        let response_body = http_json_request(
-            "GET",
-            base_url,
-            "/models",
-            runtime.api_token_env.as_deref(),
-            None,
-            Duration::from_millis(runtime.timeout_ms),
-        )?;
-        let models: ModelsResponse = serde_json::from_str(&response_body).map_err(|error| {
-            CompressionError::Runtime(format!(
-                "LM Studio /models response was not valid JSON: {error}"
-            ))
-        })?;
-
-        models
-            .data
-            .first()
-            .map(|item| item.id.clone())
-            .ok_or_else(|| {
-                CompressionError::Runtime(
-                    "LM Studio returned no available models from /v1/models".into(),
-                )
-            })
     }
 
     fn compress_with_managed_llama_cpp_server(
@@ -886,10 +821,18 @@ impl ConfiguredRuntimeBackend {
         model: &ModelDefinition,
         runtime: &RuntimeDefinition,
     ) -> Result<RuntimeCompressionObservation> {
-        let first_draft =
+        let completion =
             self.request_embedded_llama_completion(request, prompt_parts, model, runtime, true)?;
-        trace_model_output("embedded.raw_draft", &first_draft.distilled_prompt);
-        finalize_observed_model_draft(request, first_draft)
+        match completion {
+            EmbeddedCompletion::RawModel(first_draft) => {
+                trace_model_output("embedded.raw_draft", &first_draft.distilled_prompt);
+                finalize_observed_model_draft(request, first_draft)
+            }
+            EmbeddedCompletion::RuntimeFallback(final_draft) => {
+                trace_model_output("embedded.timeout_fallback", &final_draft.distilled_prompt);
+                Ok(RuntimeCompressionObservation::runtime_fallback(final_draft))
+            }
+        }
     }
 
     #[cfg(feature = "embedded-llama")]
@@ -900,7 +843,7 @@ impl ConfiguredRuntimeBackend {
         model: &ModelDefinition,
         runtime: &RuntimeDefinition,
         allow_prompt_cache: bool,
-    ) -> Result<CompressionDraft> {
+    ) -> Result<EmbeddedCompletion> {
         let total_started_at = Instant::now();
         let model_path = self.resolve_model_file_path(model, &runtime.id)?;
         let cache_key = embedded_model_cache_key(model, &model_path);
@@ -1032,7 +975,7 @@ impl ConfiguredRuntimeBackend {
                     trace_runtime_timing("embedded.generation", started_at.elapsed());
                     trace_runtime_value("embedded.generated_chunks", generated_chunks);
                     trace_runtime_value("embedded.output_chars", output.chars().count());
-                    return Ok(draft);
+                    return Ok(EmbeddedCompletion::RuntimeFallback(draft));
                 }
                 return Err(CompressionError::RuntimeTimeout(runtime.timeout_ms));
             }
@@ -1058,7 +1001,7 @@ impl ConfiguredRuntimeBackend {
         let parsed = parse_compression_output(output);
         trace_runtime_timing("embedded.output_parse", parse_started_at.elapsed());
         trace_runtime_timing("embedded.total_completion", total_started_at.elapsed());
-        parsed
+        parsed.map(EmbeddedCompletion::RawModel)
     }
 
     fn resolve_model_file_path(
@@ -1339,8 +1282,24 @@ impl RuntimeBackend for ConfiguredRuntimeBackend {
         request: &CompressionRequest,
         profile: &ProfileDefinition,
     ) -> Result<CompressionDraft> {
-        self.compress_observed_configured(request, profile)
-            .map(|observation| observation.final_draft)
+        let cache_key = CompressionCacheKey::new(request, profile);
+        if let Ok(mut cache) = self.compression_cache.lock() {
+            if let Some(draft) = cache.get(&cache_key) {
+                trace_runtime_value("compression_result_cache_hit", 1);
+                return Ok(draft);
+            }
+        }
+        trace_runtime_value("compression_result_cache_hit", 0);
+
+        let observation = self.compress_observed_configured(request, profile)?;
+        let should_cache = observation.is_cacheable();
+        let draft = observation.final_draft;
+        if should_cache {
+            if let Ok(mut cache) = self.compression_cache.lock() {
+                cache.insert(cache_key, draft.clone());
+            }
+        }
+        Ok(draft)
     }
 
     fn compress_observed(
@@ -1514,381 +1473,10 @@ fn structured_candidate_preserves_requirements(input: &str, candidate: &str) -> 
         && preserves_verification_constraints(input, candidate)
 }
 
-#[derive(Debug, Deserialize)]
-struct ModelCompressionOutput {
-    distilled_prompt: String,
-    #[serde(default)]
-    removed_content_summary: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatCompletionRequest<'a> {
-    model: &'a str,
-    messages: Vec<ChatMessage<'a>>,
-    temperature: f32,
-    max_tokens: u32,
-    stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_format: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatMessage<'a> {
-    role: &'a str,
-    content: &'a str,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatCompletionResponse {
-    choices: Vec<ChatChoice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatChoice {
-    message: ChatCompletionMessage,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatCompletionMessage {
-    content: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ModelsResponse {
-    data: Vec<ModelListItem>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ModelListItem {
-    id: String,
-}
-
 struct ProcessRunOutput {
     status: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
-}
-
-struct HttpBaseUrl {
-    host: String,
-    port: u16,
-    path_prefix: String,
-}
-
-fn compression_response_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "json_schema",
-        "json_schema": {
-            "name": "compression_result",
-            "strict": true,
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "distilled_prompt": { "type": "string" },
-                    "removed_content_summary": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    }
-                },
-                "required": ["distilled_prompt", "removed_content_summary"],
-                "additionalProperties": false
-            }
-        }
-    })
-}
-
-fn http_json_request(
-    method: &str,
-    base_url: &str,
-    endpoint_path: &str,
-    api_token_env: Option<&str>,
-    body: Option<&[u8]>,
-    timeout: Duration,
-) -> Result<String> {
-    let base = parse_http_base_url(base_url)?;
-    let path = join_http_paths(&base.path_prefix, endpoint_path);
-    let mut stream = TcpStream::connect((base.host.as_str(), base.port)).map_err(|error| {
-        CompressionError::Runtime(format!(
-            "failed to connect to local runtime at {}:{}: {error}",
-            base.host, base.port
-        ))
-    })?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-
-    let body = body.unwrap_or(&[]);
-    let mut request = format!(
-        "{method} {path} HTTP/1.1\r\n\
-         Host: {}\r\n\
-         Accept: application/json\r\n\
-         Connection: close\r\n",
-        base.host
-    );
-    if let Some(token) = resolve_api_token(api_token_env) {
-        request.push_str(&format!("Authorization: Bearer {token}\r\n"));
-    }
-    if !body.is_empty() {
-        request.push_str("Content-Type: application/json\r\n");
-        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
-    }
-    request.push_str("\r\n");
-
-    stream.write_all(request.as_bytes())?;
-    if !body.is_empty() {
-        stream.write_all(body)?;
-    }
-    stream.flush()?;
-
-    let response = read_http_response(&mut stream)?;
-    parse_http_response(&response)
-}
-
-fn read_http_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
-    let mut response = Vec::new();
-    let mut buffer = [0_u8; 8192];
-
-    loop {
-        let bytes_read = stream.read(&mut buffer)?;
-        if bytes_read == 0 {
-            return Err(CompressionError::Runtime(
-                "local runtime closed the connection before sending HTTP headers".into(),
-            ));
-        }
-        response.extend_from_slice(&buffer[..bytes_read]);
-
-        if let Some(header_end) = find_http_header_end(&response) {
-            let headers = std::str::from_utf8(&response[..header_end]).map_err(|error| {
-                CompressionError::Runtime(format!(
-                    "local runtime response headers were not UTF-8: {error}"
-                ))
-            })?;
-
-            if let Some(content_length) = http_content_length(headers)? {
-                let expected_length = header_end + 4 + content_length;
-                while response.len() < expected_length {
-                    let bytes_read = stream.read(&mut buffer)?;
-                    if bytes_read == 0 {
-                        return Err(CompressionError::Runtime(
-                            "local runtime closed the connection before the full response body arrived"
-                                .into(),
-                        ));
-                    }
-                    response.extend_from_slice(&buffer[..bytes_read]);
-                }
-                response.truncate(expected_length);
-                return Ok(response);
-            }
-
-            if has_chunked_transfer_encoding(headers) {
-                while !is_complete_chunked_body(&response[header_end + 4..])? {
-                    let bytes_read = stream.read(&mut buffer)?;
-                    if bytes_read == 0 {
-                        return Err(CompressionError::Runtime(
-                            "local runtime closed the connection before the chunked response completed"
-                                .into(),
-                        ));
-                    }
-                    response.extend_from_slice(&buffer[..bytes_read]);
-                }
-                return Ok(response);
-            }
-
-            stream.read_to_end(&mut response)?;
-            return Ok(response);
-        }
-    }
-}
-
-fn find_http_header_end(response: &[u8]) -> Option<usize> {
-    response.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-fn http_content_length(headers: &str) -> Result<Option<usize>> {
-    headers
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim())
-        })
-        .map(|value| {
-            value.parse::<usize>().map_err(|error| {
-                CompressionError::Runtime(format!(
-                    "local runtime returned an invalid Content-Length '{value}': {error}"
-                ))
-            })
-        })
-        .transpose()
-}
-
-fn is_complete_chunked_body(mut body: &[u8]) -> Result<bool> {
-    loop {
-        let Some(line_end) = body.windows(2).position(|window| window == b"\r\n") else {
-            return Ok(false);
-        };
-        let size_line = std::str::from_utf8(&body[..line_end]).map_err(|error| {
-            CompressionError::Runtime(format!("chunk size was not UTF-8: {error}"))
-        })?;
-        let size_hex = size_line.split(';').next().unwrap_or(size_line).trim();
-        let size = usize::from_str_radix(size_hex, 16).map_err(|error| {
-            CompressionError::Runtime(format!("invalid chunk size '{size_hex}': {error}"))
-        })?;
-        body = &body[line_end + 2..];
-
-        if size == 0 {
-            return Ok(true);
-        }
-        if body.len() < size + 2 {
-            return Ok(false);
-        }
-        body = &body[size + 2..];
-    }
-}
-
-fn parse_http_base_url(base_url: &str) -> Result<HttpBaseUrl> {
-    let without_scheme = base_url.strip_prefix("http://").ok_or_else(|| {
-        CompressionError::InvalidConfig(format!(
-            "local runtime base_url must use http:// for the local server: {base_url}"
-        ))
-    })?;
-    let (host_port, path_prefix) = without_scheme
-        .split_once('/')
-        .map(|(host_port, path)| (host_port, format!("/{path}")))
-        .unwrap_or((without_scheme, String::new()));
-    let (host, port) = if let Some((host, port)) = host_port.rsplit_once(':') {
-        let parsed_port = port.parse::<u16>().map_err(|error| {
-            CompressionError::InvalidConfig(format!(
-                "invalid local runtime base_url port '{port}': {error}"
-            ))
-        })?;
-        (host.to_string(), parsed_port)
-    } else {
-        (host_port.to_string(), 80)
-    };
-
-    if host.is_empty() {
-        return Err(CompressionError::InvalidConfig(format!(
-            "local runtime base_url is missing a host: {base_url}"
-        )));
-    }
-
-    Ok(HttpBaseUrl {
-        host,
-        port,
-        path_prefix: path_prefix.trim_end_matches('/').to_string(),
-    })
-}
-
-fn join_http_paths(path_prefix: &str, endpoint_path: &str) -> String {
-    let prefix = path_prefix.trim_end_matches('/');
-    let endpoint = endpoint_path.trim_start_matches('/');
-    if prefix.is_empty() {
-        format!("/{endpoint}")
-    } else {
-        format!("{prefix}/{endpoint}")
-    }
-}
-
-fn resolve_api_token(api_token_env: Option<&str>) -> Option<String> {
-    api_token_env
-        .and_then(|name| env::var(name).ok())
-        .map(|token| token.trim().to_string())
-        .filter(|token| !token.is_empty())
-}
-
-fn parse_http_response(response: &[u8]) -> Result<String> {
-    let header_end = find_http_header_end(response).ok_or_else(|| {
-        CompressionError::Runtime("local runtime returned a malformed HTTP response".into())
-    })?;
-    let headers = std::str::from_utf8(&response[..header_end]).map_err(|error| {
-        CompressionError::Runtime(format!(
-            "local runtime response headers were not UTF-8: {error}"
-        ))
-    })?;
-    let status = parse_http_status(headers)?;
-    let body_bytes = &response[header_end + 4..];
-    let body_bytes = if has_chunked_transfer_encoding(headers) {
-        decode_chunked_body(body_bytes)?
-    } else {
-        body_bytes.to_vec()
-    };
-    let body = String::from_utf8_lossy(&body_bytes).to_string();
-
-    if !(200..300).contains(&status) {
-        return Err(CompressionError::Runtime(format!(
-            "local runtime returned HTTP {status}: {}",
-            body.trim()
-        )));
-    }
-
-    Ok(body)
-}
-
-fn parse_http_status(headers: &str) -> Result<u16> {
-    let status_line = headers.lines().next().ok_or_else(|| {
-        CompressionError::Runtime("local runtime response had no status line".into())
-    })?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| {
-            CompressionError::Runtime(format!(
-                "local runtime response status was malformed: {status_line}"
-            ))
-        })?
-        .parse::<u16>()
-        .map_err(|error| {
-            CompressionError::Runtime(format!(
-                "local runtime response status was invalid: {error}"
-            ))
-        })?;
-    Ok(status)
-}
-
-fn has_chunked_transfer_encoding(headers: &str) -> bool {
-    headers.lines().any(|line| {
-        line.split_once(':')
-            .map(|(name, value)| {
-                name.eq_ignore_ascii_case("transfer-encoding")
-                    && value.to_ascii_lowercase().contains("chunked")
-            })
-            .unwrap_or(false)
-    })
-}
-
-fn decode_chunked_body(mut body: &[u8]) -> Result<Vec<u8>> {
-    let mut decoded = Vec::new();
-
-    loop {
-        let line_end = body
-            .windows(2)
-            .position(|window| window == b"\r\n")
-            .ok_or_else(|| {
-                CompressionError::Runtime("chunked local runtime response was truncated".into())
-            })?;
-        let size_line = std::str::from_utf8(&body[..line_end]).map_err(|error| {
-            CompressionError::Runtime(format!("chunk size was not UTF-8: {error}"))
-        })?;
-        let size_hex = size_line.split(';').next().unwrap_or(size_line).trim();
-        let size = usize::from_str_radix(size_hex, 16).map_err(|error| {
-            CompressionError::Runtime(format!("invalid chunk size '{size_hex}': {error}"))
-        })?;
-        body = &body[line_end + 2..];
-
-        if size == 0 {
-            break;
-        }
-        if body.len() < size + 2 {
-            return Err(CompressionError::Runtime(
-                "chunked local runtime response body was shorter than declared".into(),
-            ));
-        }
-
-        decoded.extend_from_slice(&body[..size]);
-        body = &body[size + 2..];
-    }
-
-    Ok(decoded)
 }
 
 fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Result<ProcessRunOutput> {
@@ -1954,263 +1542,6 @@ fn wait_for_runtime_health(base_url: &str, health_path: &str, timeout: Duration)
     )))
 }
 
-fn parse_compression_output(output: &str) -> Result<CompressionDraft> {
-    let trimmed = output.trim();
-    if let Ok(distilled_prompt) = serde_json::from_str::<String>(trimmed) {
-        return Ok(CompressionDraft {
-            distilled_prompt: clean_distilled_prompt_text(&distilled_prompt),
-            removed_content_summary: Vec::new(),
-        });
-    }
-
-    if trimmed.starts_with('"') && trimmed.contains("\"distilled_prompt\"") {
-        let wrapped_json = format!("{{{trimmed}}}");
-        if let Ok(parsed) = parse_model_compression_json(&wrapped_json) {
-            return Ok(CompressionDraft {
-                distilled_prompt: clean_distilled_prompt_text(&parsed.distilled_prompt),
-                removed_content_summary: parsed.removed_content_summary,
-            });
-        }
-    }
-
-    let start = output.find('{').ok_or_else(|| {
-        CompressionError::Runtime(format!(
-            "llama.cpp output did not contain JSON; output starts with: {}",
-            output_snippet(output)
-        ))
-    })?;
-    let end = match output.rfind('}') {
-        Some(end) => end,
-        None => {
-            if let Some(distilled_prompt) = extract_incomplete_distilled_prompt(output) {
-                return Ok(CompressionDraft {
-                    distilled_prompt: clean_distilled_prompt_text(&distilled_prompt),
-                    removed_content_summary: Vec::new(),
-                });
-            }
-
-            return Err(CompressionError::Runtime(format!(
-                "llama.cpp output did not contain JSON; output starts with: {}",
-                output_snippet(output)
-            )));
-        }
-    };
-    let json = &output[start..=end];
-    let parsed = match parse_model_compression_json(json) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            if let Some(parsed) = parse_first_valid_compression_json_object(output) {
-                parsed
-            } else {
-                return Err(error);
-            }
-        }
-    };
-
-    Ok(CompressionDraft {
-        distilled_prompt: clean_distilled_prompt_text(&parsed.distilled_prompt),
-        removed_content_summary: parsed.removed_content_summary,
-    })
-}
-
-fn parse_first_valid_compression_json_object(output: &str) -> Option<ModelCompressionOutput> {
-    for (start, character) in output.char_indices() {
-        if character != '{' {
-            continue;
-        }
-        let candidate = &output[start..];
-        let Some(end) = first_complete_json_object_end(candidate) else {
-            continue;
-        };
-        if let Ok(parsed) = parse_model_compression_json(&candidate[..end]) {
-            return Some(parsed);
-        }
-    }
-
-    None
-}
-
-fn clean_distilled_prompt_text(text: &str) -> String {
-    let mut cleaned = text.trim();
-    for prefix in ["実行指示:", "実行指示：", "短縮文:", "短縮文："] {
-        if let Some(stripped) = cleaned.strip_prefix(prefix) {
-            cleaned = stripped.trim();
-        }
-    }
-    for suffix in [
-        ": 短縮文",
-        "：短縮文",
-        "： 短縮文",
-        "; 短縮文",
-        "；短縮文",
-        "； 短縮文",
-    ] {
-        if let Some(stripped) = cleaned.strip_suffix(suffix) {
-            cleaned = stripped.trim();
-        }
-    }
-    cleaned.to_string()
-}
-
-fn parse_model_compression_json(json: &str) -> Result<ModelCompressionOutput> {
-    match serde_json::from_str::<ModelCompressionOutput>(json) {
-        Ok(parsed) => Ok(parsed),
-        Err(primary_error) => {
-            let value: serde_json::Value = serde_json::from_str(json).map_err(|error| {
-                CompressionError::Runtime(format!(
-                    "llama.cpp output was not valid JSON: {error}; output starts with: {}",
-                    output_snippet(json)
-                ))
-            })?;
-
-            if let Some(distilled_prompt) = extract_distilled_prompt_alias(&value) {
-                return Ok(ModelCompressionOutput {
-                    distilled_prompt,
-                    removed_content_summary: extract_removed_summary_alias(&value),
-                });
-            }
-
-            Err(CompressionError::Runtime(format!(
-                "llama.cpp output was not valid compression JSON: {primary_error}; output starts with: {}",
-                output_snippet(json)
-            )))
-        }
-    }
-}
-
-fn extract_incomplete_distilled_prompt(output: &str) -> Option<String> {
-    for key in [
-        "distilled_prompt",
-        "compressed_prompt",
-        "compressed_text",
-        "compressed",
-        "output",
-        "result",
-        "prompt",
-        "text",
-        "summary",
-    ] {
-        let key_pattern = format!("\"{key}\"");
-        let Some(key_start) = output.find(&key_pattern) else {
-            continue;
-        };
-        let after_key = &output[key_start + key_pattern.len()..];
-        let value_start = after_key.find(':')?;
-        let mut value = after_key[value_start + 1..].trim_start();
-
-        if let Some(stripped) = value.strip_prefix('"') {
-            value = stripped;
-            let mut text = String::new();
-            let mut escaped = false;
-            for character in value.chars() {
-                if escaped {
-                    text.push(match character {
-                        'n' => '\n',
-                        'r' => '\r',
-                        't' => '\t',
-                        '"' => '"',
-                        '\\' => '\\',
-                        other => other,
-                    });
-                    escaped = false;
-                    continue;
-                }
-
-                match character {
-                    '\\' => escaped = true,
-                    '"' => break,
-                    other => text.push(other),
-                }
-            }
-
-            let text = text.trim().trim_end_matches('\\').trim();
-            if !text.is_empty() {
-                return Some(text.to_string());
-            }
-        } else {
-            let text = value
-                .split([',', '\n', '\r', '}'])
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .trim_matches('"');
-            if !text.is_empty() {
-                return Some(text.to_string());
-            }
-        }
-    }
-
-    None
-}
-
-fn extract_distilled_prompt_alias(value: &serde_json::Value) -> Option<String> {
-    const STRING_KEYS: &[&str] = &[
-        "distilled_prompt",
-        "compressed_prompt",
-        "compressed_text",
-        "compressed",
-        "output",
-        "result",
-        "prompt",
-        "text",
-        "summary",
-        "圧縮結果",
-        "圧縮文",
-        "短縮文",
-        "要約",
-    ];
-
-    let object = value.as_object()?;
-    for key in STRING_KEYS {
-        if let Some(text) = object.get(*key).and_then(serde_json::Value::as_str) {
-            let text = text.trim();
-            if !text.is_empty() {
-                return Some(text.to_string());
-            }
-        }
-    }
-
-    let string_values: Vec<_> = object
-        .values()
-        .filter_map(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .collect();
-    (string_values.len() == 1).then(|| string_values[0].to_string())
-}
-
-fn extract_removed_summary_alias(value: &serde_json::Value) -> Vec<String> {
-    const ARRAY_KEYS: &[&str] = &[
-        "removed_content_summary",
-        "removed_summary",
-        "removed",
-        "omitted",
-        "削除内容",
-    ];
-
-    let Some(object) = value.as_object() else {
-        return Vec::new();
-    };
-
-    for key in ARRAY_KEYS {
-        if let Some(items) = object.get(*key).and_then(serde_json::Value::as_array) {
-            return items
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(str::to_string)
-                .collect();
-        }
-    }
-
-    Vec::new()
-}
-
-fn output_snippet(output: &str) -> String {
-    output.chars().take(240).collect()
-}
-
 fn trace_runtime_timing(stage: &str, elapsed: Duration) {
     if trace_enabled() {
         eprintln!(
@@ -2258,40 +1589,6 @@ fn trim_after_stop_marker(output: &str) -> &str {
         .min()
         .map(|index| &output[..index])
         .unwrap_or(output)
-}
-
-fn first_complete_json_object_end(output: &str) -> Option<usize> {
-    let start = output.find('{')?;
-    let mut depth = 0u32;
-    let mut in_string = false;
-    let mut escaped = false;
-
-    for (offset, character) in output[start..].char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        match character {
-            '"' => in_string = true,
-            '{' => depth += 1,
-            '}' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(start + offset + character.len_utf8());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    None
 }
 
 const MAX_AUTOMATIC_RUNTIME_THREADS: usize = 8;

@@ -1,6 +1,6 @@
 const profileSelect = document.querySelector("#profileSelect");
 const levelInput = document.querySelector("#levelInput");
-const levelValue = document.querySelector("#levelValue");
+const levelButtons = [...document.querySelectorAll("[data-compression-level]")];
 const levelHelp = document.querySelector("#levelHelp");
 const themeToggle = document.querySelector("#themeToggle");
 const settingsButton = document.querySelector("#settingsButton");
@@ -11,7 +11,6 @@ const windowMaximizeButton = document.querySelector("#windowMaximizeButton");
 const windowCloseButton = document.querySelector("#windowCloseButton");
 const compressButton = document.querySelector("#compressButton");
 const clearInputButton = document.querySelector("#clearInputButton");
-const sampleSelect = document.querySelector("#sampleSelect");
 const copyButton = document.querySelector("#copyButton");
 const promptInput = document.querySelector("#promptInput");
 const promptOutput = document.querySelector("#promptOutput");
@@ -35,7 +34,7 @@ const compressionLatency = document.querySelector("#compressionLatency");
 const settingsStorageKey = "promptCompressorSettingsV3";
 const legacySettingsStorageKey = "promptCompressorSettingsV2";
 const themeStorageKey = "promptCompressorThemeV1";
-const compressionLevelMin = 1;
+const compressionLevelMin = 2;
 const compressionLevelMax = 3;
 const settingsSaveDelayMs = 250;
 let isCompressing = false;
@@ -55,78 +54,29 @@ let activeModelDownloadProfile = "";
 let selectedModelStatus = null;
 
 const compressionLevelDetails = {
-  1: {
-    name: "控えめ",
-    description: "1 控えめ: 表現を残しつつ重複だけ削る"
-  },
   2: {
     name: "標準",
-    description: "2 標準: 要件を保ちながら短く圧縮"
+    description: "要件を保ちながらバランスよく圧縮"
   },
   3: {
-    name: "強め",
-    description: "3 強め: 高いほど強く圧縮し、短い同義表現も使う"
+    name: "高圧縮",
+    description: "短い表現を使い、さらに圧縮率を高める"
   }
 };
 
-const samplePrompts = {
-  search: {
-    level: 2,
-    text: [
-      "React の検索画面で、検索ボタンを押したときだけ API を呼び出してください。",
-      "既存の useSearchParams による URL クエリ管理は維持し、ページ番号変更時も検索状態を保持してください。",
-      "TypeScript の既存構造を活かし、大規模なリファクタリングは避けてください。"
-    ].join("\n")
-  },
-  bugfix: {
-    level: 2,
-    text: [
-      "Next.js の POST /api/orders が空の customerId で 500 を返します。",
-      "入力検証を追加し、HTTP 400 と既存の INVALID_CUSTOMER エラーコードを返してください。",
-      "成功時のレスポンス形式、在庫引当処理、既存の監査ログは変更しないでください。"
-    ].join("\n")
-  },
-  tests: {
-    level: 2,
-    text: [
-      "TypeScript の parseDateRange 関数に Vitest テストを追加してください。",
-      "YYYY-MM-DD の正常値、終了日が開始日より前、無効日付、空文字列を検証してください。",
-      "実装コードと既存テストの名前は変更せず、境界値を含めてください。"
-    ].join("\n")
-  },
-  refactor: {
-    level: 2,
-    text: [
-      "React の UserTable を UserTable と UserTableRow に分割し、行の表示責務を分離してください。",
-      "公開 props、data-testid、ソートとページネーションの挙動は維持してください。",
-      "CSS の見た目と E2E テストは変更せず、不要な再レンダリングを増やさないでください。"
-    ].join("\n")
-  },
-  logs: {
-    level: 1,
-    text: [
-      "本番ログを解析し、注文送信が失敗する原因候補を優先度順に整理してください。",
-      "2026-06-24T10:15:03Z requestId=ab12 POST /orders ECONNRESET upstream=payment-service",
-      "時刻、requestId、エラー文字列は改変せず、追加で確認すべきログと暫定対応を示してください。"
-    ].join("\n")
-  },
-  design: {
-    level: 2,
-    text: [
-      "社内向け申請画面の通知方式を、メール通知とアプリ内通知から選定してください。",
-      "管理者は未処理申請を見落とさず、一般利用者には承認結果だけを通知します。",
-      "月額コストは 3 万円以下、個人情報を外部サービスへ送信しないことが条件です。",
-      "結論、採用理由、未解決事項の順で提案してください。"
-    ].join("\n")
-  }
-};
-
-levelInput.addEventListener("input", () => {
-  renderCompressionLevel();
-  saveSettings();
-  updateSettingsSummary();
-  scheduleCompressionPrepare();
-});
+for (const levelButton of levelButtons) {
+  levelButton.addEventListener("click", () => {
+    const nextLevel = clampCompressionLevel(levelButton.dataset.compressionLevel);
+    if (nextLevel === levelInput.value) {
+      return;
+    }
+    levelInput.value = nextLevel;
+    renderCompressionLevel();
+    saveSettings();
+    updateSettingsSummary();
+    scheduleCompressionPrepare();
+  });
+}
 
 themeToggle.addEventListener("change", () => {
   const theme = themeToggle.checked ? "dark" : "light";
@@ -187,26 +137,6 @@ profileSelect.addEventListener("change", () => {
   refreshModelAvailability();
 });
 
-sampleSelect.addEventListener("change", () => {
-  loadSelectedSample();
-});
-
-function loadSelectedSample() {
-  const sample = samplePrompts[sampleSelect.value];
-  if (!sample) {
-    return;
-  }
-
-  promptInput.value = sample.text;
-  levelInput.value = clampCompressionLevel(sample.level);
-  renderCompressionLevel();
-  clearResultLists();
-  saveSettings();
-  updateSettingsSummary();
-  scheduleCompressionPrepare();
-  promptInput.focus();
-}
-
 copyButton.addEventListener("click", async () => {
   if (!promptOutput.value.trim()) {
     return;
@@ -217,7 +147,6 @@ copyButton.addEventListener("click", async () => {
 
 clearInputButton.addEventListener("click", () => {
   promptInput.value = "";
-  sampleSelect.value = "";
   clearResultLists();
   setWorkStatus("入力待ち", "");
   promptInput.focus();
@@ -808,11 +737,12 @@ async function refreshRuntimeStatus() {
 }
 
 function updateSettingsSummary() {
-  const profileLabel =
-    profileSelect.selectedOptions[0]?.textContent || "Standard";
+  const profileLabel = profileSelect.value === "internal_llm" ? "内部モデル" : "自由選択";
   const levelDetail = compressionLevelDetails[levelInput.value];
-  const levelLabel = levelDetail ? `${levelInput.value} ${levelDetail.name}` : levelInput.value;
-  settingsSummary.textContent = `${profileLabel} / Level ${levelLabel}`;
+  const levelLabel = levelDetail?.name || "標準";
+  const summary = `${profileLabel} / ${levelLabel}`;
+  settingsSummary.textContent = summary;
+  settingsSummary.title = summary;
 }
 
 function clampCompressionLevel(value) {
@@ -828,7 +758,10 @@ function clampCompressionLevel(value) {
 
 function renderCompressionLevel() {
   levelInput.value = clampCompressionLevel(levelInput.value);
-  levelValue.textContent = levelInput.value;
+  for (const levelButton of levelButtons) {
+    const isSelected = levelButton.dataset.compressionLevel === levelInput.value;
+    levelButton.setAttribute("aria-pressed", String(isSelected));
+  }
   levelHelp.textContent =
     compressionLevelDetails[levelInput.value]?.description ||
     compressionLevelDetails[2].description;

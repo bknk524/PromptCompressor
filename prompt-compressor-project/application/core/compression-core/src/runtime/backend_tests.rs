@@ -11,9 +11,12 @@ use super::{
     state_persistence_clause_satisfied, structured_candidate_preserves_requirements,
     structured_constraint_clause, trusted_precompacted_fallback_draft, validate_compression_draft,
     validate_prompt_token_budget, verification_constraint_satisfied, verified_structured_candidate,
-    CompressionDraft, ModelDefinition, ModelFileCoordinator,
+    CompressionCacheKey, CompressionDraft, CompressionDraftCache, ModelDefinition,
+    ModelFileCoordinator, RuntimeCompressionObservation, RuntimeTransformation,
+    MAX_COMPRESSION_CACHE_ENTRIES,
 };
 use crate::compression::verifier::SimpleVerifier;
+use crate::config::profile::ProfileDefinition;
 use crate::types::{
     CompressionConstraints, CompressionLevel, CompressionRequest, RequestSource, RequestTarget,
 };
@@ -73,6 +76,76 @@ fn automatic_runtime_threads_leave_capacity_for_the_app() {
 }
 
 #[test]
+fn compression_cache_reuses_exact_requests_and_evicts_least_recently_used() {
+    let profile = test_profile_definition();
+    let mut cache = CompressionDraftCache::default();
+    let first_request = test_request("依頼0".to_string(), 2);
+    let first_key = CompressionCacheKey::new(&first_request, &profile);
+    cache.insert(
+        first_key.clone(),
+        CompressionDraft {
+            distilled_prompt: "圧縮0".to_string(),
+            removed_content_summary: Vec::new(),
+        },
+    );
+    let mut second_key = None;
+    for index in 1..MAX_COMPRESSION_CACHE_ENTRIES {
+        let request = test_request(format!("依頼{index}"), 2);
+        let key = CompressionCacheKey::new(&request, &profile);
+        if index == 1 {
+            second_key = Some(key.clone());
+        }
+        cache.insert(
+            key,
+            CompressionDraft {
+                distilled_prompt: format!("圧縮{index}"),
+                removed_content_summary: Vec::new(),
+            },
+        );
+    }
+
+    assert_eq!(
+        cache
+            .get(&first_key)
+            .expect("exact request should be cached")
+            .distilled_prompt,
+        "圧縮0"
+    );
+    let last_request = test_request(format!("依頼{MAX_COMPRESSION_CACHE_ENTRIES}"), 2);
+    cache.insert(
+        CompressionCacheKey::new(&last_request, &profile),
+        CompressionDraft {
+            distilled_prompt: format!("圧縮{MAX_COMPRESSION_CACHE_ENTRIES}"),
+            removed_content_summary: Vec::new(),
+        },
+    );
+
+    assert!(cache
+        .get(&second_key.expect("second key should be recorded"))
+        .is_none());
+    assert!(cache.get(&first_key).is_some());
+    assert_eq!(cache.entries.len(), MAX_COMPRESSION_CACHE_ENTRIES);
+}
+
+#[test]
+fn compression_cache_key_separates_levels_and_constraints() {
+    let profile = test_profile_definition();
+    let level_two = test_request("同じ依頼".to_string(), 2);
+    let level_three = test_request("同じ依頼".to_string(), 3);
+    let mut different_constraints = level_two.clone();
+    different_constraints.constraints.preserve_numbers = false;
+
+    assert_ne!(
+        CompressionCacheKey::new(&level_two, &profile),
+        CompressionCacheKey::new(&level_three, &profile)
+    );
+    assert_ne!(
+        CompressionCacheKey::new(&level_two, &profile),
+        CompressionCacheKey::new(&different_constraints, &profile)
+    );
+}
+
+#[test]
 fn parses_json_from_plain_model_output() {
     let draft = parse_compression_output(
         r#"{"distilled_prompt":"Fix search behavior.","removed_content_summary":["trimmed background"]}"#,
@@ -111,6 +184,24 @@ fn observation_preserves_raw_model_output_before_runtime_transformations() {
         "README.mdの説明を簡潔にする。"
     );
     assert!(!observation.transformations.is_empty());
+}
+
+#[test]
+fn runtime_fallback_is_not_reported_as_raw_model_output_or_cached() {
+    let fallback = CompressionDraft {
+        distilled_prompt: "README.mdの説明を簡潔にする。".to_string(),
+        removed_content_summary: vec!["実行時フォールバック".to_string()],
+    };
+
+    let observation = RuntimeCompressionObservation::runtime_fallback(fallback.clone());
+
+    assert_eq!(observation.raw_model_draft, None);
+    assert_eq!(observation.final_draft, fallback);
+    assert_eq!(
+        observation.transformations,
+        [RuntimeTransformation::RuntimeFallback]
+    );
+    assert!(!observation.is_cacheable());
 }
 
 #[test]
@@ -1671,6 +1762,19 @@ fn test_request(input_text: String, level: u8) -> CompressionRequest {
         constraints: CompressionConstraints::default(),
         target: RequestTarget::codex_default(),
         source: RequestSource::Desktop,
+    }
+}
+
+fn test_profile_definition() -> ProfileDefinition {
+    ProfileDefinition {
+        id: "internal_llm".to_string(),
+        label: "Internal".to_string(),
+        selectable: true,
+        model_ref: "model".to_string(),
+        policy_ref: "policy".to_string(),
+        runtime_ref: "runtime".to_string(),
+        fallback_profile: "internal_llm".to_string(),
+        target_tokenizer_profile: "codex_default".to_string(),
     }
 }
 
