@@ -1,0 +1,35 @@
+schema_version: 1
+
+models:
+  sarashina_2_2_3b_instruct_q4_k_s:
+    label: Sarashina 2.2 3B Instruct (Local GGUF)
+    adapter: llama
+    runtime: llama_cpp_embedded
+    model_path: local/models/sarashina2.2-3b-instruct-v0.1/sarashina2.2-3b-instruct-v0.1-Q4_K_S.gguf
+    hugging_face:
+      repository: mmnga/sarashina2.2-3b-instruct-v0.1-gguf
+      revision: 31d771319b04032f33e0d9d860f3984ea4812154
+      filename: sarashina2.2-3b-instruct-v0.1-Q4_K_S.gguf
+      sha256: 01b9d19e174a67f068fef4250abb9b29188a7e0c634dc6afd427fd50400596ef
+      size_bytes: 1971362912
+    api_model: prompt-compressor-sarashina-local
+    quantization: q4_k_s
+    context_length: 4096
+    thinking: false
+    default_max_output: 192
+    prompt_template: sarashina-japanese-compression-v1
+    prompt_style: concise
+    supports_json_schema: false
+
+  lmstudio_local_model:
+    label: LM Studio (Local model)
+    adapter: openai_chat
+    runtime: lmstudio_external
+    api_model: auto
+    quantization: external
+    context_length: 4096
+    thinking: false
+    default_max_output: 160
+    prompt_template: general-codex-compression-v1
+    prompt_style: concise
+    supports_json_schema: false

@@ -582,7 +582,7 @@ impl HttpReadError {
 
 pub fn run_server(options: ServerOptions) -> Result<()> {
     run_server_with_ready(options, |info| {
-        println!("Prompt Compressor local UI: {}", info.url);
+        println!("TrimPrompt local UI: {}", info.url);
     })
 }
 
@@ -1935,9 +1935,7 @@ mod tests {
 
     #[test]
     fn current_model_and_level_are_shown_next_to_the_app_title() {
-        let title = INDEX_HTML
-            .find("<h1>Prompt Compressor</h1>")
-            .expect("app title");
+        let title = INDEX_HTML.find("<h1>TrimPrompt</h1>").expect("app title");
         let settings_summary = INDEX_HTML
             .find("id=\"settingsSummary\"")
             .expect("current settings summary");
@@ -1955,11 +1953,36 @@ mod tests {
     }
 
     #[test]
+    fn renamed_product_preserves_legacy_browser_settings() {
+        assert!(INDEX_HTML.contains("<title>TrimPrompt</title>"));
+        assert!(INDEX_HTML.contains("<h1>TrimPrompt</h1>"));
+        assert!(APP_JS.contains("trimPromptSettingsV1"));
+        assert!(APP_JS.contains("trimPromptThemeV1"));
+        assert!(APP_JS.contains("promptCompressorSettingsV3"));
+        assert!(APP_JS.contains("promptCompressorSettingsV2"));
+        assert!(APP_JS.contains("promptCompressorThemeV1"));
+        assert!(APP_JS.contains("window.trimPromptOpenSettings"));
+        assert!(!APP_JS.contains("window.promptCompressorOpenSettings"));
+    }
+
+    #[test]
+    fn interface_uses_the_material_inspired_neutral_and_blue_palette() {
+        assert!(STYLES_CSS.contains("--bg: #f8fafd"));
+        assert!(STYLES_CSS.contains("--accent: #0b57d0"));
+        assert!(STYLES_CSS.contains("--accent-soft: #e8f0fe"));
+        assert!(STYLES_CSS.contains("--success: #188038"));
+        assert!(STYLES_CSS.contains("--menu-shadow:"));
+    }
+
+    #[test]
     fn input_heading_and_actions_are_kept_on_one_line() {
         assert!(INDEX_HTML.contains("class=\"section-head input-section-head\""));
         assert!(STYLES_CSS.contains(".input-section-head h2"));
         assert!(STYLES_CSS.contains(".input-section-head .head-actions"));
-        assert!(STYLES_CSS.contains("flex-wrap: nowrap"));
+        assert!(STYLES_CSS
+            .contains("grid-template-columns: minmax(72px, 160px) max-content max-content"));
+        assert!(STYLES_CSS.contains("max-width: 160px"));
+        assert!(INDEX_HTML.contains("id=\"compressButton\" type=\"button\">圧縮</button>"));
     }
 
     #[test]
@@ -1973,6 +1996,29 @@ mod tests {
         assert!(APP_JS.contains("name: \"高圧縮\""));
         assert!(STYLES_CSS.contains(".level-switch"));
         assert!(STYLES_CSS.contains(".level-option[aria-pressed=\"true\"]"));
+    }
+
+    #[test]
+    fn desktop_ui_uses_compact_status_and_flat_metrics() {
+        assert!(STYLES_CSS.contains(".status-pill::before"));
+        assert!(STYLES_CSS.contains(".status-pill.running::before"));
+        assert!(STYLES_CSS.contains("@keyframes status-ring-spin"));
+        assert!(INDEX_HTML.contains("class=\"status-label\""));
+        assert!(APP_JS.contains("element.replaceChildren(labelElement, textElement)"));
+        assert!(APP_JS.contains("element.title = fullStatus"));
+        assert!(APP_JS.contains("setModelStatus(\"準備完了\", \"\")"));
+        assert!(APP_JS.contains("setWorkStatus(\"圧縮中\", \"running\")"));
+        assert!(APP_JS.contains("setWorkStatus(\"圧縮完了\", \"\")"));
+        assert!(!APP_JS.contains("圧縮完了・コピー済み"));
+        assert!(!APP_JS.contains("setWorkStatus(copied ? \"コピー済み\""));
+        assert!(STYLES_CSS.contains("#modelStatus"));
+        assert!(STYLES_CSS.contains(".status-label"));
+        assert!(STYLES_CSS.contains("width: min(440px, calc(100vw - 32px))"));
+        assert!(STYLES_CSS.contains(".metric:last-child"));
+        assert!(STYLES_CSS.contains("border-right: 1px solid var(--border)"));
+        assert!(INDEX_HTML.contains("推定トークン"));
+        assert!(!INDEX_HTML.contains("トークン（推定）"));
+        assert!(!INDEX_HTML.contains("モデル、圧縮モード、表示"));
     }
 
     #[test]

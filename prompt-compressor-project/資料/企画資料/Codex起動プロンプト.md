@@ -3,7 +3,7 @@
 新しい Codex プロジェクトで最初に使う開始文です。
 
 ```text
-このプロジェクトは Prompt Compressor です。
+このプロジェクトは TrimPrompt です。
 
 参照元:
 C:\Users\sl2ca\OneDrive\ドキュメント\New project\prompt-compressor-project\AGENTS.md

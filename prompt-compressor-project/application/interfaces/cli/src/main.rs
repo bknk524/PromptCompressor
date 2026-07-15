@@ -14,8 +14,8 @@ use prompt_compressor_core::{
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
-#[command(name = "prompt-compressor")]
-#[command(about = "Local-first prompt compression scaffold for Codex workflows")]
+#[command(name = "trimprompt")]
+#[command(about = "Local-first prompt compression for Codex workflows")]
 struct Cli {
     #[arg(long, value_name = "DIR")]
     settings_dir: Option<PathBuf>,

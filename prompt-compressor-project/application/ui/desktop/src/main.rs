@@ -29,18 +29,19 @@ use tao::{
     window::{Icon, Theme},
 };
 
-const APP_USER_MODEL_ID: &str = "PromptCompressor.Desktop";
-const APP_WINDOW_TITLE: &str = "Prompt Compressor";
-const SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\PromptCompressor.Desktop.SingleInstance";
-const ALREADY_RUNNING_MESSAGE: &str = "Prompt Compressor はすでに起動しています。";
+const APP_USER_MODEL_ID: &str = "TrimPrompt.Desktop";
+const APP_WINDOW_TITLE: &str = "TrimPrompt";
+const SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\TrimPrompt.Desktop.SingleInstance";
+const LEGACY_SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\PromptCompressor.Desktop.SingleInstance";
+const ALREADY_RUNNING_MESSAGE: &str = "TrimPrompt はすでに起動しています。";
 const PROTOCOL_WORKER_COUNT: usize = 4;
 const PROTOCOL_QUEUE_CAPACITY: usize = 16;
 const MAX_NOTIFICATION_TITLE_CHARS: usize = 128;
 const MAX_NOTIFICATION_BODY_CHARS: usize = 1_024;
 
 #[derive(Debug, Parser)]
-#[command(name = "prompt-compressor-desktop")]
-#[command(about = "Native Windows shell for Prompt Compressor")]
+#[command(name = "TrimPrompt")]
+#[command(about = "Native Windows shell for TrimPrompt")]
 struct Args {
     #[arg(long, value_name = "DIR")]
     settings_dir: Option<PathBuf>,
@@ -149,12 +150,20 @@ impl Drop for SingleInstanceGuard {
 }
 
 #[cfg(windows)]
-fn acquire_single_instance() -> Result<Option<SingleInstanceGuard>> {
-    let instance = try_acquire_named_mutex(SINGLE_INSTANCE_MUTEX_NAME)?;
-    if instance.is_none() {
+fn acquire_single_instance() -> Result<Option<Vec<SingleInstanceGuard>>> {
+    let legacy_instance = try_acquire_named_mutex(LEGACY_SINGLE_INSTANCE_MUTEX_NAME)?;
+    let Some(legacy_instance) = legacy_instance else {
         show_already_running_notice();
-    }
-    Ok(instance)
+        return Ok(None);
+    };
+
+    let instance = try_acquire_named_mutex(SINGLE_INSTANCE_MUTEX_NAME)?;
+    let Some(instance) = instance else {
+        show_already_running_notice();
+        return Ok(None);
+    };
+
+    Ok(Some(vec![legacy_instance, instance]))
 }
 
 #[cfg(windows)]
@@ -316,21 +325,21 @@ fn show_startup_error(error: &anyhow::Error) {
         .and_then(|path| path.parent().map(PathBuf::from))
         .unwrap_or_else(std::env::temp_dir);
     let message = format!(
-        "Prompt Compressor could not start.\n\n\
-         This desktop package must keep PromptCompressor.exe next to the application folder.\n\
+        "TrimPrompt could not start.\n\n\
+         This desktop package must keep TrimPrompt.exe next to the application folder.\n\
          Required shape:\n\n\
-         PromptCompressor.exe\n\
+         TrimPrompt.exe\n\
          application\\config\\\n\
          application\\resources\\\n\n\
          The local model is downloaded from Hugging Face after startup.\n\n\
          Error details:\n{error:#}\n"
     );
 
-    let report_path = exe_dir.join("PromptCompressor_STARTUP_ERROR.txt");
+    let report_path = exe_dir.join("TrimPrompt_STARTUP_ERROR.txt");
     let report_path = match fs::write(&report_path, &message) {
         Ok(()) => report_path,
         Err(_) => {
-            let fallback_path = std::env::temp_dir().join("PromptCompressor_STARTUP_ERROR.txt");
+            let fallback_path = std::env::temp_dir().join("TrimPrompt_STARTUP_ERROR.txt");
             let _ = fs::write(&fallback_path, message);
             fallback_path
         }
@@ -435,7 +444,7 @@ fn run_window(app: EmbeddedWebApp) -> Result<()> {
             }
             Event::UserEvent(DesktopEvent::OpenSettingsFromTray) => {
                 restore_window_from_tray(&window);
-                let _ = webview.evaluate_script("window.promptCompressorOpenSettings?.();");
+                let _ = webview.evaluate_script("window.trimPromptOpenSettings?.();");
             }
             Event::UserEvent(DesktopEvent::ExitRequested) => {
                 drop(tray_icon.take());
@@ -599,7 +608,7 @@ impl TrayIcon {
             hIcon: icon,
             ..Default::default()
         };
-        copy_utf16_to_fixed(&mut data.szTip, "Prompt Compressor");
+        copy_utf16_to_fixed(&mut data.szTip, "TrimPrompt");
 
         let installed = unsafe { Shell_NotifyIconW(NIM_ADD, &data) } != 0;
         if !installed {
@@ -659,8 +668,8 @@ impl TrayMessageWindow {
         };
 
         let hinstance = window.hinstance() as HINSTANCE;
-        let class_name = wide_null("PromptCompressorTrayMessageWindow");
-        let window_name = wide_null("PromptCompressorTrayMessageWindow");
+        let class_name = wide_null("TrimPromptTrayMessageWindow");
+        let window_name = wide_null("TrimPromptTrayMessageWindow");
         let window_class = WNDCLASSW {
             lpfnWndProc: Some(tray_message_window_proc),
             hInstance: hinstance,
@@ -1231,13 +1240,24 @@ fn protocol_response(response: LocalAppResponse) -> Response<Cow<'static, [u8]>>
 mod tests {
     use super::*;
 
+    #[test]
+    fn product_identity_uses_trim_prompt_with_legacy_single_instance_compatibility() {
+        assert_eq!(APP_WINDOW_TITLE, "TrimPrompt");
+        assert_eq!(APP_USER_MODEL_ID, "TrimPrompt.Desktop");
+        assert_eq!(
+            SINGLE_INSTANCE_MUTEX_NAME,
+            "Local\\TrimPrompt.Desktop.SingleInstance"
+        );
+        assert_eq!(
+            LEGACY_SINGLE_INSTANCE_MUTEX_NAME,
+            "Local\\PromptCompressor.Desktop.SingleInstance"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn named_mutex_allows_only_one_desktop_instance() {
-        let mutex_name = format!(
-            "Local\\PromptCompressor.Desktop.Test.{}",
-            std::process::id()
-        );
+        let mutex_name = format!("Local\\TrimPrompt.Desktop.Test.{}", std::process::id());
         let first = try_acquire_named_mutex(&mutex_name)
             .expect("create first mutex")
             .expect("first instance should acquire mutex");

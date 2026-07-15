@@ -31,9 +31,13 @@ const modelInstallButton = document.querySelector("#modelInstallButton");
 const modelCancelButton = document.querySelector("#modelCancelButton");
 const settingsSummary = document.querySelector("#settingsSummary");
 const compressionLatency = document.querySelector("#compressionLatency");
-const settingsStorageKey = "promptCompressorSettingsV3";
-const legacySettingsStorageKey = "promptCompressorSettingsV2";
-const themeStorageKey = "promptCompressorThemeV1";
+const settingsStorageKey = "trimPromptSettingsV1";
+const legacySettingsStorageKeys = [
+  "promptCompressorSettingsV3",
+  "promptCompressorSettingsV2"
+];
+const themeStorageKey = "trimPromptThemeV1";
+const legacyThemeStorageKey = "promptCompressorThemeV1";
 const compressionLevelMin = 2;
 const compressionLevelMax = 3;
 const settingsSaveDelayMs = 250;
@@ -142,7 +146,9 @@ copyButton.addEventListener("click", async () => {
     return;
   }
   const copied = await copyTextToClipboard(promptOutput.value);
-  setWorkStatus(copied ? "コピー済み" : "コピー失敗", copied ? "" : "error");
+  if (!copied) {
+    setWorkStatus("コピー失敗", "error");
+  }
 });
 
 clearInputButton.addEventListener("click", () => {
@@ -171,7 +177,7 @@ compressButton.addEventListener("click", async () => {
 
   isCompressing = true;
   setLoading(true);
-  setWorkStatus("圧縮中", "busy");
+  setWorkStatus("圧縮中", "running");
 
   try {
     const response = await fetch("/api/compress", {
@@ -199,8 +205,7 @@ compressButton.addEventListener("click", async () => {
     } else {
       const copied = await copyTextToClipboard(payload.distilled_prompt || "");
       const completionMessage = buildCompletionMessage(payload, copied);
-      const statusText = copied ? "圧縮完了・コピー済み" : "圧縮完了・コピー失敗";
-      setWorkStatus(statusText, copied ? "" : "error");
+      setWorkStatus("圧縮完了", "");
       showCompletionNotice(completionMessage, "圧縮完了");
     }
   } catch (error) {
@@ -337,10 +342,11 @@ async function installSelectedModel() {
     if (!response.ok) {
       throw new Error(result.error || "model install failed");
     }
-    setModelStatus(result.message || "モデル準備完了", "");
     if (result.cancelled) {
       modelSetupTitle.textContent = "モデル取得を中止しました";
       setModelStatus("モデル取得中止", "");
+    } else {
+      setModelReadyStatus();
     }
   } catch (error) {
     modelSetup.hidden = false;
@@ -448,11 +454,9 @@ async function prepareCompressionSelection() {
 
     if (result.prepared) {
       readyPrepareKey = prepareKey;
-      setModelStatus(result.message || "モデル準備完了", "");
-    } else {
-      setModelStatus(result.message || "待機中", "");
     }
     modelRuntimeReady = true;
+    setModelReadyStatus();
   } catch (_error) {
     modelRuntimeReady = false;
     setModelStatus("準備エラー", "error");
@@ -544,7 +548,7 @@ function formatLatencySeconds(latencyMs) {
 function setLoading(isLoading) {
   compressButton.disabled = isLoading || !modelInstalled || !modelRuntimeReady;
   clearInputButton.disabled = isLoading;
-  compressButton.textContent = isLoading ? "圧縮中" : "圧縮する";
+  compressButton.textContent = isLoading ? "圧縮中" : "圧縮";
 }
 
 function updateCompressButtonState() {
@@ -555,12 +559,25 @@ function setModelStatus(text, state) {
   updateStatusPill(modelStatus, "モデル", text, state);
 }
 
+function setModelReadyStatus() {
+  setModelStatus("準備完了", "");
+}
+
 function setWorkStatus(text, state) {
   updateStatusPill(workStatus, "作業", text, state);
 }
 
 function updateStatusPill(element, label, text, state) {
-  element.textContent = `${label}: ${text}`;
+  const fullStatus = `${label}: ${text}`;
+  const labelElement = document.createElement("span");
+  const textElement = document.createElement("span");
+  labelElement.className = "status-label";
+  labelElement.textContent = `${label}:`;
+  textElement.className = "status-text";
+  textElement.textContent = text;
+  element.replaceChildren(labelElement, textElement);
+  element.setAttribute("aria-label", fullStatus);
+  element.title = fullStatus;
   element.className = `status-pill ${state || ""}`.trim();
 }
 
@@ -707,7 +724,7 @@ async function refreshRuntimeStatus() {
         modelCancelRequested = false;
         activeModelDownloadProfile = "";
         modelCancelButton.hidden = true;
-        setModelStatus(status.message || "モデル準備完了", "");
+        setModelReadyStatus();
         break;
       case "error":
         modelRuntimeReady = false;
@@ -723,7 +740,7 @@ async function refreshRuntimeStatus() {
         break;
       case "skipped":
         modelRuntimeReady = true;
-        setModelStatus(status.message || "待機中", "");
+        setModelReadyStatus();
         break;
       default:
         modelRuntimeReady = false;
@@ -820,7 +837,7 @@ function closeSettingsMenu() {
   settingsButton.setAttribute("aria-expanded", "false");
 }
 
-window.promptCompressorOpenSettings = () => {
+window.trimPromptOpenSettings = () => {
   window.scrollTo({ top: 0, behavior: "auto" });
   openSettingsMenu();
   settingsButton.focus();
@@ -834,15 +851,31 @@ async function loadSettings() {
 
 function loadLocalSettings() {
   try {
-    const current = JSON.parse(localStorage.getItem(settingsStorageKey) || "{}");
-    const theme = localStorage.getItem(themeStorageKey);
+    const current = readStoredSettings(settingsStorageKey);
+    const theme =
+      localStorage.getItem(themeStorageKey) || localStorage.getItem(legacyThemeStorageKey);
     if (Object.keys(current).length > 0) {
       return normalizeLoadedSettings({ ...current, theme: current.theme || theme });
     }
 
-    const legacy = JSON.parse(localStorage.getItem(legacySettingsStorageKey) || "{}");
-    const migrated = legacy.profile === "lmstudio" ? { ...legacy, profile: undefined } : legacy;
-    return normalizeLoadedSettings({ ...migrated, theme });
+    for (const legacyStorageKey of legacySettingsStorageKeys) {
+      const legacy = readStoredSettings(legacyStorageKey);
+      if (Object.keys(legacy).length === 0) {
+        continue;
+      }
+      const migrated = legacy.profile === "lmstudio" ? { ...legacy, profile: undefined } : legacy;
+      return normalizeLoadedSettings({ ...migrated, theme });
+    }
+    return normalizeLoadedSettings({ theme });
+  } catch (_error) {
+    return {};
+  }
+}
+
+function readStoredSettings(key) {
+  try {
+    const value = JSON.parse(localStorage.getItem(key) || "{}");
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
   } catch (_error) {
     return {};
   }

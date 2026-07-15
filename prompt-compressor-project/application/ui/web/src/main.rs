@@ -5,8 +5,8 @@ use clap::Parser;
 use prompt_compressor_local_ui::{run_server, ServerOptions};
 
 #[derive(Debug, Parser)]
-#[command(name = "prompt-compressor-local-ui")]
-#[command(about = "Development local UI for Prompt Compressor")]
+#[command(name = "trimprompt-local-ui")]
+#[command(about = "Development local UI for TrimPrompt")]
 struct Args {
     #[arg(long, value_name = "HOST", default_value = "127.0.0.1")]
     host: String,
