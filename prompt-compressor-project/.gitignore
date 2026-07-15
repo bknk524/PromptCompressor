@@ -1,4 +1,6 @@
-/target
+# Cargo build outputs, including isolated evaluation targets
+/target/
+/target-*/
 /dist
 /node_modules
 /application/local/cache/*

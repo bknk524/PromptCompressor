@@ -10,6 +10,7 @@
   "levels": {
     "2": {
       "max_average_character_ratio": 0.82,
+      "min_case_character_ratio": 0.2,
       "max_case_character_ratio": 0.92
     }
   },

@@ -5,7 +5,6 @@ runtimes:
     backend: llama.cpp
     launch_mode: embedded
     threads: auto
-    gpu_layers: 0
     timeout_ms: 120000
 
   lmstudio_external:

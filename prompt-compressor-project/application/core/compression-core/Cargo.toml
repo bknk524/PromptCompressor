@@ -9,9 +9,11 @@ default = ["embedded-llama"]
 embedded-llama = ["dep:llama_cpp"]
 
 [dependencies]
+hf-hub.workspace = true
 llama_cpp = { version = "0.3.2", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

@@ -5,7 +5,9 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -18,7 +20,7 @@ use tao::{
 };
 use wry::{
     http::{header::CONTENT_TYPE, Request, Response},
-    WebContext, WebViewBuilder,
+    RequestAsyncResponder, WebContext, WebViewBuilder,
 };
 
 #[cfg(windows)]
@@ -28,6 +30,12 @@ use tao::{
 };
 
 const APP_USER_MODEL_ID: &str = "PromptCompressor.Desktop";
+const APP_WINDOW_TITLE: &str = "Prompt Compressor";
+const SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\PromptCompressor.Desktop.SingleInstance";
+const PROTOCOL_WORKER_COUNT: usize = 4;
+const PROTOCOL_QUEUE_CAPACITY: usize = 16;
+const MAX_NOTIFICATION_TITLE_CHARS: usize = 128;
+const MAX_NOTIFICATION_BODY_CHARS: usize = 1_024;
 
 #[derive(Debug, Parser)]
 #[command(name = "prompt-compressor-desktop")]
@@ -35,6 +43,9 @@ const APP_USER_MODEL_ID: &str = "PromptCompressor.Desktop";
 struct Args {
     #[arg(long, value_name = "DIR")]
     settings_dir: Option<PathBuf>,
+
+    #[arg(long, hide = true)]
+    package_smoke_test: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,7 +98,7 @@ struct DesktopNotification {
     body: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WindowControl {
     Minimize,
     ToggleMaximize,
@@ -96,19 +107,197 @@ enum WindowControl {
 }
 
 fn main() {
-    if let Err(error) = run() {
-        show_startup_error(&error);
+    let args = Args::parse();
+    let package_smoke_test = args.package_smoke_test;
+    if let Err(error) = run(args) {
+        if !package_smoke_test {
+            show_startup_error(&error);
+        }
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<()> {
-    let args = Args::parse();
+fn run(args: Args) -> Result<()> {
+    if args.package_smoke_test {
+        return run_packaged_local_model_smoke_test(args.settings_dir);
+    }
+
+    let Some(_single_instance) = acquire_single_instance()? else {
+        return Ok(());
+    };
     set_app_user_model_id();
     let app = prepare_embedded_web_app(args.settings_dir)?;
     app.start_default_profile_warmup();
 
     run_window(app)
+}
+
+#[cfg(windows)]
+struct SingleInstanceGuard {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows_sys::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn acquire_single_instance() -> Result<Option<SingleInstanceGuard>> {
+    use std::ptr;
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS},
+        System::Threading::CreateMutexW,
+    };
+
+    let name = wide_null(SINGLE_INSTANCE_MUTEX_NAME);
+    let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        anyhow::bail!(
+            "failed to create desktop single-instance mutex: {}",
+            unsafe { GetLastError() }
+        );
+    }
+
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        restore_existing_instance();
+        return Ok(None);
+    }
+
+    Ok(Some(SingleInstanceGuard { handle }))
+}
+
+#[cfg(windows)]
+fn restore_existing_instance() {
+    use std::ptr;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, MessageBoxW, SetForegroundWindow, ShowWindow, MB_ICONINFORMATION, MB_OK,
+        SW_RESTORE,
+    };
+
+    let title = wide_null(APP_WINDOW_TITLE);
+    let window = unsafe { FindWindowW(ptr::null(), title.as_ptr()) };
+    if !window.is_null() {
+        unsafe {
+            let _ = ShowWindow(window, SW_RESTORE);
+            let _ = SetForegroundWindow(window);
+        }
+        return;
+    }
+
+    let message = wide_null("Prompt Compressor は既に起動しています。");
+    unsafe {
+        let _ = MessageBoxW(
+            ptr::null_mut(),
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+struct SingleInstanceGuard;
+
+#[cfg(not(windows))]
+fn acquire_single_instance() -> Result<Option<SingleInstanceGuard>> {
+    Ok(Some(SingleInstanceGuard))
+}
+
+const PACKAGED_SMOKE_RESULT_FILE: &str = "package-smoke-result.json";
+const PACKAGED_SMOKE_INPUT: &str = "React の検索画面で、検索ボタンを押したときだけ API を呼ぶようにしてください。既存の useSearchParams による URL クエリ管理は維持し、大規模なリファクタリングは避けてください。";
+
+fn run_packaged_local_model_smoke_test(settings_dir: Option<PathBuf>) -> Result<()> {
+    let app = prepare_embedded_web_app(settings_dir)?;
+    let application_root = app
+        .settings_dir()
+        .parent()
+        .context("settings directory must be inside the application directory")?;
+    let result_path = application_root
+        .join("local")
+        .join("state")
+        .join(PACKAGED_SMOKE_RESULT_FILE);
+    if let Some(parent) = result_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let request_body = packaged_smoke_request_body()?;
+    let response = app.handle_request("POST", "/api/compress", &request_body);
+    fs::write(&result_path, &response.body)
+        .with_context(|| format!("failed to write {}", result_path.display()))?;
+    anyhow::ensure!(
+        response.status == 200,
+        "packaged local model smoke test returned HTTP {}",
+        response.status
+    );
+
+    let result: serde_json::Value =
+        serde_json::from_slice(&response.body).context("smoke test response was not valid JSON")?;
+    validate_packaged_smoke_result(&result)
+}
+
+fn packaged_smoke_request_body() -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "input_text": PACKAGED_SMOKE_INPUT,
+        "profile": "internal_llm",
+        "task_type": "coding",
+        "compression_mode": "codex_optimized",
+        "compression_level": 2,
+        "constraints": {
+            "preserve_code_blocks": true,
+            "preserve_file_names": true,
+            "preserve_error_messages": true,
+            "preserve_numbers": true,
+            "preserve_negations": true
+        }
+    }))?)
+}
+
+fn validate_packaged_smoke_result(result: &serde_json::Value) -> Result<()> {
+    anyhow::ensure!(
+        result.get("profile").and_then(serde_json::Value::as_str) == Some("internal_llm"),
+        "packaged local model smoke test used an unexpected profile"
+    );
+    anyhow::ensure!(
+        result.get("runtime").and_then(serde_json::Value::as_str) == Some("llama_cpp_embedded"),
+        "packaged local model smoke test used an unexpected runtime"
+    );
+    anyhow::ensure!(
+        result
+            .get("should_send_original")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false),
+        "packaged local model smoke test returned the original prompt"
+    );
+    anyhow::ensure!(
+        result
+            .get("distilled_prompt")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|prompt| !prompt.trim().is_empty()),
+        "packaged local model smoke test returned an empty prompt"
+    );
+
+    let input_characters = result
+        .pointer("/metrics/input_characters")
+        .and_then(serde_json::Value::as_u64)
+        .context("smoke test result is missing metrics.input_characters")?;
+    let output_characters = result
+        .pointer("/metrics/output_characters")
+        .and_then(serde_json::Value::as_u64)
+        .context("smoke test result is missing metrics.output_characters")?;
+    anyhow::ensure!(
+        output_characters < input_characters,
+        "packaged local model smoke test did not reduce character count"
+    );
+    Ok(())
 }
 
 fn show_startup_error(error: &anyhow::Error) {
@@ -122,8 +311,8 @@ fn show_startup_error(error: &anyhow::Error) {
          Required shape:\n\n\
          PromptCompressor.exe\n\
          application\\config\\\n\
-         application\\resources\\\n\
-         application\\local\\models\\...\n\n\
+         application\\resources\\\n\n\
+         The local model is downloaded from Hugging Face after startup.\n\n\
          Error details:\n{error:#}\n"
     );
 
@@ -163,7 +352,7 @@ fn run_window(app: EmbeddedWebApp) -> Result<()> {
     let event_loop = EventLoopBuilder::<DesktopEvent>::with_user_event().build();
 
     let window = WindowBuilder::new()
-        .with_title("Prompt Compressor")
+        .with_title(APP_WINDOW_TITLE)
         .with_decorations(false)
         .with_inner_size(LogicalSize::new(980.0, 860.0))
         .with_min_inner_size(LogicalSize::new(520.0, 640.0))
@@ -171,16 +360,30 @@ fn run_window(app: EmbeddedWebApp) -> Result<()> {
     configure_window_chrome(&window, initial_theme);
     let mut tray_message_window = install_tray_message_window(&window, event_loop.create_proxy());
     let mut tray_icon = install_tray_icon(&window, tray_message_window.as_ref());
-    let tray_available = tray_icon.is_some();
 
     let mut web_context = WebContext::new(Some(webview_data_dir));
     let app = Arc::new(app);
     let protocol_app = app.clone();
+    let protocol_executor = BoundedExecutor::new(
+        PROTOCOL_WORKER_COUNT,
+        PROTOCOL_QUEUE_CAPACITY,
+        ProtocolJob::run,
+    );
     let desktop_proxy = event_loop.create_proxy();
     let webview = WebViewBuilder::new_with_web_context(&mut web_context)
-        .with_custom_protocol("prompt-compressor".into(), move |_webview_id, request| {
-            handle_protocol_request(&protocol_app, request)
-        })
+        .with_asynchronous_custom_protocol(
+            "prompt-compressor".into(),
+            move |_webview_id, request, responder| {
+                let job = ProtocolJob {
+                    app: Arc::clone(&protocol_app),
+                    request,
+                    responder,
+                };
+                if let Err(job) = protocol_executor.submit(job) {
+                    job.reject_busy();
+                }
+            },
+        )
         .with_ipc_handler(move |request: Request<String>| {
             let message = request.body();
             if let Some(theme) = AppTheme::from_ipc_message(message) {
@@ -202,7 +405,13 @@ fn run_window(app: EmbeddedWebApp) -> Result<()> {
                 apply_window_theme(&window, theme);
             }
             Event::UserEvent(DesktopEvent::WindowControl(control)) => {
-                handle_window_control(&window, control, tray_available);
+                if control == WindowControl::Close {
+                    drop(tray_icon.take());
+                    drop(tray_message_window.take());
+                    *control_flow = ControlFlow::Exit;
+                } else {
+                    handle_window_control(&window, control);
+                }
             }
             Event::UserEvent(DesktopEvent::ShowNotification(notification)) => {
                 show_desktop_notification(
@@ -227,7 +436,9 @@ fn run_window(app: EmbeddedWebApp) -> Result<()> {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                hide_window_to_tray(&window, tray_available);
+                drop(tray_icon.take());
+                drop(tray_message_window.take());
+                *control_flow = ControlFlow::Exit;
             }
             _ => {}
         }
@@ -235,7 +446,7 @@ fn run_window(app: EmbeddedWebApp) -> Result<()> {
 }
 
 fn configure_window_chrome(window: &tao::window::Window, theme: AppTheme) {
-    window.set_title("Prompt Compressor");
+    window.set_title(APP_WINDOW_TITLE);
     set_window_icons(window);
     set_window_shadow(window);
     apply_window_theme(window, theme);
@@ -290,19 +501,26 @@ impl DesktopNotification {
     fn from_ipc_message(message: &str) -> Option<Self> {
         let payload = message.strip_prefix("notification:")?;
         let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
-        let title = value
-            .get("title")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("圧縮完了")
-            .to_string();
-        let body = value
-            .get("body")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())?
-            .to_string();
+        let title = limit_notification_text(
+            value
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("圧縮完了"),
+            MAX_NOTIFICATION_TITLE_CHARS,
+        );
+        let body = limit_notification_text(
+            value
+                .get("body")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?,
+            MAX_NOTIFICATION_BODY_CHARS,
+        );
+        if body.is_empty() {
+            return None;
+        }
 
         Some(Self { title, body })
     }
@@ -793,26 +1011,14 @@ impl WindowControl {
     }
 }
 
-fn handle_window_control(
-    window: &tao::window::Window,
-    control: WindowControl,
-    tray_available: bool,
-) {
+fn handle_window_control(window: &tao::window::Window, control: WindowControl) {
     match control {
-        WindowControl::Minimize => hide_window_to_tray(window, tray_available),
+        WindowControl::Minimize => window.set_minimized(true),
         WindowControl::ToggleMaximize => window.set_maximized(!window.is_maximized()),
-        WindowControl::Close => hide_window_to_tray(window, tray_available),
+        WindowControl::Close => {}
         WindowControl::Drag => {
             let _ = window.drag_window();
         }
-    }
-}
-
-fn hide_window_to_tray(window: &tao::window::Window, tray_available: bool) {
-    if tray_available {
-        window.set_visible(false);
-    } else {
-        window.set_minimized(true);
     }
 }
 
@@ -921,6 +1127,79 @@ fn handle_protocol_request(
     protocol_response(response)
 }
 
+struct ProtocolJob {
+    app: Arc<EmbeddedWebApp>,
+    request: Request<Vec<u8>>,
+    responder: RequestAsyncResponder,
+}
+
+impl ProtocolJob {
+    fn run(self) {
+        let response = handle_protocol_request(&self.app, self.request);
+        self.responder.respond(response);
+    }
+
+    fn reject_busy(self) {
+        let response = LocalAppResponse {
+            status: 503,
+            content_type: "application/json; charset=utf-8".to_string(),
+            body: serde_json::to_vec(&serde_json::json!({
+                "error": "処理が混み合っています。少し待ってから再試行してください。"
+            }))
+            .expect("static busy response should serialize"),
+        };
+        self.responder.respond(protocol_response(response));
+    }
+}
+
+struct BoundedExecutor<T> {
+    sender: SyncSender<T>,
+    _workers: Vec<JoinHandle<()>>,
+}
+
+impl<T: Send + 'static> BoundedExecutor<T> {
+    fn new(
+        worker_count: usize,
+        queue_capacity: usize,
+        process: impl Fn(T) + Send + Sync + 'static,
+    ) -> Self {
+        assert!(worker_count > 0, "worker_count must be greater than zero");
+        let (sender, receiver) = mpsc::sync_channel(queue_capacity);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let process = Arc::new(process);
+        let mut workers = Vec::with_capacity(worker_count);
+
+        for _ in 0..worker_count {
+            let receiver = Arc::clone(&receiver);
+            let process = Arc::clone(&process);
+            workers.push(std::thread::spawn(move || loop {
+                let item = {
+                    let Ok(receiver) = receiver.lock() else {
+                        return;
+                    };
+                    receiver.recv()
+                };
+                let Ok(item) = item else {
+                    return;
+                };
+                process(item);
+            }));
+        }
+
+        Self {
+            sender,
+            _workers: workers,
+        }
+    }
+
+    fn submit(&self, item: T) -> std::result::Result<(), T> {
+        match self.sender.try_send(item) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(item) | TrySendError::Disconnected(item)) => Err(item),
+        }
+    }
+}
+
 fn protocol_response(response: LocalAppResponse) -> Response<Cow<'static, [u8]>> {
     Response::builder()
         .status(response.status)
@@ -936,4 +1215,112 @@ fn protocol_response(response: LocalAppResponse) -> Response<Cow<'static, [u8]>>
                 ))
                 .expect("fallback protocol response should be valid")
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_smoke_result() -> serde_json::Value {
+        serde_json::json!({
+            "profile": "internal_llm",
+            "runtime": "llama_cpp_embedded",
+            "should_send_original": false,
+            "distilled_prompt": "検索ボタン押下時のみAPIを呼ぶ。",
+            "metrics": {
+                "input_characters": 100,
+                "output_characters": 20
+            }
+        })
+    }
+
+    #[test]
+    fn packaged_smoke_request_uses_the_embedded_profile_and_level_two() {
+        let body: serde_json::Value = serde_json::from_slice(
+            &packaged_smoke_request_body().expect("serialize smoke request"),
+        )
+        .expect("parse smoke request");
+
+        assert_eq!(body["profile"], "internal_llm");
+        assert_eq!(body["compression_level"], 2);
+        assert_eq!(body["task_type"], "coding");
+        assert_eq!(body["compression_mode"], "codex_optimized");
+        assert_eq!(body["input_text"], PACKAGED_SMOKE_INPUT);
+    }
+
+    #[test]
+    fn packaged_smoke_validation_requires_real_compression() {
+        assert!(validate_packaged_smoke_result(&valid_smoke_result()).is_ok());
+
+        let mut fallback = valid_smoke_result();
+        fallback["should_send_original"] = serde_json::Value::Bool(true);
+        assert!(validate_packaged_smoke_result(&fallback).is_err());
+
+        let mut unchanged = valid_smoke_result();
+        unchanged["metrics"]["output_characters"] = serde_json::json!(100);
+        assert!(validate_packaged_smoke_result(&unchanged).is_err());
+    }
+
+    #[test]
+    fn protocol_executor_runs_tasks_outside_the_calling_thread() {
+        let caller = std::thread::current().id();
+        let (tx, rx) = mpsc::channel();
+        let executor = BoundedExecutor::new(1, 1, move |()| {
+            tx.send(std::thread::current().id())
+                .expect("send worker id");
+        });
+
+        executor.submit(()).expect("submit protocol task");
+        let worker_thread = rx.recv().expect("receive worker id");
+        assert_ne!(worker_thread, caller);
+    }
+
+    #[test]
+    fn protocol_executor_rejects_work_when_workers_and_queue_are_full() {
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let worker_gate = Arc::clone(&gate);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let executor = BoundedExecutor::new(1, 1, move |value| {
+            if value == 1 {
+                started_tx.send(()).expect("signal worker start");
+                let (lock, condition) = &*worker_gate;
+                let mut released = lock.lock().expect("lock test gate");
+                while !*released {
+                    released = condition.wait(released).expect("wait for test gate");
+                }
+            }
+            completed_tx.send(value).expect("signal completed task");
+        });
+
+        executor.submit(1).expect("start first task");
+        started_rx.recv().expect("worker should start");
+        executor.submit(2).expect("queue second task");
+        assert_eq!(executor.submit(3), Err(3));
+
+        let (lock, condition) = &*gate;
+        *lock.lock().expect("lock test gate") = true;
+        condition.notify_one();
+        assert_eq!(completed_rx.recv().expect("first task completes"), 1);
+        assert_eq!(completed_rx.recv().expect("second task completes"), 2);
+    }
+
+    #[test]
+    fn desktop_notification_normalizes_and_limits_ipc_text() {
+        let long_body = format!("line one\n{}", "x".repeat(MAX_NOTIFICATION_BODY_CHARS + 20));
+        let message = format!(
+            "notification:{}",
+            serde_json::json!({ "title": "  title\ntext  ", "body": long_body })
+        );
+
+        let notification =
+            DesktopNotification::from_ipc_message(&message).expect("valid notification");
+
+        assert_eq!(notification.title, "title text");
+        assert_eq!(
+            notification.body.chars().count(),
+            MAX_NOTIFICATION_BODY_CHARS
+        );
+        assert!(!notification.body.contains('\n'));
+    }
 }

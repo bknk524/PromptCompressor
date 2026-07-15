@@ -107,10 +107,15 @@ impl ProfileRegistry {
             )));
         }
 
-        let profiles = entries
+        let profiles: BTreeMap<_, _> = entries
             .into_iter()
-            .map(|(id, entry)| {
-                (
+            .map(|(id, entry)| -> Result<_> {
+                if id.trim().is_empty() || id.chars().any(char::is_control) {
+                    return Err(CompressionError::InvalidConfig(
+                        "profile id cannot be empty or contain control characters".into(),
+                    ));
+                }
+                Ok((
                     id.clone(),
                     ProfileDefinition {
                         id,
@@ -122,9 +127,29 @@ impl ProfileRegistry {
                         fallback_profile: entry.fallback_profile,
                         target_tokenizer_profile: entry.target_tokenizer_profile,
                     },
-                )
+                ))
             })
-            .collect();
+            .collect::<Result<_>>()?;
+        if profiles.is_empty() {
+            return Err(CompressionError::InvalidConfig(
+                "profile catalog must define at least one profile".into(),
+            ));
+        }
+        if let Some(default_profile) = &default_profile {
+            if !profiles.contains_key(default_profile) {
+                return Err(CompressionError::InvalidConfig(format!(
+                    "default profile '{default_profile}' is not defined"
+                )));
+            }
+        }
+        for profile in profiles.values() {
+            if !profiles.contains_key(&profile.fallback_profile) {
+                return Err(CompressionError::InvalidConfig(format!(
+                    "profile '{}' references unknown fallback profile '{}'",
+                    profile.id, profile.fallback_profile
+                )));
+            }
+        }
 
         Ok(Self {
             profiles,
@@ -134,6 +159,7 @@ impl ProfileRegistry {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProfilesFile {
     schema_version: u32,
     #[serde(default)]
@@ -142,6 +168,7 @@ struct ProfilesFile {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProfileEntry {
     label: String,
     #[serde(default)]
@@ -151,4 +178,28 @@ struct ProfileEntry {
     runtime_ref: String,
     fallback_profile: String,
     target_tokenizer_profile: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProfilesFile;
+
+    #[test]
+    fn rejects_unknown_profile_keys() {
+        let yaml = r#"
+schema_version: 1
+profiles:
+  internal:
+    label: Internal
+    selectable: true
+    model_ref: model
+    policy_ref: policy
+    runtime_ref: runtime
+    fallback_profile: internal
+    target_tokenizer_profile: codex_default
+    runtime_threads: 4
+"#;
+
+        assert!(serde_yaml::from_str::<ProfilesFile>(yaml).is_err());
+    }
 }

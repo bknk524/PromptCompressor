@@ -24,7 +24,7 @@ application folder.
 
 ## Current Local Model
 
-The adopted local model is stored at:
+The adopted local model is downloaded on first use and stored at:
 
 ```text
 models/sarashina2.2-3b-instruct-v0.1/sarashina2.2-3b-instruct-v0.1-Q4_K_S.gguf
@@ -32,6 +32,7 @@ models/sarashina2.2-3b-instruct-v0.1/sarashina2.2-3b-instruct-v0.1-Q4_K_S.gguf
 
 Source: `mmnga/sarashina2.2-3b-instruct-v0.1-gguf` on Hugging Face.
 Base model: `sbintuitions/sarashina2.2-3b-instruct-v0.1`.
+The source revision and SHA-256 are pinned in `../config/model-catalog.yaml`.
 The `models/` directory is excluded from Git because model files are large and machine-specific.
 
 The default app workflow does not require `llama.exe`, `llama-server.exe`, or

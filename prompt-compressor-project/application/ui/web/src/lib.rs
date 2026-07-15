@@ -1,42 +1,36 @@
-use std::fs;
+use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
-use std::ptr::{null, null_mut};
+use std::os::windows::ffi::OsStrExt;
+#[cfg(target_os = "windows")]
+use std::ptr::null_mut;
 
 use anyhow::{Context, Result};
 use prompt_compressor_core::{
-    CompressionConstraints, CompressionLevel, CompressionMode, CompressionRequest,
-    CompressionService, ConfiguredRuntimeBackend, ProfileRegistry, RequestSource, RequestTarget,
-    TaskType,
+    CompressionConstraints, CompressionError, CompressionLevel, CompressionRequest,
+    CompressionService, ConfiguredRuntimeBackend, ModelDownloadCancellation, ModelDownloadProgress,
+    ProfileRegistry, RequestSource, RequestTarget,
 };
 use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::{
-    Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM},
+    Foundation::GetLastError,
+    Storage::FileSystem::{
+        GetDiskFreeSpaceExW, MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    },
     System::{
         DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
-        LibraryLoader::GetModuleHandleW,
         Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
         Ole::CF_UNICODETEXT,
-    },
-    UI::{
-        Shell::{
-            Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO,
-            NIIF_LARGE_ICON, NIIF_USER, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
-            NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
-        },
-        WindowsAndMessaging::{
-            CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, LoadIconW, LoadImageW,
-            RegisterClassW, UnregisterClassW, HICON, HWND_MESSAGE, IDI_INFORMATION, IMAGE_ICON,
-            LR_DEFAULTSIZE, WM_USER, WNDCLASSW, WS_OVERLAPPED,
-        },
     },
 };
 
@@ -44,8 +38,17 @@ const INDEX_HTML: &str = include_str!("../static/index.html");
 const STYLES_CSS: &str = include_str!("../static/styles.css");
 const APP_JS: &str = include_str!("../static/app.js");
 
-#[cfg(target_os = "windows")]
-const APP_ICON_RESOURCE_ID: u16 = 1;
+const MAX_HEADER_BYTES: usize = 16 * 1024;
+const MAX_REQUEST_PATH_BYTES: usize = 2 * 1024;
+const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024;
+const MAX_SETTINGS_BODY_BYTES: usize = 16 * 1024;
+const MAX_PROMPT_CHARS: usize = 100_000;
+const MAX_PROFILE_CHARS: usize = 128;
+const MAX_CLIPBOARD_CHARS: usize = 100_000;
+const HTTP_WORKER_COUNT: usize = 4;
+const HTTP_QUEUE_CAPACITY: usize = 16;
+const INSTALL_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
+static SETTINGS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct ServerOptions {
@@ -135,8 +138,104 @@ pub struct LocalAppResponse {
 struct AppState {
     registry: ProfileRegistry,
     backend: ConfiguredRuntimeBackend,
+    service: Arc<CompressionService<ConfiguredRuntimeBackend>>,
     warmup: RuntimeWarmupState,
     ui_settings: PersistedUiSettings,
+    inference_gate: InferenceGate,
+    model_downloads: ModelDownloadControl,
+}
+
+#[derive(Clone, Default)]
+struct InferenceGate {
+    slot: Arc<Mutex<()>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InferenceGateError {
+    Busy,
+    Unavailable,
+}
+
+impl InferenceGate {
+    fn try_enter(&self) -> std::result::Result<std::sync::MutexGuard<'_, ()>, InferenceGateError> {
+        match self.slot.try_lock() {
+            Ok(permit) => Ok(permit),
+            Err(TryLockError::WouldBlock) => Err(InferenceGateError::Busy),
+            Err(TryLockError::Poisoned(_)) => Err(InferenceGateError::Unavailable),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct ModelDownloadControl {
+    next_id: Arc<AtomicU64>,
+    active: Arc<Mutex<Option<ActiveModelDownload>>>,
+}
+
+#[derive(Clone)]
+struct ActiveModelDownload {
+    id: u64,
+    profile: String,
+    cancellation: ModelDownloadCancellation,
+}
+
+struct ModelDownloadPermit {
+    control: ModelDownloadControl,
+    active: ActiveModelDownload,
+}
+
+impl ModelDownloadControl {
+    fn start(&self, profile: String) -> Result<ModelDownloadPermit> {
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| anyhow::anyhow!("model download control is unavailable"))?;
+        if active.is_some() {
+            anyhow::bail!("a model download is already active");
+        }
+        let operation = ActiveModelDownload {
+            id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            profile,
+            cancellation: ModelDownloadCancellation::default(),
+        };
+        *active = Some(operation.clone());
+        Ok(ModelDownloadPermit {
+            control: self.clone(),
+            active: operation,
+        })
+    }
+
+    fn cancel(&self, profile: &str) -> Result<bool> {
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| anyhow::anyhow!("model download control is unavailable"))?;
+        let Some(active) = active.as_ref() else {
+            return Ok(false);
+        };
+        if active.profile != profile {
+            anyhow::bail!("the requested profile is not being downloaded");
+        }
+        active.cancellation.cancel();
+        Ok(true)
+    }
+}
+
+impl ModelDownloadPermit {
+    fn cancellation(&self) -> &ModelDownloadCancellation {
+        &self.active.cancellation
+    }
+}
+
+impl Drop for ModelDownloadPermit {
+    fn drop(&mut self) {
+        let Ok(mut active) = self.control.active.lock() else {
+            return;
+        };
+        if active.as_ref().map(|value| value.id) == Some(self.active.id) {
+            *active = None;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -145,6 +244,8 @@ struct RuntimeWarmupSnapshot {
     profile: Option<String>,
     message: String,
     error: Option<String>,
+    downloaded_bytes: Option<u64>,
+    total_bytes: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -160,6 +261,8 @@ impl RuntimeWarmupState {
                 profile: None,
                 message: "モデル読み込み待機中".to_string(),
                 error: None,
+                downloaded_bytes: None,
+                total_bytes: None,
             })),
         }
     }
@@ -177,10 +280,30 @@ impl RuntimeWarmupState {
                 snapshot.profile = profile;
                 snapshot.message = message.into();
                 snapshot.error = error;
+                snapshot.downloaded_bytes = None;
+                snapshot.total_bytes = None;
             }
             Err(error) => {
                 eprintln!("runtime warmup status lock failed: {error}");
             }
+        }
+    }
+
+    fn set_download_progress(&self, profile: String, downloaded_bytes: u64, total_bytes: u64) {
+        let percent = downloaded_bytes
+            .saturating_mul(100)
+            .checked_div(total_bytes)
+            .unwrap_or(0);
+        match self.snapshot.lock() {
+            Ok(mut snapshot) => {
+                snapshot.phase = "downloading".to_string();
+                snapshot.profile = Some(profile);
+                snapshot.message = format!("Hugging Faceからモデルを取得中 {percent}%");
+                snapshot.error = None;
+                snapshot.downloaded_bytes = Some(downloaded_bytes);
+                snapshot.total_bytes = Some(total_bytes);
+            }
+            Err(error) => eprintln!("runtime warmup status lock failed: {error}"),
         }
     }
 
@@ -204,7 +327,7 @@ impl RuntimeWarmupState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct UiSettings {
     #[serde(default = "default_ui_settings_schema_version")]
     schema_version: u32,
@@ -218,6 +341,8 @@ struct UiSettings {
     level: Option<u8>,
     #[serde(default)]
     theme: Option<String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for UiSettings {
@@ -229,6 +354,7 @@ impl Default for UiSettings {
             task: None,
             level: None,
             theme: None,
+            extra: BTreeMap::new(),
         }
     }
 }
@@ -289,8 +415,20 @@ impl PersistedUiSettings {
         }
     }
 
-    fn save(&self, settings: UiSettings) -> Result<serde_json::Value> {
+    fn save(&self, mut settings: UiSettings) -> Result<serde_json::Value> {
+        let mut guard = self
+            .settings
+            .lock()
+            .map_err(|error| anyhow::anyhow!("failed to lock UI settings: {error}"))?;
+
+        for (key, value) in &guard.extra {
+            settings.extra.entry(key.clone()).or_insert(value.clone());
+        }
         let settings = settings.normalized();
+        if *guard == settings {
+            return Ok(serde_json::to_value(settings)?);
+        }
+
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -298,16 +436,92 @@ impl PersistedUiSettings {
 
         let body =
             serde_json::to_vec_pretty(&settings).context("failed to serialize UI settings")?;
-        fs::write(&self.path, body)
-            .with_context(|| format!("failed to write {}", self.path.display()))?;
+        atomic_write_file(&self.path, &body)?;
 
-        let mut guard = self
-            .settings
-            .lock()
-            .map_err(|error| anyhow::anyhow!("failed to lock UI settings: {error}"))?;
         *guard = settings.clone();
         Ok(serde_json::to_value(settings)?)
     }
+}
+
+fn atomic_write_file(path: &Path, body: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("settings path has no file name: {}", path.display()))?;
+
+    let (temp_path, mut temp_file) = loop {
+        let counter = SETTINGS_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut temp_name = file_name.to_os_string();
+        temp_name.push(format!(".{}.{}.tmp", std::process::id(), counter));
+        let temp_path = parent.join(temp_name);
+
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => break (temp_path, file),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to create {}", temp_path.display()));
+            }
+        }
+    };
+
+    // 一時ファイルを完全に同期してから置換し、旧設定か新設定のどちらかだけが残るようにする。
+    let write_result = temp_file
+        .write_all(body)
+        .with_context(|| format!("failed to write {}", temp_path.display()))
+        .and_then(|()| {
+            temp_file
+                .sync_all()
+                .with_context(|| format!("failed to sync {}", temp_path.display()))
+        });
+    drop(temp_file);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    if let Err(error) = replace_file(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error).with_context(|| format!("failed to replace {}", path.display()));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let source = path_to_wide_null(source);
+    let destination = path_to_wide_null(destination);
+    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)?;
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(target_os = "windows")]
+fn path_to_wide_null(path: &Path) -> Vec<u16> {
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 fn normalize_optional_text(value: Option<String>) -> Option<String> {
@@ -324,8 +538,6 @@ fn default_ui_settings_schema_version() -> u32 {
 struct CompressPayload {
     input_text: String,
     profile: String,
-    task_type: TaskType,
-    compression_mode: CompressionMode,
     compression_level: u8,
     constraints: Option<CompressionConstraints>,
 }
@@ -333,17 +545,13 @@ struct CompressPayload {
 #[derive(Debug, Deserialize)]
 struct PrepareCompressionPayload {
     profile: String,
-    task_type: TaskType,
-    compression_mode: CompressionMode,
     compression_level: u8,
     constraints: Option<CompressionConstraints>,
 }
 
 #[derive(Debug, Deserialize)]
-struct NotificationPayload {
-    #[serde(default)]
-    title: Option<String>,
-    body: String,
+struct ModelProfilePayload {
+    profile: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -351,10 +559,24 @@ struct ClipboardPayload {
     text: String,
 }
 
+#[derive(Debug)]
 struct HttpRequest {
     method: String,
     path: String,
+    headers: BTreeMap<String, String>,
     body: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct HttpReadError {
+    status: u16,
+    message: &'static str,
+}
+
+impl HttpReadError {
+    fn new(status: u16, message: &'static str) -> Self {
+        Self { status, message }
+    }
 }
 
 pub fn run_server(options: ServerOptions) -> Result<()> {
@@ -407,6 +629,9 @@ fn run_server_with_ready(options: ServerOptions, on_ready: impl FnOnce(ServerInf
 }
 
 fn prepare_server(options: ServerOptions) -> Result<(ServerInfo, TcpListener, Arc<AppState>)> {
+    if !is_loopback_host(&options.host) {
+        anyhow::bail!("local UI host must resolve to a loopback address");
+    }
     let settings_dir = resolve_settings_dir(options.settings_dir.as_deref())?;
     let state = prepare_app_state(&settings_dir)?;
 
@@ -415,8 +640,11 @@ fn prepare_server(options: ServerOptions) -> Result<(ServerInfo, TcpListener, Ar
         TcpListener::bind(&address).with_context(|| format!("failed to bind {address}"))?;
     let address = listener
         .local_addr()
-        .context("failed to determine local server address")?
-        .to_string();
+        .context("failed to determine local server address")?;
+    if !address.ip().is_loopback() {
+        anyhow::bail!("local UI listener must use a loopback address");
+    }
+    let address = address.to_string();
     let url = format!("http://{address}/");
 
     Ok((
@@ -437,8 +665,9 @@ fn prepare_app_state(settings_dir: &Path) -> Result<Arc<AppState>> {
     let profiles_path = settings_dir.join("compression-profiles.yaml");
     let registry = ProfileRegistry::from_path(&profiles_path)
         .with_context(|| format!("failed to load profiles from {}", profiles_path.display()))?;
-    let backend = ConfiguredRuntimeBackend::from_settings_dir(&settings_dir)
+    let backend = ConfiguredRuntimeBackend::from_settings_dir(settings_dir)
         .context("failed to initialize configured runtime backend")?;
+    let service = Arc::new(CompressionService::new(registry.clone(), backend.clone()));
     let ui_settings = PersistedUiSettings::load(
         application_root
             .join("local")
@@ -448,8 +677,11 @@ fn prepare_app_state(settings_dir: &Path) -> Result<Arc<AppState>> {
     let state = Arc::new(AppState {
         registry,
         backend,
+        service,
         warmup: RuntimeWarmupState::new(),
         ui_settings,
+        inference_gate: InferenceGate::default(),
+        model_downloads: ModelDownloadControl::default(),
     });
     Ok(state)
 }
@@ -476,14 +708,39 @@ fn start_default_profile_warmup(state: Arc<AppState>) {
     };
 
     state.warmup.set(
-        "loading",
+        "checking",
         Some(profile.id.clone()),
-        "アプリ内モデルを読み込み中",
+        "アプリ内モデルを確認中",
         None,
     );
 
     thread::spawn(move || {
         let profile_id = profile.id.clone();
+        let status = match state.backend.profile_model_status(&profile) {
+            Ok(status) => status,
+            Err(error) => {
+                state.warmup.set(
+                    "error",
+                    Some(profile_id),
+                    "モデル状態の確認に失敗しました",
+                    Some(error.to_string()),
+                );
+                return;
+            }
+        };
+        if status.requires_install && !status.installed {
+            state
+                .warmup
+                .set("missing", Some(profile_id), "モデルの取得が必要です", None);
+            return;
+        }
+
+        state.warmup.set(
+            "loading",
+            Some(profile_id.clone()),
+            "インストール済みモデルを読み込み中",
+            None,
+        );
         match state.backend.warm_profile(&profile) {
             Ok(true) => state.warmup.set(
                 "ready",
@@ -500,7 +757,7 @@ fn start_default_profile_warmup(state: Arc<AppState>) {
             Err(error) => state.warmup.set(
                 "error",
                 Some(profile_id),
-                "アプリ内モデルの先読みでエラーが発生しました",
+                "アプリ内モデルの読み込みに失敗しました",
                 Some(error.to_string()),
             ),
         }
@@ -512,23 +769,36 @@ fn serve(
     state: Arc<AppState>,
     shutdown_rx: Option<mpsc::Receiver<()>>,
 ) -> Result<()> {
+    let server_address = listener
+        .local_addr()
+        .context("failed to determine local server address")?;
     listener
         .set_nonblocking(shutdown_rx.is_some())
         .context("failed to configure local server listener")?;
+    let (job_tx, workers) = start_http_workers(state, server_address);
 
-    loop {
+    let serve_result = loop {
         if let Some(shutdown_rx) = &shutdown_rx {
             match shutdown_rx.try_recv() {
-                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break Ok(()),
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
 
         match listener.accept() {
-            Ok((stream, _peer)) => {
-                let state = state.clone();
-                if let Err(error) = handle_client(stream, &state) {
-                    eprintln!("request failed: {error:#}");
+            Ok((stream, peer)) => {
+                if !peer.ip().is_loopback() {
+                    eprintln!("rejected non-loopback client");
+                    continue;
+                }
+                match job_tx.try_send(stream) {
+                    Ok(()) => {}
+                    Err(mpsc::TrySendError::Full(stream)) => {
+                        reject_overloaded_client(stream);
+                    }
+                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                        break Err(anyhow::anyhow!("HTTP worker pool stopped unexpectedly"));
+                    }
                 }
             }
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
@@ -536,22 +806,84 @@ fn serve(
             }
             Err(error) => eprintln!("connection failed: {error}"),
         }
-    }
+    };
 
-    Ok(())
+    drop(job_tx);
+    for worker in workers {
+        if worker.join().is_err() {
+            return Err(anyhow::anyhow!("HTTP worker panicked during shutdown"));
+        }
+    }
+    serve_result
 }
 
-fn handle_client(mut stream: TcpStream, state: &AppState) -> Result<()> {
+fn start_http_workers(
+    state: Arc<AppState>,
+    server_address: SocketAddr,
+) -> (mpsc::SyncSender<TcpStream>, Vec<JoinHandle<()>>) {
+    let (job_tx, job_rx) = mpsc::sync_channel::<TcpStream>(HTTP_QUEUE_CAPACITY);
+    let job_rx = Arc::new(Mutex::new(job_rx));
+    let mut workers = Vec::with_capacity(HTTP_WORKER_COUNT);
+
+    for _ in 0..HTTP_WORKER_COUNT {
+        let state = state.clone();
+        let job_rx = job_rx.clone();
+        workers.push(thread::spawn(move || loop {
+            let stream = match job_rx.lock() {
+                Ok(receiver) => receiver.recv(),
+                Err(error) => {
+                    eprintln!("HTTP worker queue lock failed: {error}");
+                    return;
+                }
+            };
+            let Ok(stream) = stream else {
+                return;
+            };
+            if let Err(error) = handle_client(stream, &state, server_address) {
+                eprintln!("request failed: {error:#}");
+            }
+        }));
+    }
+
+    (job_tx, workers)
+}
+
+fn reject_overloaded_client(mut stream: TcpStream) {
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+    let response = http_transport_response(json_response(
+        503,
+        &serde_json::json!({ "error": "local UI is busy" }),
+    ));
+    let _ = stream.write_all(&response);
+    let _ = stream.flush();
+}
+
+fn handle_client(
+    mut stream: TcpStream,
+    state: &AppState,
+    server_address: SocketAddr,
+) -> Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-    let request = read_request(&mut stream)?;
-    let response = route_request(request, state);
+    let response = match read_request(&mut stream) {
+        Ok(request) => route_request(request, state, server_address),
+        Err(error) => http_transport_response(json_response(
+            error.status,
+            &serde_json::json!({ "error": error.message }),
+        )),
+    };
     stream.write_all(&response)?;
     stream.flush()?;
     Ok(())
 }
 
-fn route_request(request: HttpRequest, state: &AppState) -> Vec<u8> {
+fn route_request(request: HttpRequest, state: &AppState, server_address: SocketAddr) -> Vec<u8> {
+    if let Err(error) = validate_network_request(&request, server_address) {
+        return http_transport_response(json_response(
+            error.status,
+            &serde_json::json!({ "error": error.message }),
+        ));
+    }
     http_transport_response(route_application_request(
         &request.method,
         &request.path,
@@ -567,6 +899,12 @@ fn route_application_request(
     state: &AppState,
 ) -> LocalAppResponse {
     let path = raw_path.split('?').next().unwrap_or(raw_path);
+    if body.len() > request_body_limit(path) {
+        return json_response(
+            413,
+            &serde_json::json!({ "error": "request body is too large" }),
+        );
+    }
     match (method, path) {
         ("GET", "/") => http_response(200, "text/html; charset=utf-8", INDEX_HTML.as_bytes()),
         ("GET", "/styles.css") => {
@@ -579,22 +917,23 @@ fn route_application_request(
         ),
         ("GET", "/api/profiles") => json_response(200, &profiles_json(&state.registry)),
         ("GET", "/api/runtime-status") => json_response(200, &state.warmup.json()),
+        ("POST", "/api/model-status") => match model_status_from_body(body, state) {
+            Ok(value) => json_response(200, &value),
+            Err(error) => json_response(400, &serde_json::json!({ "error": error.to_string() })),
+        },
+        ("POST", "/api/model-install") => {
+            run_inference_route(state, || install_model_from_body(body, state))
+        }
+        ("POST", "/api/model-cancel") => match cancel_model_download_from_body(body, state) {
+            Ok(value) => json_response(200, &value),
+            Err(error) => json_response(400, &serde_json::json!({ "error": error.to_string() })),
+        },
         ("GET", "/api/settings") => json_response(200, &state.ui_settings.json()),
         ("PUT" | "POST", "/api/settings") => match save_settings_from_body(body, state) {
             Ok(value) => json_response(200, &value),
             Err(error) => json_response(
                 400,
                 &serde_json::json!({
-                    "error": error.to_string()
-                }),
-            ),
-        },
-        ("POST", "/api/windows-notification") => match notify_from_body(body) {
-            Ok(value) => json_response(200, &value),
-            Err(error) => json_response(
-                400,
-                &serde_json::json!({
-                    "notified": false,
                     "error": error.to_string()
                 }),
             ),
@@ -609,25 +948,10 @@ fn route_application_request(
                 }),
             ),
         },
-        ("POST", "/api/prepare-compression") => match prepare_compression_from_body(body, state) {
-            Ok(value) => json_response(200, &value),
-            Err(error) => json_response(
-                400,
-                &serde_json::json!({
-                    "prepared": false,
-                    "error": error.to_string()
-                }),
-            ),
-        },
-        ("POST", "/api/compress") => match compress_from_body(body, state) {
-            Ok(value) => json_response(200, &value),
-            Err(error) => json_response(
-                400,
-                &serde_json::json!({
-                    "error": error.to_string()
-                }),
-            ),
-        },
+        ("POST", "/api/prepare-compression") => {
+            run_inference_route(state, || prepare_compression_from_body(body, state))
+        }
+        ("POST", "/api/compress") => run_inference_route(state, || compress_from_body(body, state)),
         _ => json_response(
             404,
             &serde_json::json!({
@@ -637,37 +961,63 @@ fn route_application_request(
     }
 }
 
-fn save_settings_from_body(body: &[u8], state: &AppState) -> Result<serde_json::Value> {
-    let settings: UiSettings = serde_json::from_slice(body).context("invalid JSON settings")?;
-    state.ui_settings.save(settings)
+fn request_body_limit(path: &str) -> usize {
+    match path {
+        "/api/settings"
+        | "/api/prepare-compression"
+        | "/api/model-status"
+        | "/api/model-install"
+        | "/api/model-cancel" => MAX_SETTINGS_BODY_BYTES,
+        "/api/clipboard" | "/api/compress" => MAX_REQUEST_BODY_BYTES,
+        _ => MAX_SETTINGS_BODY_BYTES,
+    }
 }
 
-fn notify_from_body(body: &[u8]) -> Result<serde_json::Value> {
-    let payload: NotificationPayload =
-        serde_json::from_slice(body).context("invalid JSON notification request")?;
-    let title = payload
-        .title
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("圧縮完了");
-    let body = payload.body.trim();
-    if body.is_empty() {
-        anyhow::bail!("notification body is empty");
-    }
+fn run_inference_route(
+    state: &AppState,
+    operation: impl FnOnce() -> Result<serde_json::Value>,
+) -> LocalAppResponse {
+    let _permit = match state.inference_gate.try_enter() {
+        Ok(permit) => permit,
+        Err(InferenceGateError::Busy) => {
+            return json_response(
+                429,
+                &serde_json::json!({ "error": "compression is already running" }),
+            );
+        }
+        Err(InferenceGateError::Unavailable) => {
+            return json_response(
+                500,
+                &serde_json::json!({ "error": "compression gate is unavailable" }),
+            );
+        }
+    };
 
-    let notified = show_windows_notification(title, body)?;
-    Ok(serde_json::json!({
-        "notified": notified
-    }))
+    match operation() {
+        Ok(value) => json_response(200, &value),
+        Err(error) => json_response(400, &serde_json::json!({ "error": error.to_string() })),
+    }
+}
+
+fn save_settings_from_body(body: &[u8], state: &AppState) -> Result<serde_json::Value> {
+    let settings: UiSettings = serde_json::from_slice(body).context("invalid JSON settings")?;
+    for (field, value) in [
+        ("profile", settings.profile.as_deref()),
+        ("mode", settings.mode.as_deref()),
+        ("task", settings.task.as_deref()),
+        ("theme", settings.theme.as_deref()),
+    ] {
+        if let Some(value) = value {
+            validate_text_field(field, value, MAX_PROFILE_CHARS, true)?;
+        }
+    }
+    state.ui_settings.save(settings)
 }
 
 fn copy_to_clipboard_from_body(body: &[u8]) -> Result<serde_json::Value> {
     let payload: ClipboardPayload =
         serde_json::from_slice(body).context("invalid JSON clipboard request")?;
-    if payload.text.trim().is_empty() {
-        anyhow::bail!("clipboard text is empty");
-    }
+    validate_text_field("clipboard text", &payload.text, MAX_CLIPBOARD_CHARS, false)?;
 
     let copied = write_text_to_clipboard(&payload.text)?;
     Ok(serde_json::json!({
@@ -675,13 +1025,189 @@ fn copy_to_clipboard_from_body(body: &[u8]) -> Result<serde_json::Value> {
     }))
 }
 
+fn model_status_from_body(body: &[u8], state: &AppState) -> Result<serde_json::Value> {
+    let payload: ModelProfilePayload =
+        serde_json::from_slice(body).context("invalid JSON model status request")?;
+    validate_text_field("profile", &payload.profile, MAX_PROFILE_CHARS, false)?;
+    let profile = state.registry.resolve(&payload.profile)?;
+    let status = state.backend.profile_model_status(profile)?;
+    let available_bytes = status
+        .destination
+        .as_deref()
+        .and_then(available_disk_space_bytes);
+    let mut value = serde_json::to_value(status)?;
+    value["available_bytes"] = available_bytes
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null);
+    Ok(value)
+}
+
+fn install_model_from_body(body: &[u8], state: &AppState) -> Result<serde_json::Value> {
+    let payload: ModelProfilePayload =
+        serde_json::from_slice(body).context("invalid JSON model install request")?;
+    validate_text_field("profile", &payload.profile, MAX_PROFILE_CHARS, false)?;
+    let profile = state.registry.resolve(&payload.profile)?.clone();
+    let status = state.backend.profile_model_status(&profile)?;
+    if !status.requires_install {
+        return Ok(serde_json::json!({
+            "installed": true,
+            "message": "このプロファイルはモデル取得不要です"
+        }));
+    }
+    ensure_model_disk_capacity(&status)?;
+    let download = state.model_downloads.start(profile.id.clone())?;
+
+    let profile_id = profile.id.clone();
+    state.warmup.set(
+        "downloading",
+        Some(profile_id.clone()),
+        "Hugging Faceからモデルを取得しています",
+        None,
+    );
+    let warmup = state.warmup.clone();
+    let result = state
+        .backend
+        .install_profile_with_progress_and_cancellation(
+            &profile,
+            download.cancellation(),
+            move |ModelDownloadProgress {
+                      downloaded_bytes,
+                      total_bytes,
+                  }| {
+                warmup.set_download_progress(profile_id.clone(), downloaded_bytes, total_bytes);
+            },
+        );
+    match result {
+        Ok(true) => {
+            state.warmup.set(
+                "ready",
+                Some(profile.id),
+                "モデル取得と読み込みが完了しました",
+                None,
+            );
+            Ok(serde_json::json!({
+                "installed": true,
+                "message": "モデル取得と読み込みが完了しました"
+            }))
+        }
+        Ok(false) => Ok(serde_json::json!({
+            "installed": true,
+            "message": "このプロファイルはモデル取得不要です"
+        })),
+        Err(CompressionError::Cancelled(_)) => {
+            state.warmup.set(
+                "cancelled",
+                Some(profile.id),
+                "モデル取得を中止しました。次回は続きから再開できます",
+                None,
+            );
+            Ok(serde_json::json!({
+                "installed": false,
+                "cancelled": true,
+                "message": "モデル取得を中止しました"
+            }))
+        }
+        Err(error) => {
+            state.warmup.set(
+                "error",
+                Some(profile.id),
+                "モデル取得に失敗しました",
+                Some(error.to_string()),
+            );
+            Err(error.into())
+        }
+    }
+}
+
+fn cancel_model_download_from_body(body: &[u8], state: &AppState) -> Result<serde_json::Value> {
+    let payload: ModelProfilePayload =
+        serde_json::from_slice(body).context("invalid JSON model cancel request")?;
+    validate_text_field("profile", &payload.profile, MAX_PROFILE_CHARS, false)?;
+    let cancelled = state.model_downloads.cancel(&payload.profile)?;
+    if cancelled {
+        state.warmup.set(
+            "cancelling",
+            Some(payload.profile),
+            "モデル取得を中止しています",
+            None,
+        );
+    }
+    Ok(serde_json::json!({
+        "cancelled": cancelled,
+        "message": if cancelled {
+            "モデル取得の中止を受け付けました"
+        } else {
+            "実行中のモデル取得はありません"
+        }
+    }))
+}
+
+fn ensure_model_disk_capacity(status: &prompt_compressor_core::ProfileModelStatus) -> Result<()> {
+    let Some(destination) = status.destination.as_deref() else {
+        return Ok(());
+    };
+    let Some(available_bytes) = available_disk_space_bytes(destination) else {
+        return Ok(());
+    };
+    let Some(required_bytes) = required_model_install_bytes(status) else {
+        return Ok(());
+    };
+    if available_bytes < required_bytes {
+        anyhow::bail!(
+            "insufficient disk space for model installation: required {required_bytes} bytes, available {available_bytes} bytes"
+        );
+    }
+    Ok(())
+}
+
+fn required_model_install_bytes(
+    status: &prompt_compressor_core::ProfileModelStatus,
+) -> Option<u64> {
+    if status.installed {
+        return None;
+    }
+    let size_bytes = status.size_bytes?;
+    let downloaded_bytes = status.partial_downloaded_bytes.unwrap_or(0).min(size_bytes);
+    Some(
+        size_bytes
+            .saturating_sub(downloaded_bytes)
+            .saturating_add(INSTALL_HEADROOM_BYTES),
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn available_disk_space_bytes(path: &Path) -> Option<u64> {
+    let existing = path.ancestors().find(|candidate| candidate.exists())?;
+    let volume_path = if existing.is_file() {
+        existing.parent()?
+    } else {
+        existing
+    };
+    let absolute = fs::canonicalize(volume_path).ok()?;
+    let wide = path_to_wide_null(&absolute);
+    let mut available = 0u64;
+    let success = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (success != 0).then_some(available)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn available_disk_space_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
 fn prepare_compression_from_body(body: &[u8], state: &AppState) -> Result<serde_json::Value> {
     let payload: PrepareCompressionPayload =
         serde_json::from_slice(body).context("invalid JSON prepare request")?;
+    validate_text_field("profile", &payload.profile, MAX_PROFILE_CHARS, false)?;
     let request = CompressionRequest {
         input_text: String::new(),
-        task_type: payload.task_type,
-        compression_mode: payload.compression_mode,
         compression_level: CompressionLevel::from_u8(payload.compression_level)
             .context("invalid compression level")?,
         profile: payload.profile,
@@ -698,8 +1224,7 @@ fn prepare_compression_from_body(body: &[u8], state: &AppState) -> Result<serde_
     );
 
     let started_at = Instant::now();
-    let service = CompressionService::new(state.registry.clone(), state.backend.clone());
-    match service.prepare(request.clone()) {
+    match state.service.prepare(request.clone()) {
         Ok(prepared) => {
             let message = if prepared {
                 "圧縮プロンプト準備完了"
@@ -732,10 +1257,10 @@ fn prepare_compression_from_body(body: &[u8], state: &AppState) -> Result<serde_
 
 fn compress_from_body(body: &[u8], state: &AppState) -> Result<serde_json::Value> {
     let payload: CompressPayload = serde_json::from_slice(body).context("invalid JSON request")?;
+    validate_text_field("input_text", &payload.input_text, MAX_PROMPT_CHARS, false)?;
+    validate_text_field("profile", &payload.profile, MAX_PROFILE_CHARS, false)?;
     let request = CompressionRequest {
         input_text: payload.input_text,
-        task_type: payload.task_type,
-        compression_mode: payload.compression_mode,
         compression_level: CompressionLevel::from_u8(payload.compression_level)
             .context("invalid compression level")?,
         profile: payload.profile,
@@ -744,9 +1269,26 @@ fn compress_from_body(body: &[u8], state: &AppState) -> Result<serde_json::Value
         source: RequestSource::Desktop,
     };
 
-    let service = CompressionService::new(state.registry.clone(), state.backend.clone());
-    let result = service.compress(request)?;
+    let result = state.service.compress(request)?;
     Ok(serde_json::to_value(result)?)
+}
+
+fn validate_text_field(
+    field: &str,
+    value: &str,
+    max_chars: usize,
+    allow_empty: bool,
+) -> Result<()> {
+    if !allow_empty && value.trim().is_empty() {
+        anyhow::bail!("{field} is empty");
+    }
+    if value.chars().count() > max_chars {
+        anyhow::bail!("{field} exceeds {max_chars} characters");
+    }
+    if value.contains('\0') {
+        anyhow::bail!("{field} contains a null character");
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -817,59 +1359,202 @@ fn profiles_json(registry: &ProfileRegistry) -> serde_json::Value {
     })
 }
 
-fn read_request(stream: &mut TcpStream) -> Result<HttpRequest> {
+fn read_request(stream: &mut impl Read) -> std::result::Result<HttpRequest, HttpReadError> {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 4096];
 
     loop {
-        let bytes_read = stream.read(&mut chunk)?;
+        let bytes_read = stream.read(&mut chunk).map_err(http_read_io_error)?;
         if bytes_read == 0 {
-            break;
+            return Err(HttpReadError::new(400, "incomplete HTTP headers"));
         }
         buffer.extend_from_slice(&chunk[..bytes_read]);
         if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
             break;
         }
+        if buffer.len() > MAX_HEADER_BYTES {
+            return Err(HttpReadError::new(431, "request headers are too large"));
+        }
     }
 
-    let header_end = find_header_end(&buffer).context("malformed HTTP request")?;
-    let headers = std::str::from_utf8(&buffer[..header_end]).context("request was not UTF-8")?;
-    let mut lines = headers.lines();
-    let request_line = lines.next().context("missing request line")?;
+    let header_end = find_header_end(&buffer)
+        .ok_or_else(|| HttpReadError::new(400, "malformed HTTP request"))?;
+    if header_end > MAX_HEADER_BYTES {
+        return Err(HttpReadError::new(431, "request headers are too large"));
+    }
+    let header_text = std::str::from_utf8(&buffer[..header_end])
+        .map_err(|_| HttpReadError::new(400, "request headers are not UTF-8"))?;
+    let mut lines = header_text.lines();
+    let request_line = lines
+        .next()
+        .ok_or_else(|| HttpReadError::new(400, "missing request line"))?;
     let mut request_parts = request_line.split_whitespace();
-    let method = request_parts.next().context("missing method")?.to_string();
-    let raw_path = request_parts.next().context("missing path")?;
+    let method = request_parts
+        .next()
+        .ok_or_else(|| HttpReadError::new(400, "missing method"))?
+        .to_string();
+    let raw_path = request_parts
+        .next()
+        .ok_or_else(|| HttpReadError::new(400, "missing path"))?;
+    let version = request_parts
+        .next()
+        .ok_or_else(|| HttpReadError::new(400, "missing HTTP version"))?;
+    if request_parts.next().is_some() || version != "HTTP/1.1" {
+        return Err(HttpReadError::new(400, "unsupported request line"));
+    }
+    if !method
+        .chars()
+        .all(|character| character.is_ascii_uppercase())
+        || !raw_path.starts_with('/')
+        || raw_path.len() > MAX_REQUEST_PATH_BYTES
+    {
+        return Err(HttpReadError::new(400, "invalid request target"));
+    }
     let path = raw_path.split('?').next().unwrap_or(raw_path).to_string();
-    let content_length = parse_content_length(headers);
+    let headers = parse_headers(lines)?;
+    if headers.contains_key("transfer-encoding") {
+        return Err(HttpReadError::new(
+            400,
+            "transfer encoding is not supported",
+        ));
+    }
+    let content_length = match headers.get("content-length") {
+        Some(value)
+            if !value.is_empty() && value.chars().all(|character| character.is_ascii_digit()) =>
+        {
+            value
+                .parse::<usize>()
+                .map_err(|_| HttpReadError::new(400, "invalid content length"))?
+        }
+        Some(_) => return Err(HttpReadError::new(400, "invalid content length")),
+        None if matches!(method.as_str(), "POST" | "PUT" | "PATCH") => {
+            return Err(HttpReadError::new(411, "content length is required"));
+        }
+        None => 0,
+    };
+    if content_length > request_body_limit(&path).min(MAX_REQUEST_BODY_BYTES) {
+        return Err(HttpReadError::new(413, "request body is too large"));
+    }
 
     let body_start = header_end + 4;
     let mut body = buffer[body_start..].to_vec();
+    if body.len() > content_length {
+        return Err(HttpReadError::new(
+            400,
+            "multiple HTTP requests are not supported",
+        ));
+    }
     while body.len() < content_length {
-        let bytes_read = stream.read(&mut chunk)?;
+        let bytes_read = stream.read(&mut chunk).map_err(http_read_io_error)?;
         if bytes_read == 0 {
-            break;
+            return Err(HttpReadError::new(400, "incomplete request body"));
+        }
+        if body.len() + bytes_read > content_length {
+            return Err(HttpReadError::new(
+                400,
+                "request body exceeds content length",
+            ));
         }
         body.extend_from_slice(&chunk[..bytes_read]);
     }
-    body.truncate(content_length);
 
-    Ok(HttpRequest { method, path, body })
+    Ok(HttpRequest {
+        method,
+        path,
+        headers,
+        body,
+    })
 }
 
 fn find_header_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-fn parse_content_length(headers: &str) -> usize {
-    headers
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())
-                .flatten()
-        })
-        .unwrap_or(0)
+fn parse_headers<'a>(
+    lines: impl Iterator<Item = &'a str>,
+) -> std::result::Result<BTreeMap<String, String>, HttpReadError> {
+    let mut headers = BTreeMap::new();
+    for line in lines {
+        if line.starts_with([' ', '\t']) {
+            return Err(HttpReadError::new(400, "folded headers are not supported"));
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| HttpReadError::new(400, "malformed request header"))?;
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        {
+            return Err(HttpReadError::new(400, "invalid request header name"));
+        }
+        let name = name.to_ascii_lowercase();
+        if headers.insert(name, value.trim().to_string()).is_some() {
+            return Err(HttpReadError::new(400, "duplicate request header"));
+        }
+    }
+    Ok(headers)
+}
+
+fn http_read_io_error(error: std::io::Error) -> HttpReadError {
+    if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) {
+        HttpReadError::new(408, "request timed out")
+    } else {
+        HttpReadError::new(400, "failed to read request")
+    }
+}
+
+fn validate_network_request(
+    request: &HttpRequest,
+    server_address: SocketAddr,
+) -> std::result::Result<(), HttpReadError> {
+    let host = request
+        .headers
+        .get("host")
+        .ok_or_else(|| HttpReadError::new(403, "local host header is required"))?;
+    if !authority_matches_local_server(host, server_address.port()) {
+        return Err(HttpReadError::new(403, "host is not allowed"));
+    }
+
+    if matches!(request.method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
+        let origin = request
+            .headers
+            .get("origin")
+            .ok_or_else(|| HttpReadError::new(403, "same-origin request is required"))?;
+        let authority = origin
+            .strip_prefix("http://")
+            .filter(|authority| !authority.contains('/'))
+            .ok_or_else(|| HttpReadError::new(403, "origin is not allowed"))?;
+        if !authority_matches_local_server(authority, server_address.port()) {
+            return Err(HttpReadError::new(403, "origin is not allowed"));
+        }
+    }
+    Ok(())
+}
+
+fn authority_matches_local_server(authority: &str, expected_port: u16) -> bool {
+    let Some((host, port)) = split_authority(authority) else {
+        return false;
+    };
+    port == expected_port && is_loopback_host(host)
+}
+
+fn split_authority(authority: &str) -> Option<(&str, u16)> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let closing = rest.find(']')?;
+        let host = &rest[..closing];
+        let port = rest[closing + 1..].strip_prefix(':')?.parse().ok()?;
+        return Some((host, port));
+    }
+    let (host, port) = authority.rsplit_once(':')?;
+    Some((host, port.parse().ok()?))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn json_response(status: u16, value: &serde_json::Value) -> LocalAppResponse {
@@ -884,180 +1569,8 @@ fn json_response(status: u16, value: &serde_json::Value) -> LocalAppResponse {
 }
 
 #[cfg(target_os = "windows")]
-fn show_windows_notification(title: &str, body: &str) -> Result<bool> {
-    unsafe {
-        let class_name = to_wide_null(&format!(
-            "PromptCompressorNotificationWindow{}",
-            std::process::id()
-        ));
-        let hinstance = GetModuleHandleW(null());
-        let window_class = WNDCLASSW {
-            lpfnWndProc: Some(notification_window_proc),
-            hInstance: hinstance,
-            lpszClassName: class_name.as_ptr(),
-            ..Default::default()
-        };
-
-        if RegisterClassW(&window_class) == 0 {
-            anyhow::bail!("RegisterClassW for notification failed: {}", GetLastError());
-        }
-
-        let hwnd = CreateWindowExW(
-            0,
-            class_name.as_ptr(),
-            class_name.as_ptr(),
-            WS_OVERLAPPED,
-            0,
-            0,
-            0,
-            0,
-            HWND_MESSAGE,
-            null_mut(),
-            hinstance,
-            null(),
-        );
-
-        let result = if hwnd.is_null() {
-            Err(anyhow::anyhow!(
-                "CreateWindowExW for notification failed: {}",
-                GetLastError()
-            ))
-        } else {
-            show_shell_notification(hwnd, title, body)
-        };
-
-        if !hwnd.is_null() {
-            DestroyWindow(hwnd);
-        }
-        UnregisterClassW(class_name.as_ptr(), hinstance);
-        result
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn show_windows_notification(_title: &str, _body: &str) -> Result<bool> {
-    Ok(false)
-}
-
-fn limit_notification_text(value: &str, max_chars: usize) -> String {
-    let value = value.replace(['\r', '\n', '\t'], " ");
-    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if value.chars().count() <= max_chars {
-        return value;
-    }
-
-    value
-        .chars()
-        .take(max_chars.saturating_sub(3))
-        .collect::<String>()
-        + "..."
-}
-
-#[cfg(target_os = "windows")]
-unsafe extern "system" fn notification_window_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-}
-
-#[cfg(target_os = "windows")]
-fn show_shell_notification(hwnd: HWND, title: &str, body: &str) -> Result<bool> {
-    unsafe {
-        let hinstance = GetModuleHandleW(null());
-        let (notification_icon, owns_icon) = load_notification_icon(hinstance);
-        if notification_icon.is_null() {
-            anyhow::bail!("notification icon could not be loaded: {}", GetLastError());
-        }
-
-        let mut data = NOTIFYICONDATAW {
-            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-            hWnd: hwnd,
-            uID: 1,
-            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
-            uCallbackMessage: WM_USER + 1,
-            hIcon: notification_icon,
-            hBalloonIcon: notification_icon,
-            ..Default::default()
-        };
-
-        copy_wide(&mut data.szTip, "Prompt Compressor");
-        if Shell_NotifyIconW(NIM_ADD, &data) == 0 {
-            if owns_icon {
-                let _ = DestroyIcon(notification_icon);
-            }
-            anyhow::bail!("Shell_NotifyIconW NIM_ADD failed: {}", GetLastError());
-        }
-
-        data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-        let _ = Shell_NotifyIconW(NIM_SETVERSION, &data);
-
-        data.uFlags = NIF_INFO;
-        data.dwInfoFlags = if owns_icon {
-            NIIF_USER | NIIF_LARGE_ICON
-        } else {
-            NIIF_INFO
-        };
-        let title_text = limit_notification_text(title, data.szInfoTitle.len().saturating_sub(1));
-        let body_text = limit_notification_text(body, data.szInfo.len().saturating_sub(1));
-        copy_wide(&mut data.szInfoTitle, &title_text);
-        copy_wide(&mut data.szInfo, &body_text);
-
-        let modify_result = Shell_NotifyIconW(NIM_MODIFY, &data);
-        thread::sleep(Duration::from_secs(6));
-        let _ = Shell_NotifyIconW(NIM_DELETE, &data);
-        if owns_icon {
-            let _ = DestroyIcon(notification_icon);
-        }
-
-        if modify_result == 0 {
-            anyhow::bail!("Shell_NotifyIconW NIM_MODIFY failed: {}", GetLastError());
-        }
-
-        Ok(true)
-    }
-}
-
-#[cfg(target_os = "windows")]
-unsafe fn load_notification_icon(
-    hinstance: windows_sys::Win32::Foundation::HMODULE,
-) -> (HICON, bool) {
-    let app_icon = unsafe {
-        LoadImageW(
-            hinstance,
-            resource_id(APP_ICON_RESOURCE_ID),
-            IMAGE_ICON,
-            32,
-            32,
-            LR_DEFAULTSIZE,
-        ) as HICON
-    };
-
-    if !app_icon.is_null() {
-        return (app_icon, true);
-    }
-
-    (unsafe { LoadIconW(null_mut(), IDI_INFORMATION) }, false)
-}
-
-#[cfg(target_os = "windows")]
-fn resource_id(id: u16) -> windows_sys::core::PCWSTR {
-    id as usize as windows_sys::core::PCWSTR
-}
-
-#[cfg(target_os = "windows")]
 fn to_wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-#[cfg(target_os = "windows")]
-fn copy_wide<const N: usize>(target: &mut [u16; N], value: &str) {
-    target.fill(0);
-    for (index, code_unit) in value.encode_utf16().take(N.saturating_sub(1)).enumerate() {
-        target[index] = code_unit;
-    }
 }
 
 fn http_response(status: u16, content_type: &str, body: &[u8]) -> LocalAppResponse {
@@ -1075,8 +1588,15 @@ fn http_transport_response(response: LocalAppResponse) -> Vec<u8> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
+        408 => "Request Timeout",
+        411 => "Length Required",
+        413 => "Payload Too Large",
+        429 => "Too Many Requests",
+        431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "OK",
     };
     let mut response = format!(
@@ -1084,6 +1604,10 @@ fn http_transport_response(response: LocalAppResponse) -> Vec<u8> {
          Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
          Cache-Control: no-store\r\n\
+         Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'\r\n\
+         Referrer-Policy: no-referrer\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         X-Frame-Options: DENY\r\n\
          Connection: close\r\n\r\n",
         body.len(),
         status = status,
@@ -1131,4 +1655,413 @@ fn find_upward_settings_dir(start: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Barrier;
+
+    use super::*;
+
+    struct TestDirectory {
+        path: PathBuf,
+    }
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let counter = SETTINGS_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "prompt-compressor-{label}-{}-{counter}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create test directory");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn settings_temp_files(directory: &Path) -> Vec<PathBuf> {
+        fs::read_dir(directory)
+            .expect("read settings directory")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".tmp"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn accepts_only_loopback_bind_hosts() {
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.42.0.1"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("192.168.1.10"));
+        assert!(!is_loopback_host("example.com"));
+    }
+
+    #[test]
+    fn parses_bounded_http_request_with_unambiguous_length() {
+        let body = br#"{"input_text":"hello"}"#;
+        let raw = format!(
+            "POST /api/compress HTTP/1.1\r\nHost: 127.0.0.1:8787\r\nOrigin: http://127.0.0.1:8787\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+
+        let request = read_request(&mut Cursor::new(raw.into_bytes())).expect("valid request");
+
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/api/compress");
+        assert_eq!(request.body, body);
+        assert_eq!(request.headers["host"], "127.0.0.1:8787");
+    }
+
+    #[test]
+    fn rejects_oversized_and_ambiguous_http_requests_before_parsing_json() {
+        let oversized = format!(
+            "POST /api/compress HTTP/1.1\r\nHost: 127.0.0.1:8787\r\nContent-Length: {}\r\n\r\n",
+            MAX_REQUEST_BODY_BYTES + 1
+        );
+        let duplicate = "POST /api/compress HTTP/1.1\r\nHost: 127.0.0.1:8787\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\n";
+        let chunked = "POST /api/compress HTTP/1.1\r\nHost: 127.0.0.1:8787\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n";
+
+        let oversized_error =
+            read_request(&mut Cursor::new(oversized.into_bytes())).expect_err("oversized request");
+        let duplicate_error =
+            read_request(&mut Cursor::new(duplicate.as_bytes())).expect_err("duplicate length");
+        let chunked_error =
+            read_request(&mut Cursor::new(chunked.as_bytes())).expect_err("chunked request");
+
+        assert_eq!(oversized_error.status, 413);
+        assert_eq!(duplicate_error.status, 400);
+        assert_eq!(chunked_error.status, 400);
+    }
+
+    #[test]
+    fn enforces_local_host_and_same_origin_for_mutating_requests() {
+        let server = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8787);
+        let mut request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/compress".to_string(),
+            headers: BTreeMap::from([
+                ("host".to_string(), "localhost:8787".to_string()),
+                ("origin".to_string(), "http://127.0.0.1:8787".to_string()),
+            ]),
+            body: Vec::new(),
+        };
+
+        assert!(validate_network_request(&request, server).is_ok());
+
+        request
+            .headers
+            .insert("origin".to_string(), "https://attacker.example".to_string());
+        assert_eq!(
+            validate_network_request(&request, server)
+                .expect_err("foreign origin")
+                .status,
+            403
+        );
+
+        request
+            .headers
+            .insert("origin".to_string(), "http://localhost:8787".to_string());
+        request
+            .headers
+            .insert("host".to_string(), "attacker.example:8787".to_string());
+        assert_eq!(
+            validate_network_request(&request, server)
+                .expect_err("foreign host")
+                .status,
+            403
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_fields_and_null_characters() {
+        assert!(validate_text_field("profile", "internal_llm", MAX_PROFILE_CHARS, false).is_ok());
+        assert!(validate_text_field("profile", "", MAX_PROFILE_CHARS, false).is_err());
+        assert!(validate_text_field("profile", "bad\0value", MAX_PROFILE_CHARS, false).is_err());
+        assert!(validate_text_field(
+            "profile",
+            &"x".repeat(MAX_PROFILE_CHARS + 1),
+            MAX_PROFILE_CHARS,
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn inference_gate_is_shared_and_non_blocking() {
+        let gate = InferenceGate::default();
+        let cloned = gate.clone();
+        let permit = gate.try_enter().expect("first permit");
+
+        assert_eq!(
+            cloned.try_enter().expect_err("busy gate"),
+            InferenceGateError::Busy
+        );
+
+        drop(permit);
+        assert!(cloned.try_enter().is_ok());
+    }
+
+    #[test]
+    fn model_download_control_cancels_only_the_active_profile() {
+        let control = ModelDownloadControl::default();
+        let permit = control
+            .start("internal_llm".to_string())
+            .expect("start model download");
+
+        assert!(control.cancel("other_profile").is_err());
+        assert!(control
+            .cancel("internal_llm")
+            .expect("cancel active download"));
+        assert!(permit.cancellation().is_cancelled());
+
+        drop(permit);
+        assert!(!control
+            .cancel("internal_llm")
+            .expect("no active download after permit drop"));
+    }
+
+    #[test]
+    fn install_capacity_counts_only_bytes_missing_from_a_partial_download() {
+        let status = prompt_compressor_core::ProfileModelStatus {
+            profile: "internal_llm".into(),
+            model_id: "model".into(),
+            label: "Model".into(),
+            requires_install: true,
+            installed: false,
+            repository: Some("owner/model".into()),
+            revision: Some("a".repeat(40)),
+            filename: Some("model.gguf".into()),
+            size_bytes: Some(2 * 1024 * 1024 * 1024),
+            partial_downloaded_bytes: Some(768 * 1024 * 1024),
+            destination: Some(PathBuf::from("model.gguf")),
+        };
+
+        assert_eq!(
+            required_model_install_bytes(&status),
+            Some(1792 * 1024 * 1024)
+        );
+
+        let installed_status = prompt_compressor_core::ProfileModelStatus {
+            installed: true,
+            ..status
+        };
+        assert_eq!(required_model_install_bytes(&installed_status), None);
+    }
+
+    #[test]
+    fn transport_response_sets_browser_security_headers() {
+        let response = String::from_utf8(http_transport_response(http_response(
+            200,
+            "text/html; charset=utf-8",
+            b"ok",
+        )))
+        .expect("HTTP response");
+
+        assert!(response.contains("Content-Security-Policy:"));
+        assert!(response.contains("X-Content-Type-Options: nosniff"));
+        assert!(response.contains("X-Frame-Options: DENY"));
+        assert!(response.contains("Referrer-Policy: no-referrer"));
+    }
+
+    #[test]
+    fn embedded_ui_requires_explicit_model_install_and_preserves_fallback_copy_choice() {
+        assert!(INDEX_HTML.contains("id=\"modelInstallButton\""));
+        assert!(APP_JS.contains("fetch(\"/api/model-install\""));
+        assert!(INDEX_HTML.contains("id=\"modelCancelButton\""));
+        assert!(APP_JS.contains("fetch(\"/api/model-cancel\""));
+        assert!(APP_JS.contains("if (payload.should_send_original)"));
+        assert!(APP_JS.contains("自動コピーは行っていません"));
+        assert!(!APP_JS.contains("navigator.clipboard.writeText(promptOutput.value)"));
+        let native_copy = APP_JS
+            .find("if (await copyTextWithNativeApi(text))")
+            .expect("native clipboard fallback");
+        let browser_copy = APP_JS
+            .find("await navigator.clipboard.writeText(text)")
+            .expect("browser clipboard fallback");
+        assert!(native_copy < browser_copy);
+        assert!(APP_JS.contains("let modelRuntimeReady = false"));
+        assert!(APP_JS.contains(
+            "compressButton.disabled = isCompressing || !modelInstalled || !modelRuntimeReady"
+        ));
+        assert!(!APP_JS.contains("/api/windows-notification"));
+        assert!(APP_JS.contains("settingsSaveDelayMs = 250"));
+        assert!(APP_JS.contains("scheduleSettingsSave(settings)"));
+    }
+
+    #[test]
+    fn resolves_available_disk_space_for_existing_directory() {
+        #[cfg(target_os = "windows")]
+        assert!(available_disk_space_bytes(std::env::temp_dir().as_path()).is_some());
+    }
+
+    #[test]
+    fn resolves_available_disk_space_for_existing_file() {
+        #[cfg(target_os = "windows")]
+        assert!(available_disk_space_bytes(
+            std::env::current_exe().expect("test executable").as_path()
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn normalizes_known_settings_without_dropping_unknown_fields() {
+        let settings: UiSettings = serde_json::from_value(serde_json::json!({
+            "schema_version": 99,
+            "profile": " internal_llm ",
+            "level": 9,
+            "theme": "future-theme",
+            "future_panel": { "density": "compact" }
+        }))
+        .expect("deserialize settings");
+
+        let value = serde_json::to_value(settings.normalized()).expect("serialize settings");
+
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["profile"], "internal_llm");
+        assert_eq!(value["level"], 3);
+        assert!(value["theme"].is_null());
+        assert_eq!(value["future_panel"]["density"], "compact");
+    }
+
+    #[test]
+    fn settings_save_preserves_existing_unknown_fields_and_cleans_temp_file() {
+        let directory = TestDirectory::new("settings-preserve");
+        let path = directory.path().join("ui-settings.json");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "profile": "old",
+                "future_panel": { "density": "compact" }
+            }))
+            .expect("serialize initial settings"),
+        )
+        .expect("write initial settings");
+        let persisted = PersistedUiSettings::load(path.clone());
+        let incoming = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "profile": "new",
+            "level": 2,
+            "future_request": true
+        }))
+        .expect("deserialize incoming settings");
+
+        persisted.save(incoming).expect("save settings");
+
+        let disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read persisted settings"))
+                .expect("parse persisted settings");
+        assert_eq!(disk, persisted.json());
+        assert_eq!(disk["profile"], "new");
+        assert_eq!(disk["future_panel"]["density"], "compact");
+        assert_eq!(disk["future_request"], true);
+        assert!(settings_temp_files(directory.path()).is_empty());
+    }
+
+    #[test]
+    fn unchanged_settings_skip_filesystem_writes() {
+        let directory = TestDirectory::new("settings-unchanged");
+        let invalid_parent = directory.path().join("not-a-directory");
+        fs::write(&invalid_parent, b"sentinel").expect("write conflicting parent file");
+        let current = UiSettings {
+            profile: Some("internal_llm".to_string()),
+            level: Some(2),
+            theme: Some("dark".to_string()),
+            ..UiSettings::default()
+        };
+        let persisted = PersistedUiSettings {
+            path: invalid_parent.join("ui-settings.json"),
+            settings: Arc::new(Mutex::new(current.clone())),
+        };
+
+        persisted
+            .save(current)
+            .expect("unchanged settings should not touch the invalid path");
+        let changed = UiSettings {
+            profile: Some("internal_llm".to_string()),
+            level: Some(3),
+            theme: Some("dark".to_string()),
+            ..UiSettings::default()
+        };
+        persisted
+            .save(changed)
+            .expect_err("changed settings must attempt a filesystem write");
+    }
+
+    #[test]
+    fn failed_settings_save_keeps_memory_and_removes_temp_file() {
+        let directory = TestDirectory::new("settings-failure");
+        let path = directory.path().join("ui-settings.json");
+        fs::create_dir(&path).expect("create conflicting destination directory");
+        fs::write(path.join("sentinel"), b"keep").expect("write sentinel");
+        let previous = UiSettings {
+            profile: Some("previous".to_string()),
+            ..UiSettings::default()
+        };
+        let persisted = PersistedUiSettings {
+            path,
+            settings: Arc::new(Mutex::new(previous)),
+        };
+        let incoming = UiSettings {
+            profile: Some("replacement".to_string()),
+            ..UiSettings::default()
+        };
+
+        persisted.save(incoming).expect_err("save must fail");
+
+        assert_eq!(persisted.json()["profile"], "previous");
+        assert!(settings_temp_files(directory.path()).is_empty());
+    }
+
+    #[test]
+    fn concurrent_settings_saves_keep_disk_and_memory_consistent() {
+        let directory = TestDirectory::new("settings-concurrent");
+        let path = directory.path().join("ui-settings.json");
+        let persisted = PersistedUiSettings::load(path.clone());
+        let barrier = Arc::new(Barrier::new(5));
+        let mut handles = Vec::new();
+
+        for index in 0..4 {
+            let persisted = persisted.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                let settings = UiSettings {
+                    profile: Some(format!("profile-{index}")),
+                    ..UiSettings::default()
+                };
+                barrier.wait();
+                persisted.save(settings).expect("concurrent save");
+            }));
+        }
+
+        barrier.wait();
+        for handle in handles {
+            handle.join().expect("save thread");
+        }
+
+        let disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).expect("read persisted settings"))
+                .expect("parse persisted settings");
+        assert_eq!(disk, persisted.json());
+        assert!(settings_temp_files(directory.path()).is_empty());
+    }
 }

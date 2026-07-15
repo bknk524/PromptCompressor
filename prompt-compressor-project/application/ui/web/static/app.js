@@ -22,19 +22,37 @@ const characterComparison = document.querySelector("#characterComparison");
 const tokenRatioValue = document.querySelector("#tokenRatioValue");
 const characterRatioValue = document.querySelector("#characterRatioValue");
 const fallbackValue = document.querySelector("#fallbackValue");
+const resultNotice = document.querySelector("#resultNotice");
+const resultNoticeDetail = document.querySelector("#resultNoticeDetail");
+const modelSetup = document.querySelector("#modelSetup");
+const modelSetupTitle = document.querySelector("#modelSetupTitle");
+const modelSetupDetail = document.querySelector("#modelSetupDetail");
+const modelDownloadProgress = document.querySelector("#modelDownloadProgress");
+const modelInstallButton = document.querySelector("#modelInstallButton");
+const modelCancelButton = document.querySelector("#modelCancelButton");
 const settingsSummary = document.querySelector("#settingsSummary");
 const compressionLatency = document.querySelector("#compressionLatency");
 const settingsStorageKey = "promptCompressorSettingsV3";
 const legacySettingsStorageKey = "promptCompressorSettingsV2";
 const themeStorageKey = "promptCompressorThemeV1";
-const fixedCompressionMode = "codex_optimized";
-const fixedTaskType = "coding";
 const compressionLevelMin = 1;
 const compressionLevelMax = 3;
+const settingsSaveDelayMs = 250;
 let isCompressing = false;
 let prepareTimerId = 0;
+let settingsSaveTimerId = 0;
+let settingsSaveInFlight = false;
+let pendingServerSettings = null;
+let lastLocalSettingsJson = "";
+let lastServerSettingsFingerprint = "";
 let inFlightPrepareKey = "";
 let readyPrepareKey = "";
+let modelInstalled = false;
+let modelRuntimeReady = false;
+let modelInstallInFlight = false;
+let modelCancelRequested = false;
+let activeModelDownloadProfile = "";
+let selectedModelStatus = null;
 
 const compressionLevelDetails = {
   1: {
@@ -161,9 +179,12 @@ windowCloseButton.addEventListener("click", () => {
 });
 
 profileSelect.addEventListener("change", () => {
+  modelRuntimeReady = false;
+  updateCompressButtonState();
   saveSettings();
   updateSettingsSummary();
-  scheduleCompressionPrepare();
+  readyPrepareKey = "";
+  refreshModelAvailability();
 });
 
 sampleSelect.addEventListener("change", () => {
@@ -190,8 +211,8 @@ copyButton.addEventListener("click", async () => {
   if (!promptOutput.value.trim()) {
     return;
   }
-  await navigator.clipboard.writeText(promptOutput.value);
-  setWorkStatus("コピー済み", "");
+  const copied = await copyTextToClipboard(promptOutput.value);
+  setWorkStatus(copied ? "コピー済み" : "コピー失敗", copied ? "" : "error");
 });
 
 clearInputButton.addEventListener("click", () => {
@@ -203,6 +224,15 @@ clearInputButton.addEventListener("click", () => {
 });
 
 compressButton.addEventListener("click", async () => {
+  if (!modelInstalled) {
+    setWorkStatus("モデル取得待ち", "error");
+    modelInstallButton.focus();
+    return;
+  }
+  if (!modelRuntimeReady) {
+    setWorkStatus("モデル準備待ち", "busy");
+    return;
+  }
   const inputText = promptInput.value.trim();
   if (!inputText) {
     setWorkStatus("入力待ち", "error");
@@ -223,8 +253,6 @@ compressButton.addEventListener("click", async () => {
       body: JSON.stringify({
         input_text: inputText,
         profile: profileSelect.value,
-        task_type: fixedTaskType,
-        compression_mode: fixedCompressionMode,
         compression_level: Number(levelInput.value),
         constraints: defaultCompressionConstraints()
       })
@@ -236,11 +264,16 @@ compressButton.addEventListener("click", async () => {
     }
 
     renderResult(payload);
-    const copied = await copyTextToClipboard(payload.distilled_prompt || "");
-    const completionMessage = buildCompletionMessage(payload, copied);
-    const statusText = copied ? "圧縮完了・コピー済み" : "圧縮完了・コピー失敗";
-    setWorkStatus(statusText, copied && !payload.should_send_original ? "" : "error");
-    showCompletionNotice(completionMessage);
+    if (payload.should_send_original) {
+      setWorkStatus("圧縮せず原文を保持", "error");
+      showCompletionNotice(buildFallbackMessage(payload), "原文を保持");
+    } else {
+      const copied = await copyTextToClipboard(payload.distilled_prompt || "");
+      const completionMessage = buildCompletionMessage(payload, copied);
+      const statusText = copied ? "圧縮完了・コピー済み" : "圧縮完了・コピー失敗";
+      setWorkStatus(statusText, copied ? "" : "error");
+      showCompletionNotice(completionMessage, "圧縮完了");
+    }
   } catch (error) {
     setWorkStatus("エラー", "error");
     promptOutput.value = String(error.message || error);
@@ -280,10 +313,171 @@ async function loadProfiles() {
   }
   updateSettingsSummary();
   saveSettings();
-  scheduleCompressionPrepare(50);
+  await refreshModelAvailability();
 }
 
+async function refreshModelAvailability() {
+  if (!profileSelect.value || modelInstallInFlight) {
+    return;
+  }
+  modelInstalled = false;
+  modelRuntimeReady = false;
+  updateCompressButtonState();
+  try {
+    const response = await fetch("/api/model-status", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ profile: profileSelect.value })
+    });
+    const status = await response.json();
+    if (!response.ok) {
+      throw new Error(status.error || "model status failed");
+    }
+    selectedModelStatus = status;
+    modelInstalled = !status.requires_install || Boolean(status.installed);
+    renderModelSetup(status);
+    updateCompressButtonState();
+    if (modelInstalled) {
+      scheduleCompressionPrepare(50);
+    }
+  } catch (_error) {
+    selectedModelStatus = null;
+    modelSetup.hidden = false;
+    modelSetupTitle.textContent = "モデル状態を確認できませんでした";
+    modelSetupDetail.textContent = "設定を確認して再試行してください。";
+    modelInstallButton.disabled = true;
+    setModelStatus("状態確認エラー", "error");
+  }
+}
+
+function renderModelSetup(status) {
+  if (!status.requires_install || status.installed) {
+    modelSetup.hidden = true;
+    modelDownloadProgress.hidden = true;
+    modelInstallButton.disabled = false;
+    modelCancelButton.hidden = true;
+    return;
+  }
+
+  modelSetup.hidden = false;
+  modelSetupTitle.textContent = `${status.label || "ローカルモデル"} の取得が必要です`;
+  const source = status.repository ? `Hugging Face: ${status.repository}` : "Hugging Face";
+  const size = formatBytes(status.size_bytes);
+  const available = Number.isFinite(status.available_bytes)
+    ? ` / 空き ${formatBytes(status.available_bytes)}`
+    : "";
+  const partial = Number(status.partial_downloaded_bytes || 0);
+  const resume = partial > 0 ? ` / ${formatBytes(partial)}から再開` : "";
+  modelSetupDetail.textContent = `${source} / ${size}${available}${resume}`;
+  modelDownloadProgress.hidden = true;
+  modelInstallButton.disabled = false;
+  modelInstallButton.textContent = "モデルを取得";
+  modelCancelButton.hidden = true;
+  setModelStatus("モデル未取得", "error");
+}
+
+async function installSelectedModel() {
+  if (!profileSelect.value || modelInstallInFlight) {
+    return;
+  }
+  const profile = profileSelect.value;
+  modelInstallInFlight = true;
+  modelCancelRequested = false;
+  activeModelDownloadProfile = profile;
+  modelInstalled = false;
+  modelInstallButton.disabled = true;
+  modelInstallButton.textContent = "取得中";
+  modelCancelButton.hidden = false;
+  modelCancelButton.disabled = false;
+  modelDownloadProgress.hidden = false;
+  modelDownloadProgress.value = 0;
+  setModelStatus("モデル取得中", "busy");
+  updateCompressButtonState();
+
+  try {
+    const response = await fetch("/api/model-install", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ profile })
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.error || "model install failed");
+    }
+    setModelStatus(result.message || "モデル準備完了", "");
+    if (result.cancelled) {
+      modelSetupTitle.textContent = "モデル取得を中止しました";
+      setModelStatus("モデル取得中止", "");
+    }
+  } catch (error) {
+    modelSetup.hidden = false;
+    modelSetupTitle.textContent = modelCancelRequested
+      ? "モデル取得を中止しました"
+      : "モデル取得に失敗しました";
+    modelSetupDetail.textContent = String(error.message || error);
+    setModelStatus("モデル取得失敗", "error");
+  } finally {
+    modelInstallInFlight = false;
+    modelCancelRequested = false;
+    activeModelDownloadProfile = "";
+    modelInstallButton.disabled = false;
+    modelInstallButton.textContent = "再試行";
+    modelCancelButton.hidden = true;
+    modelCancelButton.disabled = false;
+    await refreshModelAvailability();
+  }
+}
+
+async function cancelSelectedModelDownload() {
+  if (!activeModelDownloadProfile || !modelInstallInFlight || modelCancelRequested) {
+    return;
+  }
+  modelCancelRequested = true;
+  modelCancelButton.disabled = true;
+  setModelStatus("モデル取得を中止中", "busy");
+  try {
+    const response = await fetch("/api/model-cancel", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ profile: activeModelDownloadProfile })
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.error || "model cancel failed");
+    }
+    modelSetupDetail.textContent = result.message || "モデル取得を中止しています。";
+  } catch (error) {
+    modelCancelRequested = false;
+    modelCancelButton.disabled = false;
+    modelSetupDetail.textContent = String(error.message || error);
+    setModelStatus("中止要求エラー", "error");
+  }
+}
+
+function formatBytes(value) {
+  if (!Number.isFinite(value) || value < 0) {
+    return "容量不明";
+  }
+  const gibibytes = value / (1024 ** 3);
+  if (gibibytes >= 1) {
+    return `${gibibytes.toFixed(2)} GiB`;
+  }
+  return `${Math.max(1, Math.round(value / (1024 ** 2)))} MiB`;
+}
+
+modelInstallButton.addEventListener("click", installSelectedModel);
+modelCancelButton.addEventListener("click", cancelSelectedModelDownload);
+
 function scheduleCompressionPrepare(delayMs = 350) {
+  if (!modelInstalled || modelInstallInFlight) {
+    return;
+  }
   window.clearTimeout(prepareTimerId);
   prepareTimerId = window.setTimeout(() => {
     prepareCompressionSelection();
@@ -302,6 +496,8 @@ async function prepareCompressionSelection() {
   }
 
   inFlightPrepareKey = prepareKey;
+  modelRuntimeReady = false;
+  updateCompressButtonState();
   setModelStatus("モデル準備中", "busy");
 
   try {
@@ -327,12 +523,15 @@ async function prepareCompressionSelection() {
     } else {
       setModelStatus(result.message || "待機中", "");
     }
+    modelRuntimeReady = true;
   } catch (_error) {
+    modelRuntimeReady = false;
     setModelStatus("準備エラー", "error");
   } finally {
     if (inFlightPrepareKey === prepareKey) {
       inFlightPrepareKey = "";
     }
+    updateCompressButtonState();
   }
 }
 
@@ -343,8 +542,6 @@ function currentPreparePayload() {
 
   return {
     profile: profileSelect.value,
-    task_type: fixedTaskType,
-    compression_mode: fixedCompressionMode,
     compression_level: Number(clampCompressionLevel(levelInput.value)),
     constraints: defaultCompressionConstraints()
   };
@@ -379,6 +576,11 @@ function renderResult(result) {
     : "-";
   fallbackValue.textContent = result.should_send_original ? "はい" : "いいえ";
   compressionLatency.textContent = formatLatencySeconds(metrics.latency_ms);
+  resultNotice.hidden = !result.should_send_original;
+  resultNoticeDetail.textContent = result.should_send_original
+    ? fallbackNoticeDetail(result.fallback_reason)
+    : "";
+  copyButton.textContent = result.should_send_original ? "原文をコピー" : "コピー";
 }
 
 function clearResultLists() {
@@ -389,6 +591,9 @@ function clearResultLists() {
   characterRatioValue.textContent = "-";
   fallbackValue.textContent = "-";
   compressionLatency.textContent = "";
+  resultNotice.hidden = true;
+  resultNoticeDetail.textContent = "";
+  copyButton.textContent = "コピー";
 }
 
 function formatComparison(input, output) {
@@ -408,9 +613,13 @@ function formatLatencySeconds(latencyMs) {
 }
 
 function setLoading(isLoading) {
-  compressButton.disabled = isLoading;
+  compressButton.disabled = isLoading || !modelInstalled || !modelRuntimeReady;
   clearInputButton.disabled = isLoading;
   compressButton.textContent = isLoading ? "圧縮中" : "圧縮する";
+}
+
+function updateCompressButtonState() {
+  compressButton.disabled = isCompressing || !modelInstalled || !modelRuntimeReady;
 }
 
 function setModelStatus(text, state) {
@@ -431,14 +640,14 @@ async function copyTextToClipboard(text) {
     return false;
   }
 
+  if (await copyTextWithNativeApi(text)) {
+    return true;
+  }
+
   try {
     await navigator.clipboard.writeText(text);
     return true;
   } catch (_error) {
-    if (await copyTextWithNativeApi(text)) {
-      return true;
-    }
-
     promptOutput.focus();
     promptOutput.select();
     try {
@@ -480,6 +689,18 @@ function buildCompletionMessage(result, copied) {
   return `圧縮完了。${copyText}。圧縮後: ${output}（トークン ${tokenText} / 文字数 ${characterText}）`;
 }
 
+function buildFallbackMessage(result) {
+  const metrics = result.metrics || {};
+  return `圧縮結果を安全に採用できなかったため原文を保持しました。自動コピーは行っていません。（文字数 ${formatComparison(metrics.input_characters, metrics.output_characters)}）`;
+}
+
+function fallbackNoticeDetail(reason) {
+  if (typeof reason === "string" && reason.includes("model context")) {
+    return "入力がモデルの文脈長を超えています。内容を分割して再実行してください。自動コピーは行っていません。";
+  }
+  return "要件保持を安全に確認できませんでした。内容を見直して再実行してください。自動コピーは行っていません。";
+}
+
 function summarizeText(text) {
   const compact = text.replace(/\s+/g, " ").trim();
   if (compact.length <= 120) {
@@ -488,39 +709,12 @@ function summarizeText(text) {
   return `${compact.slice(0, 117)}...`;
 }
 
-async function notifyCompressionComplete(message) {
-  await notifyWindowsCompletion(message);
+function notifyCompressionComplete(message, title = "圧縮完了") {
+  return postDesktopNotification(title, message);
 }
 
-async function notifyWindowsCompletion(message) {
-  if (postDesktopNotification("圧縮完了", message)) {
-    return true;
-  }
-
-  try {
-    const response = await fetch("/api/windows-notification", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        title: "圧縮完了",
-        body: message
-      })
-    });
-    if (!response.ok) {
-      return false;
-    }
-
-    const payload = await response.json();
-    return Boolean(payload.notified);
-  } catch (_error) {
-    return false;
-  }
-}
-
-function showCompletionNotice(message) {
-  notifyCompressionComplete(message);
+function showCompletionNotice(message, title) {
+  notifyCompressionComplete(message, title);
 }
 
 async function refreshRuntimeStatus() {
@@ -530,23 +724,84 @@ async function refreshRuntimeStatus() {
       return;
     }
     const status = await response.json();
+    if (status.profile && status.profile !== profileSelect.value) {
+      return;
+    }
     switch (status.phase) {
+      case "checking":
+        modelRuntimeReady = false;
+        setModelStatus(status.message || "モデル確認中", "busy");
+        break;
+      case "downloading": {
+        modelRuntimeReady = false;
+        modelInstallInFlight = true;
+        activeModelDownloadProfile = String(status.profile || profileSelect.value || "");
+        setModelStatus(status.message || "モデル取得中", "busy");
+        modelSetup.hidden = false;
+        modelSetupTitle.textContent = "ローカルモデルを取得しています";
+        const downloaded = Number(status.downloaded_bytes || 0);
+        const total = Number(status.total_bytes || selectedModelStatus?.size_bytes || 0);
+        modelSetupDetail.textContent = total > 0
+          ? `${formatBytes(downloaded)} / ${formatBytes(total)}`
+          : "Hugging Faceから取得しています。";
+        modelDownloadProgress.hidden = false;
+        modelDownloadProgress.value = total > 0 ? Math.min(100, (downloaded * 100) / total) : 0;
+        modelCancelButton.hidden = false;
+        modelCancelButton.disabled = modelCancelRequested;
+        break;
+      }
+      case "cancelling":
+        modelRuntimeReady = false;
+        modelInstallInFlight = true;
+        modelCancelRequested = true;
+        activeModelDownloadProfile = String(status.profile || activeModelDownloadProfile);
+        setModelStatus(status.message || "モデル取得を中止中", "busy");
+        modelCancelButton.hidden = false;
+        modelCancelButton.disabled = true;
+        break;
+      case "cancelled":
+        modelRuntimeReady = false;
+        modelInstallInFlight = false;
+        modelCancelRequested = false;
+        activeModelDownloadProfile = "";
+        modelCancelButton.hidden = true;
+        setModelStatus(status.message || "モデル取得中止", "");
+        break;
       case "loading":
+        modelRuntimeReady = false;
+        modelCancelButton.hidden = true;
         setModelStatus(status.message || "モデル読み込み中", "busy");
         break;
       case "ready":
+        modelRuntimeReady = true;
+        modelInstallInFlight = false;
+        modelCancelRequested = false;
+        activeModelDownloadProfile = "";
+        modelCancelButton.hidden = true;
         setModelStatus(status.message || "モデル準備完了", "");
         break;
       case "error":
+        modelRuntimeReady = false;
+        modelInstallInFlight = false;
+        modelCancelRequested = false;
+        activeModelDownloadProfile = "";
+        modelCancelButton.hidden = true;
         setModelStatus(status.message || "モデル読み込み失敗", "error");
         break;
+      case "missing":
+        modelRuntimeReady = false;
+        setModelStatus(status.message || "モデル未取得", "error");
+        break;
       case "skipped":
+        modelRuntimeReady = true;
         setModelStatus(status.message || "待機中", "");
         break;
       default:
+        modelRuntimeReady = false;
         setModelStatus(status.message || "待機中", "");
         break;
     }
+    updateCompressButtonState();
   } catch (_error) {
     // The UI can keep working even if the status probe races server startup.
   }
@@ -666,7 +921,11 @@ async function loadServerSettings() {
     if (!response.ok) {
       return {};
     }
-    return normalizeLoadedSettings(await response.json());
+    const settings = normalizeLoadedSettings(await response.json());
+    if (Object.keys(settings).length > 0) {
+      lastServerSettingsFingerprint = settingsFingerprint(settings);
+    }
+    return settings;
   } catch (_error) {
     return {};
   }
@@ -685,12 +944,13 @@ function normalizeLoadedSettings(settings) {
 
 function saveSettings() {
   const settings = collectSettings();
-  localStorage.setItem(
-    settingsStorageKey,
-    JSON.stringify(settings)
-  );
-  localStorage.setItem(themeStorageKey, settings.theme);
-  saveSettingsToServer(settings);
+  const serialized = JSON.stringify(settings);
+  if (serialized !== lastLocalSettingsJson) {
+    localStorage.setItem(settingsStorageKey, serialized);
+    localStorage.setItem(themeStorageKey, settings.theme);
+    lastLocalSettingsJson = serialized;
+  }
+  scheduleSettingsSave(settings);
 }
 
 function collectSettings() {
@@ -702,22 +962,73 @@ function collectSettings() {
   };
 }
 
+function settingsFingerprint(settings) {
+  return JSON.stringify({
+    profile: typeof settings.profile === "string" ? settings.profile : "",
+    level: Number.isFinite(Number(settings.level)) ? Number(settings.level) : null,
+    theme: settings.theme === "dark" ? "dark" : "light"
+  });
+}
+
+function scheduleSettingsSave(settings) {
+  const fingerprint = settingsFingerprint(settings);
+  if (fingerprint === lastServerSettingsFingerprint) {
+    pendingServerSettings = null;
+    if (settingsSaveTimerId) {
+      clearTimeout(settingsSaveTimerId);
+      settingsSaveTimerId = 0;
+    }
+    return;
+  }
+
+  pendingServerSettings = { settings, fingerprint };
+  if (settingsSaveTimerId) {
+    clearTimeout(settingsSaveTimerId);
+  }
+  settingsSaveTimerId = setTimeout(flushSettingsSave, settingsSaveDelayMs);
+}
+
+async function flushSettingsSave() {
+  settingsSaveTimerId = 0;
+  if (settingsSaveInFlight || !pendingServerSettings) {
+    return;
+  }
+
+  const pending = pendingServerSettings;
+  pendingServerSettings = null;
+  settingsSaveInFlight = true;
+  const saved = await saveSettingsToServer(pending.settings);
+  settingsSaveInFlight = false;
+  if (saved) {
+    lastServerSettingsFingerprint = pending.fingerprint;
+  }
+
+  if (pendingServerSettings?.fingerprint === lastServerSettingsFingerprint) {
+    pendingServerSettings = null;
+  } else if (pendingServerSettings && !settingsSaveTimerId) {
+    settingsSaveTimerId = setTimeout(flushSettingsSave, settingsSaveDelayMs);
+  }
+}
+
 async function saveSettingsToServer(settings) {
   try {
-    await fetch("/api/settings", {
+    const response = await fetch("/api/settings", {
       method: "PUT",
       headers: {
         "Content-Type": "application/json"
       },
       body: JSON.stringify(settings)
     });
+    return response.ok;
   } catch (_error) {
     // localStorage remains as a fallback when the local API is unavailable.
+    return false;
   }
 }
 
 initializeTheme();
 renderCompressionLevel();
+updateCompressButtonState();
 
 loadProfiles()
   .then(() => {

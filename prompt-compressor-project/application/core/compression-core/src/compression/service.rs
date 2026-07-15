@@ -6,10 +6,9 @@ use crate::compression::token_estimator::SimpleTokenEstimator;
 use crate::compression::verifier::SimpleVerifier;
 use crate::config::profile::ProfileRegistry;
 use crate::error::{CompressionError, Result};
-use crate::runtime::backend::{CompressionDraft, RuntimeBackend};
+use crate::runtime::backend::{CompressionDraft, RuntimeBackend, RuntimeCompressionObservation};
 use crate::types::{
-    CompressionMetrics, CompressionRequest, CompressionResult, PreservedRequirement, RiskFlag,
-    RiskSeverity,
+    CompressionMetrics, CompressionRequest, CompressionResult, RiskFlag, RiskSeverity,
 };
 
 #[derive(Debug)]
@@ -18,6 +17,13 @@ pub struct CompressionService<B> {
     backend: B,
     token_estimator: SimpleTokenEstimator,
     verifier: SimpleVerifier,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObservedCompression {
+    pub result: CompressionResult,
+    pub runtime_observation: Option<RuntimeCompressionObservation>,
+    pub application_fallback_applied: bool,
 }
 
 impl<B> CompressionService<B>
@@ -34,6 +40,22 @@ where
     }
 
     pub fn compress(&self, request: CompressionRequest) -> Result<CompressionResult> {
+        self.compress_internal(request, false)
+            .map(|observed| observed.result)
+    }
+
+    pub fn compress_with_observation(
+        &self,
+        request: CompressionRequest,
+    ) -> Result<ObservedCompression> {
+        self.compress_internal(request, true)
+    }
+
+    fn compress_internal(
+        &self,
+        request: CompressionRequest,
+        observe_runtime: bool,
+    ) -> Result<ObservedCompression> {
         let started_at = Instant::now();
         if request.input_text.trim().is_empty() {
             return Err(CompressionError::EmptyInput);
@@ -47,8 +69,10 @@ where
 
         let backend_started_at = Instant::now();
         let mut runtime_fallback_reason = None;
+        let mut runtime_observation = None;
+        let mut application_fallback_applied = false;
         let active_profile = requested_profile;
-        let draft = if request.compression_level.is_original() {
+        let mut draft = if request.compression_level.is_original() {
             CompressionDraft {
                 distilled_prompt: request.input_text.trim().to_string(),
                 removed_content_summary: vec![
@@ -56,9 +80,22 @@ where
                 ],
             }
         } else {
-            match self.backend.compress(&request, requested_profile) {
-                Ok(draft) => draft,
+            let backend_result = if observe_runtime {
+                self.backend
+                    .compress_observed(&request, requested_profile)
+                    .map(|observation| (observation.final_draft.clone(), Some(observation)))
+            } else {
+                self.backend
+                    .compress(&request, requested_profile)
+                    .map(|draft| (draft, None))
+            };
+            match backend_result {
+                Ok((draft, observation)) => {
+                    runtime_observation = observation;
+                    draft
+                }
                 Err(error) => {
+                    application_fallback_applied = true;
                     runtime_fallback_reason = Some(format!(
                         "Profile '{}' failed: {error}; original prompt returned without retry.",
                         requested_profile.id
@@ -81,6 +118,12 @@ where
                 message: "Runtime backend failed; sending the original prompt is safer."
                     .to_string(),
             });
+        }
+        if verification.should_send_original
+            && draft.distilled_prompt.trim() != request.input_text.trim()
+        {
+            draft = verification_fallback_draft(&request);
+            application_fallback_applied = true;
         }
 
         let metrics_started_at = Instant::now();
@@ -114,7 +157,7 @@ where
         trace_service_timing("metrics", metrics_started_at.elapsed());
         trace_service_timing("total", started_at.elapsed());
 
-        Ok(CompressionResult {
+        let result = CompressionResult {
             request_id: request_id.to_string(),
             profile: active_profile.id.clone(),
             model_id: active_profile.model_ref.clone(),
@@ -126,6 +169,12 @@ where
             should_send_original: verification.should_send_original,
             fallback_reason: verification.fallback_reason,
             metrics,
+        };
+
+        Ok(ObservedCompression {
+            result,
+            runtime_observation,
+            application_fallback_applied,
         })
     }
 
@@ -186,6 +235,15 @@ fn original_prompt_draft(request: &CompressionRequest) -> CompressionDraft {
     }
 }
 
+fn verification_fallback_draft(request: &CompressionRequest) -> CompressionDraft {
+    CompressionDraft {
+        distilled_prompt: request.input_text.trim().to_string(),
+        removed_content_summary: vec![
+            "Output verification failed; returned the original prompt.".to_string()
+        ],
+    }
+}
+
 fn count_characters(text: &str) -> usize {
     text.chars().count()
 }
@@ -195,10 +253,11 @@ mod tests {
     use super::{count_characters, CompressionService};
     use crate::config::profile::{ProfileDefinition, ProfileRegistry};
     use crate::error::{CompressionError, Result};
-    use crate::runtime::backend::{CompressionDraft, RuntimeBackend};
+    use crate::runtime::backend::{
+        CompressionDraft, RuntimeBackend, RuntimeCompressionObservation, RuntimeTransformation,
+    };
     use crate::types::{
-        CompressionConstraints, CompressionLevel, CompressionMode, CompressionRequest,
-        RequestSource, RequestTarget, TaskType,
+        CompressionConstraints, CompressionLevel, CompressionRequest, RequestSource, RequestTarget,
     };
 
     #[test]
@@ -248,6 +307,71 @@ mod tests {
             .any(|risk| risk.code == "RUNTIME_FALLBACK"));
     }
 
+    #[test]
+    fn returns_original_when_output_verification_fails() {
+        let service =
+            CompressionService::new(ProfileRegistry::bootstrap(), MissingConstraintBackend);
+        let mut request = test_request("internal_llm");
+        request.input_text = "config.yamlのHTTP 400処理を変更しないでください。".to_string();
+
+        let result = service
+            .compress(request.clone())
+            .expect("verification failure should return the original prompt");
+
+        assert_eq!(result.distilled_prompt, request.input_text);
+        assert!(result.should_send_original);
+        assert!(result
+            .risk_flags
+            .iter()
+            .any(|risk| risk.code == "VERIFICATION_FAILED"));
+        assert!(!result
+            .preserved_requirements
+            .iter()
+            .any(|requirement| requirement.text == "preserve_file_names"));
+    }
+
+    #[test]
+    fn exposes_raw_and_runtime_outputs_for_evaluation() {
+        let service = CompressionService::new(ProfileRegistry::bootstrap(), ObservingBackend);
+        let mut request = test_request("internal_llm");
+        request.input_text = "README.mdの説明を短く整理してください。".to_string();
+
+        let observed = service
+            .compress_with_observation(request)
+            .expect("observed compression should succeed");
+        let runtime = observed
+            .runtime_observation
+            .expect("runtime observation should be retained");
+
+        assert_eq!(
+            runtime
+                .raw_model_draft
+                .expect("raw model draft should be available")
+                .distilled_prompt,
+            "出力: README.mdの説明を簡潔にする。"
+        );
+        assert_eq!(
+            runtime.final_draft.distilled_prompt,
+            "README.mdの説明を簡潔にする。"
+        );
+        assert_eq!(
+            runtime.transformations,
+            [RuntimeTransformation::PolishedModelOutput]
+        );
+        assert!(!observed.application_fallback_applied);
+    }
+
+    #[test]
+    fn regular_compression_uses_the_non_observed_backend_path() {
+        let service = CompressionService::new(ProfileRegistry::bootstrap(), ObservingBackend);
+        let mut request = test_request("internal_llm");
+        request.input_text = "README.mdの説明を短く整理してください。".to_string();
+
+        let result = service.compress(request).expect("regular compression");
+
+        assert_eq!(result.distilled_prompt, "README.mdを短くする。");
+    }
+
     #[derive(Debug, Clone)]
     struct FallbackBackend;
 
@@ -281,11 +405,59 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct MissingConstraintBackend;
+
+    impl RuntimeBackend for MissingConstraintBackend {
+        fn compress(
+            &self,
+            _request: &CompressionRequest,
+            _profile: &ProfileDefinition,
+        ) -> Result<CompressionDraft> {
+            Ok(CompressionDraft {
+                distilled_prompt: "HTTP処理を整理する。".to_string(),
+                removed_content_summary: vec![],
+            })
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ObservingBackend;
+
+    impl RuntimeBackend for ObservingBackend {
+        fn compress(
+            &self,
+            _request: &CompressionRequest,
+            _profile: &ProfileDefinition,
+        ) -> Result<CompressionDraft> {
+            Ok(CompressionDraft {
+                distilled_prompt: "README.mdを短くする。".to_string(),
+                removed_content_summary: vec![],
+            })
+        }
+
+        fn compress_observed(
+            &self,
+            _request: &CompressionRequest,
+            _profile: &ProfileDefinition,
+        ) -> Result<RuntimeCompressionObservation> {
+            Ok(RuntimeCompressionObservation {
+                raw_model_draft: Some(CompressionDraft {
+                    distilled_prompt: "出力: README.mdの説明を簡潔にする。".to_string(),
+                    removed_content_summary: vec![],
+                }),
+                final_draft: CompressionDraft {
+                    distilled_prompt: "README.mdの説明を簡潔にする。".to_string(),
+                    removed_content_summary: vec![],
+                },
+                transformations: vec![RuntimeTransformation::PolishedModelOutput],
+            })
+        }
+    }
+
     fn test_request(profile: &str) -> CompressionRequest {
         CompressionRequest {
             input_text: "テスト用の依頼を短くしてください。".to_string(),
-            task_type: TaskType::Coding,
-            compression_mode: CompressionMode::CodexOptimized,
             compression_level: CompressionLevel::from_u8(2).expect("valid level"),
             profile: profile.to_string(),
             constraints: CompressionConstraints::default(),
@@ -294,6 +466,3 @@ mod tests {
         }
     }
 }
-
-#[allow(dead_code)]
-fn _keep_types_used(_a: PreservedRequirement, _b: RiskFlag) {}

@@ -3,7 +3,7 @@ id: level-prompt-profiles-v1
 
 # Each profile inherits this baseline. The selected profile is sent to the
 # model in one request; the application does not run a second derivation pass.
-shared_instruction: "削除可=挨拶/現状説明/背景/敬語/重複/明白ノイズ。保持=対象/操作契機/条件と結果/例外/数値/必須語/禁止/維持/検証。必須語は表記を変えず対象と同じ節に各1回置き、同義語化/単独ラベル/末尾追記禁止。異なる条件と結果を統合せず、否定を反転しない。日時/ID/URL/ファイル名/エラー表記/識別子は改変禁止。原文外追加/意味変更/個別ケース暗記は禁止。"
+shared_instruction: "削除可=挨拶/現状説明/背景/敬語/重複/明白ノイズ。保持=対象/操作契機/条件と結果/例外/数値/必須語/禁止/維持/検証。必須語は表記を変えず対象と同じ節に各1回置き、同義語化/単独ラベル/末尾追記禁止。限定語(だけ/のみ/以外)、否定語(しない/せず/禁止)、条件語(なら/場合/とき)は削除・弱化せず、対象と結果を同じ節に残す。異なる条件と結果を統合せず、否定を反転しない。日時/ID/URL/ファイル名/エラー表記/識別子は改変禁止。原文外追加/意味変更/個別ケース暗記は禁止。"
 
 profiles:
   level_1_reference:

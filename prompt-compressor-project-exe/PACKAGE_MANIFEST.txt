@@ -1,9 +1,9 @@
-﻿Prompt Compressor desktop package
+Prompt Compressor desktop package
 
-Generated: 2026-07-10 17:59:40
+Generated: 2026-07-15 12:07:03
 Executable: PromptCompressor.exe
 Default profile: internal_llm
-Model: application/local/models/sarashina2.2-3b-instruct-v0.1/sarashina2.2-3b-instruct-v0.1-Q4_K_S.gguf
+Model: downloaded from Hugging Face on first launch to application/local/models/sarashina2.2-3b-instruct-v0.1/sarashina2.2-3b-instruct-v0.1-Q4_K_S.gguf
 Runtime: llama_cpp_embedded (embedded in executable)
 Desktop transport: WebView2 custom protocol (no HTTP server, no localhost port)
 

@@ -7,9 +7,9 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use prompt_compressor_core::{
-    CompressionConstraints, CompressionLevel, CompressionMode, CompressionRequest,
-    CompressionService, ConfiguredRuntimeBackend, ProfileRegistry, RequestSource, RequestTarget,
-    RuntimeBackend, TaskType,
+    CompressionConstraints, CompressionLevel, CompressionRequest, CompressionService,
+    ConfiguredRuntimeBackend, ProfileRegistry, RequestSource, RequestTarget, RuntimeBackend,
+    RuntimeTransformation,
 };
 use serde::{Deserialize, Serialize};
 
@@ -32,17 +32,11 @@ struct Cli {
     #[arg(long, default_value = "internal_llm")]
     profile: String,
 
-    #[arg(long, value_enum, default_value_t = ModeArg::CodexOptimized)]
-    mode: ModeArg,
-
     #[arg(long, value_enum, default_value_t = FormatArg::Text)]
     format: FormatArg,
 
     #[arg(long, default_value_t = 2)]
     level: u8,
-
-    #[arg(long)]
-    copy: bool,
 
     #[arg(long)]
     list_profiles: bool,
@@ -64,6 +58,9 @@ struct Cli {
 
     #[arg(long)]
     eval_progress: bool,
+
+    #[arg(long, value_enum, default_value_t = EvaluationStageArg::FinalPipeline)]
+    eval_stage: EvaluationStageArg,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -72,13 +69,11 @@ enum FormatArg {
     Json,
 }
 
-#[derive(Clone, Debug, ValueEnum)]
-enum ModeArg {
-    Lossless,
-    InstructionExtract,
-    CodexOptimized,
-    PrivacyRedaction,
-    DeveloperMode,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum EvaluationStageArg {
+    RawModel,
+    FinalPipeline,
 }
 
 fn main() -> Result<()> {
@@ -101,12 +96,15 @@ fn main() -> Result<()> {
         let service = CompressionService::new(registry, backend);
         let report = run_evaluation(
             &service,
-            eval_fixture,
-            &cli.profile,
-            &cli.eval_levels,
-            cli.eval_case_limit,
-            cli.eval_case_offset,
-            cli.eval_progress,
+            EvaluationOptions {
+                fixture_path: eval_fixture,
+                fallback_profile: &cli.profile,
+                requested_levels: &cli.eval_levels,
+                case_limit: cli.eval_case_limit,
+                case_offset: cli.eval_case_offset,
+                progress: cli.eval_progress,
+                evaluation_stage: cli.eval_stage,
+            },
         )?;
         println!(
             "{}",
@@ -126,8 +124,6 @@ fn main() -> Result<()> {
     let input = read_input(&cli)?;
     let request = CompressionRequest {
         input_text: input,
-        task_type: TaskType::Coding,
-        compression_mode: map_mode(cli.mode),
         compression_level: CompressionLevel::from_u8(cli.level)?,
         profile: cli.profile,
         constraints: CompressionConstraints::default(),
@@ -154,10 +150,6 @@ fn main() -> Result<()> {
 
     let result = service.compress(request)?;
 
-    if cli.copy {
-        eprintln!("copy support is not wired yet; use the displayed output for now.");
-    }
-
     match cli.format {
         FormatArg::Text => {
             println!("{}", result.distilled_prompt);
@@ -181,10 +173,6 @@ struct EvaluationFixture {
     #[serde(default)]
     profile: Option<String>,
     #[serde(default)]
-    task_type: Option<TaskType>,
-    #[serde(default)]
-    compression_mode: Option<CompressionMode>,
-    #[serde(default)]
     failure_policy: Option<EvaluationFailurePolicy>,
     levels: BTreeMap<String, EvaluationLevelConfig>,
     cases: Vec<EvaluationCase>,
@@ -202,6 +190,8 @@ struct EvaluationLevelConfig {
     #[serde(default)]
     max_average_character_ratio: Option<f32>,
     #[serde(default)]
+    min_case_character_ratio: Option<f32>,
+    #[serde(default)]
     max_case_character_ratio: Option<f32>,
 }
 
@@ -209,10 +199,6 @@ struct EvaluationLevelConfig {
 struct EvaluationCase {
     id: String,
     input_text: String,
-    #[serde(default)]
-    task_type: Option<TaskType>,
-    #[serde(default)]
-    compression_mode: Option<CompressionMode>,
     #[serde(default)]
     required_terms: Vec<String>,
     #[serde(default)]
@@ -225,6 +211,7 @@ struct EvaluationCase {
 struct EvaluationReport {
     fixture_id: String,
     profile: String,
+    evaluation_stage: EvaluationStageArg,
     case_count: usize,
     run_count: usize,
     failure_count: usize,
@@ -245,6 +232,7 @@ struct EvaluationLevelReport {
     average_character_ratio: f32,
     min_average_character_ratio: Option<f32>,
     max_average_character_ratio: Option<f32>,
+    min_case_character_ratio: Option<f32>,
     max_case_character_ratio: Option<f32>,
     passed: bool,
 }
@@ -266,10 +254,24 @@ struct EvaluationFailureReport {
 struct EvaluationSampleReport {
     case_id: String,
     level: u8,
+    input_text: String,
     character_ratio: Option<f32>,
     should_send_original: Option<bool>,
     fallback_reason: Option<String>,
     output_preview: Option<String>,
+    raw_model_character_ratio: Option<f32>,
+    runtime_character_ratio: Option<f32>,
+    final_character_ratio: Option<f32>,
+    raw_model_output: Option<String>,
+    runtime_output: Option<String>,
+    final_output: Option<String>,
+    raw_model_removed_content_summary: Option<Vec<String>>,
+    runtime_removed_content_summary: Option<Vec<String>>,
+    final_removed_content_summary: Option<Vec<String>>,
+    runtime_transformations: Vec<RuntimeTransformation>,
+    application_fallback_applied: bool,
+    final_should_send_original: Option<bool>,
+    final_fallback_reason: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -279,15 +281,29 @@ struct EvaluationLevelAccumulator {
     ratio_sum: f32,
 }
 
-fn run_evaluation<B: RuntimeBackend>(
-    service: &CompressionService<B>,
-    fixture_path: &Path,
-    fallback_profile: &str,
-    requested_levels: &[u8],
+struct EvaluationOptions<'a> {
+    fixture_path: &'a Path,
+    fallback_profile: &'a str,
+    requested_levels: &'a [u8],
     case_limit: Option<usize>,
     case_offset: usize,
     progress: bool,
+    evaluation_stage: EvaluationStageArg,
+}
+
+fn run_evaluation<B: RuntimeBackend>(
+    service: &CompressionService<B>,
+    options: EvaluationOptions<'_>,
 ) -> Result<EvaluationReport> {
+    let EvaluationOptions {
+        fixture_path,
+        fallback_profile,
+        requested_levels,
+        case_limit,
+        case_offset,
+        progress,
+        evaluation_stage,
+    } = options;
     let fixture_text = fs::read_to_string(fixture_path)
         .with_context(|| format!("failed to read eval fixture: {}", fixture_path.display()))?;
     let fixture: EvaluationFixture =
@@ -298,6 +314,7 @@ fn run_evaluation<B: RuntimeBackend>(
             fixture.schema_version
         );
     }
+    validate_evaluation_fixture(&fixture)?;
 
     let profile = fixture
         .profile
@@ -357,16 +374,6 @@ fn run_evaluation<B: RuntimeBackend>(
 
             let request = CompressionRequest {
                 input_text: case.input_text.clone(),
-                task_type: case
-                    .task_type
-                    .clone()
-                    .or_else(|| fixture.task_type.clone())
-                    .unwrap_or(TaskType::Coding),
-                compression_mode: case
-                    .compression_mode
-                    .clone()
-                    .or_else(|| fixture.compression_mode.clone())
-                    .unwrap_or(CompressionMode::CodexOptimized),
                 compression_level: CompressionLevel::from_u8(level)?,
                 profile: profile.clone(),
                 constraints: CompressionConstraints::default(),
@@ -374,7 +381,7 @@ fn run_evaluation<B: RuntimeBackend>(
                 source: RequestSource::Cli,
             };
 
-            let run = service.compress(request);
+            let run = service.compress_with_observation(request);
             let mut reasons = Vec::new();
             let mut missing_terms = Vec::new();
             let mut missing_marker_groups = Vec::new();
@@ -382,37 +389,84 @@ fn run_evaluation<B: RuntimeBackend>(
             let mut should_send_original = None;
             let mut fallback_reason = None;
             let mut output_preview = None;
+            let mut raw_model_character_ratio = None;
+            let mut runtime_character_ratio = None;
+            let mut final_character_ratio = None;
+            let mut raw_model_output = None;
+            let mut runtime_output = None;
+            let mut final_output = None;
+            let mut raw_model_removed_content_summary = None;
+            let mut runtime_removed_content_summary = None;
+            let mut final_removed_content_summary = None;
+            let mut runtime_transformations = Vec::new();
+            let mut application_fallback_applied = false;
+            let mut final_should_send_original = None;
+            let mut final_fallback_reason = None;
 
             match run {
-                Ok(result) => {
-                    let output = result.distilled_prompt.trim();
-                    character_ratio = Some(result.metrics.character_ratio);
-                    should_send_original = Some(result.should_send_original);
-                    fallback_reason = result.fallback_reason.clone();
-                    output_preview = Some(trim_preview(output, 120));
-                    accumulator.ratio_sum += result.metrics.character_ratio;
+                Ok(observed) => {
+                    application_fallback_applied = observed.application_fallback_applied;
+                    let result = observed.result;
+                    final_character_ratio = Some(result.metrics.character_ratio);
+                    final_output = Some(result.distilled_prompt.trim().to_string());
+                    final_removed_content_summary = Some(result.removed_content_summary);
+                    final_should_send_original = Some(result.should_send_original);
+                    final_fallback_reason = result.fallback_reason;
 
-                    if result.should_send_original {
-                        reasons.push("should_send_original".to_string());
+                    if let Some(runtime) = observed.runtime_observation {
+                        if let Some(raw_model_draft) = runtime.raw_model_draft {
+                            let output = raw_model_draft.distilled_prompt.trim().to_string();
+                            raw_model_character_ratio =
+                                Some(text_character_ratio(&case.input_text, &output));
+                            raw_model_output = Some(output);
+                            raw_model_removed_content_summary =
+                                Some(raw_model_draft.removed_content_summary);
+                        }
+
+                        let output = runtime.final_draft.distilled_prompt.trim().to_string();
+                        runtime_character_ratio =
+                            Some(text_character_ratio(&case.input_text, &output));
+                        runtime_output = Some(output);
+                        runtime_removed_content_summary =
+                            Some(runtime.final_draft.removed_content_summary);
+                        runtime_transformations = runtime.transformations;
                     }
-                    if let Some(max_case_ratio) = level_config.max_case_character_ratio {
-                        if result.metrics.character_ratio > max_case_ratio {
-                            reasons.push(format!(
-                                "character_ratio {:.3} exceeds max_case {:.3}",
-                                result.metrics.character_ratio, max_case_ratio
-                            ));
+
+                    let selected_output = match evaluation_stage {
+                        EvaluationStageArg::RawModel => raw_model_output.as_deref(),
+                        EvaluationStageArg::FinalPipeline => final_output.as_deref(),
+                    };
+                    character_ratio = match evaluation_stage {
+                        EvaluationStageArg::RawModel => raw_model_character_ratio,
+                        EvaluationStageArg::FinalPipeline => final_character_ratio,
+                    };
+                    if evaluation_stage == EvaluationStageArg::FinalPipeline {
+                        should_send_original = final_should_send_original;
+                        fallback_reason = final_fallback_reason.clone();
+                        if final_should_send_original == Some(true) {
+                            reasons.push("should_send_original".to_string());
                         }
                     }
 
-                    missing_terms = missing_required_terms(output, &case.required_terms);
-                    if !missing_terms.is_empty() {
-                        reasons.push("missing_required_terms".to_string());
+                    if let Some(output) = selected_output {
+                        output_preview = Some(trim_preview(output, 120));
+                        if let Some(ratio) = character_ratio {
+                            reasons
+                                .extend(case_character_ratio_failure_reasons(ratio, level_config));
+                        }
+                        missing_terms = missing_required_terms(output, &case.required_terms);
+                        if !missing_terms.is_empty() {
+                            reasons.push("missing_required_terms".to_string());
+                        }
+                        missing_marker_groups =
+                            missing_required_marker_groups(output, &case.required_marker_groups);
+                        if !missing_marker_groups.is_empty() {
+                            reasons.push("missing_required_marker_groups".to_string());
+                        }
+                    } else {
+                        reasons.push("selected_output_unavailable".to_string());
                     }
-                    missing_marker_groups =
-                        missing_required_marker_groups(output, &case.required_marker_groups);
-                    if !missing_marker_groups.is_empty() {
-                        reasons.push("missing_required_marker_groups".to_string());
-                    }
+                    accumulator.ratio_sum += character_ratio.unwrap_or(1.0);
                 }
                 Err(error) => {
                     reasons.push(format!("runtime_error: {error}"));
@@ -455,10 +509,24 @@ fn run_evaluation<B: RuntimeBackend>(
             samples.push(EvaluationSampleReport {
                 case_id: case.id.clone(),
                 level,
+                input_text: case.input_text.clone(),
                 character_ratio,
                 should_send_original,
                 fallback_reason,
                 output_preview,
+                raw_model_character_ratio,
+                runtime_character_ratio,
+                final_character_ratio,
+                raw_model_output,
+                runtime_output,
+                final_output,
+                raw_model_removed_content_summary,
+                runtime_removed_content_summary,
+                final_removed_content_summary,
+                runtime_transformations,
+                application_fallback_applied,
+                final_should_send_original,
+                final_fallback_reason,
             });
         }
     }
@@ -485,10 +553,10 @@ fn run_evaluation<B: RuntimeBackend>(
             && failure_rate <= max_failure_rate
             && config
                 .min_average_character_ratio
-                .map_or(true, |minimum| average_ratio >= minimum)
+                .is_none_or(|minimum| average_ratio >= minimum)
             && config
                 .max_average_character_ratio
-                .map_or(true, |maximum| average_ratio <= maximum);
+                .is_none_or(|maximum| average_ratio <= maximum);
         passed &= level_passed;
         level_reports.push(EvaluationLevelReport {
             level,
@@ -498,6 +566,7 @@ fn run_evaluation<B: RuntimeBackend>(
             average_character_ratio: average_ratio,
             min_average_character_ratio: config.min_average_character_ratio,
             max_average_character_ratio: config.max_average_character_ratio,
+            min_case_character_ratio: config.min_case_character_ratio,
             max_case_character_ratio: config.max_case_character_ratio,
             passed: level_passed,
         });
@@ -513,6 +582,7 @@ fn run_evaluation<B: RuntimeBackend>(
     Ok(EvaluationReport {
         fixture_id: fixture.id.clone(),
         profile,
+        evaluation_stage,
         case_count: cases.len(),
         run_count,
         failure_count,
@@ -523,6 +593,88 @@ fn run_evaluation<B: RuntimeBackend>(
         samples,
         failures,
     })
+}
+
+fn text_character_ratio(input: &str, output: &str) -> f32 {
+    let input_characters = input.chars().count();
+    if input_characters == 0 {
+        1.0
+    } else {
+        output.chars().count() as f32 / input_characters as f32
+    }
+}
+
+fn validate_evaluation_fixture(fixture: &EvaluationFixture) -> Result<()> {
+    if let Some(policy) = &fixture.failure_policy {
+        validate_ratio("failure_policy.max_failure_rate", policy.max_failure_rate)?;
+    }
+
+    for (level, config) in &fixture.levels {
+        for (name, value) in [
+            (
+                "min_average_character_ratio",
+                config.min_average_character_ratio,
+            ),
+            (
+                "max_average_character_ratio",
+                config.max_average_character_ratio,
+            ),
+            ("min_case_character_ratio", config.min_case_character_ratio),
+            ("max_case_character_ratio", config.max_case_character_ratio),
+        ] {
+            if let Some(value) = value {
+                validate_ratio(&format!("levels.{level}.{name}"), value)?;
+            }
+        }
+
+        if let (Some(minimum), Some(maximum)) = (
+            config.min_average_character_ratio,
+            config.max_average_character_ratio,
+        ) {
+            if minimum > maximum {
+                bail!(
+                    "levels.{level}.min_average_character_ratio must not exceed max_average_character_ratio"
+                );
+            }
+        }
+        if let (Some(minimum), Some(maximum)) = (
+            config.min_case_character_ratio,
+            config.max_case_character_ratio,
+        ) {
+            if minimum > maximum {
+                bail!(
+                    "levels.{level}.min_case_character_ratio must not exceed max_case_character_ratio"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_ratio(name: &str, value: f32) -> Result<()> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        bail!("{name} must be a finite value between 0 and 1");
+    }
+    Ok(())
+}
+
+fn case_character_ratio_failure_reasons(ratio: f32, config: &EvaluationLevelConfig) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if let Some(minimum) = config.min_case_character_ratio {
+        if ratio < minimum {
+            reasons.push(format!(
+                "character_ratio {ratio:.3} is below min_case {minimum:.3}"
+            ));
+        }
+    }
+    if let Some(maximum) = config.max_case_character_ratio {
+        if ratio > maximum {
+            reasons.push(format!(
+                "character_ratio {ratio:.3} exceeds max_case {maximum:.3}"
+            ));
+        }
+    }
+    reasons
 }
 
 fn resolve_evaluation_levels(
@@ -665,6 +817,7 @@ fn contains_marker_text(haystack: &str, marker: &str) -> bool {
             "抑制",
             "最小限",
         ],
+        &["壊れない", "壊れず", "壊さない", "破損しない"],
         &[
             "避ける",
             "避け",
@@ -771,19 +924,15 @@ fn find_upward_settings_dir(start: &Path) -> Option<PathBuf> {
     None
 }
 
-fn map_mode(mode: ModeArg) -> CompressionMode {
-    match mode {
-        ModeArg::Lossless => CompressionMode::Lossless,
-        ModeArg::InstructionExtract => CompressionMode::InstructionExtract,
-        ModeArg::CodexOptimized => CompressionMode::CodexOptimized,
-        ModeArg::PrivacyRedaction => CompressionMode::PrivacyRedaction,
-        ModeArg::DeveloperMode => CompressionMode::DeveloperMode,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{contains_marker_text, contains_required_term, missing_required_marker_groups};
+    use std::collections::BTreeMap;
+
+    use super::{
+        case_character_ratio_failure_reasons, contains_marker_text, contains_required_term,
+        missing_required_marker_groups, validate_evaluation_fixture, EvaluationFixture,
+        EvaluationLevelConfig,
+    };
 
     #[test]
     fn treats_keep_marker_aliases_as_equivalent() {
@@ -813,6 +962,10 @@ mod tests {
             "増やさない"
         ));
         assert!(contains_marker_text("個人情報外部送信なし。", "送信しない"));
+        assert!(contains_marker_text(
+            "既存クライアントが壊れず、互換性を確認。",
+            "壊れない"
+        ));
     }
 
     #[test]
@@ -851,5 +1004,59 @@ mod tests {
             "通知はアプリ内のみ。",
             "Windows 通知"
         ));
+    }
+
+    #[test]
+    fn applies_inclusive_per_case_character_ratio_bounds() {
+        let config = EvaluationLevelConfig {
+            min_average_character_ratio: None,
+            max_average_character_ratio: None,
+            min_case_character_ratio: Some(0.4),
+            max_case_character_ratio: Some(0.9),
+        };
+
+        assert!(case_character_ratio_failure_reasons(0.4, &config).is_empty());
+        assert!(case_character_ratio_failure_reasons(0.9, &config).is_empty());
+        assert_eq!(
+            case_character_ratio_failure_reasons(0.399, &config),
+            vec!["character_ratio 0.399 is below min_case 0.400"]
+        );
+        assert_eq!(
+            case_character_ratio_failure_reasons(0.901, &config),
+            vec!["character_ratio 0.901 exceeds max_case 0.900"]
+        );
+    }
+
+    #[test]
+    fn rejects_inverted_or_out_of_range_evaluation_bounds() {
+        let fixture_with = |config| EvaluationFixture {
+            schema_version: 1,
+            id: "test".to_string(),
+            profile: None,
+            failure_policy: None,
+            levels: BTreeMap::from([("2".to_string(), config)]),
+            cases: Vec::new(),
+        };
+        let inverted = fixture_with(EvaluationLevelConfig {
+            min_average_character_ratio: None,
+            max_average_character_ratio: None,
+            min_case_character_ratio: Some(0.8),
+            max_case_character_ratio: Some(0.7),
+        });
+        let out_of_range = fixture_with(EvaluationLevelConfig {
+            min_average_character_ratio: None,
+            max_average_character_ratio: None,
+            min_case_character_ratio: Some(-0.1),
+            max_case_character_ratio: Some(0.9),
+        });
+
+        assert!(validate_evaluation_fixture(&inverted)
+            .expect_err("inverted bounds")
+            .to_string()
+            .contains("must not exceed"));
+        assert!(validate_evaluation_fixture(&out_of_range)
+            .expect_err("out of range bound")
+            .to_string()
+            .contains("between 0 and 1"));
     }
 }

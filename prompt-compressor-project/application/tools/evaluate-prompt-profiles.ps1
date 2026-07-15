@@ -7,6 +7,7 @@ param(
     [int]$CaseLimit = 0,
     [int]$CaseOffset = 0,
     [string]$LogPath = "",
+    [string]$ProgressPath = "",
     [switch]$Trace,
     [switch]$NoDefaultFeatures
 )
@@ -27,17 +28,52 @@ if ([string]::IsNullOrWhiteSpace($SettingsDir)) {
     $SettingsDir = Join-Path $projectRoot "application\config"
 }
 
-if (-not $env:NM_PATH) {
-    $candidateNm = "C:\Program Files\LLVM\bin\llvm-nm.exe"
-    if (Test-Path $candidateNm) {
-        $env:NM_PATH = $candidateNm
+function Set-LlvmToolPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$VariableName,
+        [Parameter(Mandatory = $true)][string[]]$Candidates
+    )
+
+    $current = [Environment]::GetEnvironmentVariable($VariableName, "Process")
+    if (-not [string]::IsNullOrWhiteSpace($current) -and (Test-Path -LiteralPath $current -PathType Leaf)) {
+        return
+    }
+    foreach ($candidate in $Candidates) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            [Environment]::SetEnvironmentVariable($VariableName, $candidate, "Process")
+            return
+        }
+    }
+    throw "$VariableName could not be resolved. Install LLVM or set the variable to the required executable."
+}
+
+$rustSysroot = (& rustc --print sysroot | Select-Object -First 1).Trim()
+$rustHostLine = & rustc -vV | Where-Object { $_ -match '^host:\s*(.+)$' } | Select-Object -First 1
+$rustHost = if ($rustHostLine -match '^host:\s*(.+)$') { $Matches[1].Trim() } else { "" }
+if ([string]::IsNullOrWhiteSpace($rustSysroot) -or [string]::IsNullOrWhiteSpace($rustHost)) {
+    throw "The active Rust toolchain could not be resolved."
+}
+$rustLlvmBin = Join-Path $rustSysroot "lib\rustlib\$rustHost\bin"
+Set-LlvmToolPath -VariableName "NM_PATH" -Candidates @(
+    "C:\Program Files\LLVM\bin\llvm-nm.exe",
+    (Join-Path $rustLlvmBin "llvm-nm.exe")
+)
+Set-LlvmToolPath -VariableName "OBJCOPY_PATH" -Candidates @(
+    "C:\Program Files\LLVM\bin\llvm-objcopy.exe",
+    (Join-Path $rustLlvmBin "llvm-objcopy.exe")
+)
+
+$libclangPath = [Environment]::GetEnvironmentVariable("LIBCLANG_PATH", "Process")
+if ([string]::IsNullOrWhiteSpace($libclangPath) -or -not (Test-Path -LiteralPath (Join-Path $libclangPath "libclang.dll") -PathType Leaf)) {
+    foreach ($candidate in @("C:\Program Files\LLVM\bin", "C:\Program Files (x86)\LLVM\bin")) {
+        if (Test-Path -LiteralPath (Join-Path $candidate "libclang.dll") -PathType Leaf) {
+            $env:LIBCLANG_PATH = $candidate
+            break
+        }
     }
 }
-if (-not $env:OBJCOPY_PATH) {
-    $candidateObjcopy = "C:\Program Files\LLVM\bin\llvm-objcopy.exe"
-    if (Test-Path $candidateObjcopy) {
-        $env:OBJCOPY_PATH = $candidateObjcopy
-    }
+if ([string]::IsNullOrWhiteSpace($env:LIBCLANG_PATH) -or -not (Test-Path -LiteralPath (Join-Path $env:LIBCLANG_PATH "libclang.dll") -PathType Leaf)) {
+    throw "LIBCLANG_PATH could not be resolved. Install LLVM or set it to the directory containing libclang.dll."
 }
 if ($Trace) {
     $env:PROMPT_COMPRESSOR_TRACE = "1"
@@ -120,21 +156,26 @@ try {
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $processInfo
         [void]$process.Start()
-        $stdout = $process.StandardOutput.ReadToEnd()
-        $stderr = $process.StandardError.ReadToEnd()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
         $process.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
 
-        [System.IO.File]::WriteAllText($resolvedLogPath, $stdout + $stderr, $utf8NoBom)
+        [System.IO.File]::WriteAllText($resolvedLogPath, $stdout, $utf8NoBom)
+        if (-not [string]::IsNullOrWhiteSpace($ProgressPath)) {
+            $resolvedProgressPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ProgressPath)
+            $progressParent = Split-Path -Parent $resolvedProgressPath
+            if (-not [string]::IsNullOrWhiteSpace($progressParent)) {
+                New-Item -ItemType Directory -Force -Path $progressParent | Out-Null
+            }
+            [System.IO.File]::WriteAllText($resolvedProgressPath, $stderr, $utf8NoBom)
+        }
         if (-not [string]::IsNullOrWhiteSpace($stdout)) {
             Write-Output $stdout
         }
         if (-not [string]::IsNullOrWhiteSpace($stderr)) {
-            if ($process.ExitCode -eq 0) {
-                [Console]::Error.WriteLine($stderr)
-            }
-            else {
-                Write-Error $stderr
-            }
+            [Console]::Error.WriteLine($stderr)
         }
         exit $process.ExitCode
     }

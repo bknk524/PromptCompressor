@@ -11,16 +11,19 @@
     "1": {
       "min_average_character_ratio": 0.62,
       "max_average_character_ratio": 0.90,
+      "min_case_character_ratio": 0.45,
       "max_case_character_ratio": 0.98
     },
     "2": {
       "min_average_character_ratio": 0.46,
       "max_average_character_ratio": 0.78,
+      "min_case_character_ratio": 0.40,
       "max_case_character_ratio": 0.90
     },
     "3": {
       "min_average_character_ratio": 0.30,
       "max_average_character_ratio": 0.65,
+      "min_case_character_ratio": 0.20,
       "max_case_character_ratio": 0.82
     }
   },

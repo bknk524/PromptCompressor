@@ -29,6 +29,9 @@ pub enum CompressionError {
     #[error("runtime timed out after {0} ms")]
     RuntimeTimeout(u64),
 
+    #[error("operation cancelled: {0}")]
+    Cancelled(String),
+
     #[error("runtime error: {0}")]
     Runtime(String),
 }

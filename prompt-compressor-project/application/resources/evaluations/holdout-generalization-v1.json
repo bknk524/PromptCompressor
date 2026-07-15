@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "id": "holdout-generalization-v1",
+  "profile": "internal_llm",
+  "task_type": "coding",
+  "compression_mode": "codex_optimized",
+  "failure_policy": {
+    "max_failure_rate": 0.0
+  },
+  "levels": {
+    "2": {
+      "max_average_character_ratio": 0.85,
+      "min_case_character_ratio": 0.2,
+      "max_case_character_ratio": 0.95
+    }
+  },
+  "cases": [
+    {
+      "id": "holdout-zig-build-matrix",
+      "input_text": "前にも少し相談した件ですが、Zigのbuild.zigでrelease-fastとrelease-safeの2構成を扱えるように整理してください。release-fastだけはLTOを有効にし、release-safeでは安全性チェックを無効にしないでください。既存のzig build testとinstall手順は変更せず、LinuxとWindowsの両方で生成物名が一致することを確認してください。背景説明は長くなりましたが、必要なのはこの変更だけです。",
+      "required_terms": ["Zig", "build.zig", "release-fast", "release-safe", "LTO", "zig build test", "Linux", "Windows"],
+      "required_marker_groups": ["だけ|のみ", "無効にしない", "変更せず|変更しない", "確認"]
+    },
+    {
+      "id": "holdout-elixir-oban-uniqueness",
+      "input_text": "ElixirのObanで請求通知ジョブがまれに二重実行されるため、account_idとbilling_monthの組み合わせでunique制約を設定してください。同じ月の完了済みジョブは再投入しませんが、failed状態は管理画面から明示的に再試行できるようにしてください。既存のqueue名billingとmax_attempts=5は変えず、ExUnitで同時投入と手動再試行を検証してください。",
+      "required_terms": ["Elixir", "Oban", "account_id", "billing_month", "failed", "billing", "max_attempts=5", "ExUnit"],
+      "required_marker_groups": ["二重実行|unique", "再投入しない", "変えず|変更しない", "検証"]
+    },
+    {
+      "id": "holdout-dotnet-feature-flag",
+      "input_text": "ASP.NET Coreの注文APIへFeature Managementを導入し、新しい価格計算はPricingV2が有効なテナントだけに適用してください。フラグ取得がタイムアウトした場合は旧計算へ戻し、注文作成自体を失敗させないでください。既存のPOST /ordersレスポンスと監査イベント名は変更せず、xUnitで有効、無効、タイムアウトの3ケースを確認してください。",
+      "required_terms": ["ASP.NET Core", "Feature Management", "PricingV2", "POST /orders", "xUnit"],
+      "required_marker_groups": ["だけ|のみ", "旧計算", "失敗させない", "変更せず|変更しない", "3ケース|有効.*無効.*タイムアウト"]
+    },
+    {
+      "id": "holdout-cmake-cross-compile",
+      "input_text": "CMakePresets.jsonにarm64-linux向けのcross presetを追加してください。toolchainはcmake/toolchains/aarch64.cmakeを参照し、CMAKE_SYSROOTが未設定ならconfigure時点で理由付きエラーにしてください。既存のx64-debug presetとNinja指定は変更せず、cmake --build --preset arm64-linuxが通ることをCIで確認してください。",
+      "required_terms": ["CMakePresets.json", "arm64-linux", "cmake/toolchains/aarch64.cmake", "CMAKE_SYSROOT", "x64-debug", "Ninja", "cmake --build --preset arm64-linux", "CI"],
+      "required_marker_groups": ["未設定", "エラー", "変更せず|変更しない", "確認"]
+    },
+    {
+      "id": "holdout-kafka-offset-recovery",
+      "input_text": "Kafkaのshipment-events consumerで処理途中の例外後にoffsetが進み、イベントが欠落する問題を修正してください。DB更新とoutbox記録が成功した場合だけoffsetをcommitし、同じevent_idを再受信しても配送を二重作成しないでください。poison messageは3回失敗後にshipment-events-dlqへ送り、payload全文をログへ残さないでください。Testcontainersで再配信、重複、DLQを検証してください。",
+      "required_terms": ["Kafka", "shipment-events", "offset", "outbox", "event_id", "poison message", "shipment-events-dlq", "Testcontainers"],
+      "required_marker_groups": ["成功した場合だけ|成功時のみ", "二重作成しない", "3回", "全文をログへ残さない|ログへ残さない", "検証"]
+    },
+    {
+      "id": "holdout-sqlite-backup",
+      "input_text": "デスクトップアプリのSQLiteバックアップ処理を追加してください。WALモードのまま整合したスナップショットを作り、保存先はユーザーが選んだフォルダだけにしてください。バックアップ名はapp-YYYYMMDD-HHmm.dbとし、直近7世代を超えた古いファイルだけ削除してください。処理中もDB接続を強制切断せず、復元テストでschema_versionとレコード件数を確認してください。",
+      "required_terms": ["SQLite", "WAL", "app-YYYYMMDD-HHmm.db", "7世代", "DB", "schema_version"],
+      "required_marker_groups": ["だけ|のみ", "超えた", "削除", "強制切断せず|切断しない", "復元テスト|確認"]
+    },
+    {
+      "id": "holdout-ruby-sidekiq-timezone",
+      "input_text": "Ruby on RailsのSidekiqで日次集計を各組織のtimezone午前1時に実行してください。DSTで同じ時刻が2回来てもorganization_idとlocal_dateが同じなら1回だけ処理し、存在しない時刻は次の有効時刻へ送ってください。既存のdaily_metrics queueは変えず、RSpecで春と秋のDST境界を検証してください。",
+      "required_terms": ["Ruby on Rails", "Sidekiq", "timezone", "DST", "organization_id", "local_date", "daily_metrics", "RSpec"],
+      "required_marker_groups": ["1回だけ|1回のみ", "次の有効時刻", "変えず|変更しない", "検証"]
+    },
+    {
+      "id": "holdout-web-components-a11y",
+      "input_text": "Web Componentsのdate-pickerへキーボード操作を追加してください。ArrowLeftとArrowRightは日、ArrowUpとArrowDownは週単位で移動し、Escapeでは値を変更せず閉じてください。shadow DOM内でもaria-activedescendantが現在日を指すようにし、既存のchangeイベント発火条件は変更しないでください。Playwrightとaxeで操作とアクセシビリティを確認してください。",
+      "required_terms": ["Web Components", "date-picker", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Escape", "shadow DOM", "aria-activedescendant", "Playwright", "axe"],
+      "required_marker_groups": ["値を変更せず|変更しない", "閉じ", "発火条件.*変更しない|変更しない", "確認"]
+    },
+    {
+      "id": "holdout-noisy-nix-flake",
+      "input_text": "えっとNixのflake.nixなんですけど devShellをmacOSとLinuxでそろえたいです。nodejs_22とpnpmを両方入れて、たぶんPythonも、いやPythonは今回は不要です。asdfgh 998877は関係ない文字です。既存のnix flake checkは変更しないで、nix develop後にpnpm testが通ることを確認してください。",
+      "required_terms": ["Nix", "flake.nix", "devShell", "macOS", "Linux", "nodejs_22", "pnpm", "nix flake check", "nix develop", "pnpm test"],
+      "required_marker_groups": ["Python.*不要|Pythonは.*不要", "変更しない", "確認"]
+    },
+    {
+      "id": "holdout-noisy-protobuf-compatibility",
+      "input_text": "gRPCのuser.proto更新をお願いしたいですです。display_nameをfield 7で追加、あっ7で合ってます。以前消したfield 4はreservedのまま再利用しないでください。文字列 qqq!! は意味ありません。既存クライアントが未知fieldを受けても壊れないことと、buf breakingで後方互換性を確認してください。",
+      "required_terms": ["gRPC", "user.proto", "display_name", "field 7", "field 4", "reserved", "buf breaking"],
+      "required_marker_groups": ["再利用しない", "壊れない", "後方互換", "確認"]
+    },
+    {
+      "id": "holdout-noisy-wasm-memory",
+      "input_text": "Rustからwasm-bindgenで画像変換するところ、処理後もmemoryが増えつづけます。入力は最大25MB、いや最終的に20MBです。変な入力xyzxyzは無視で。Uint8Arrayのcopyを必要以上に増やさず、失敗時も確保したbufferを解放してください。ただし公開関数convertImageの名前と戻り値Promise<Uint8Array>は変更しないで、Chromeのperformance.measureUserAgentSpecificMemoryで10回実行後を確認してください。",
+      "required_terms": ["Rust", "wasm-bindgen", "20MB", "Uint8Array", "buffer", "convertImage", "Promise<Uint8Array>", "Chrome", "performance.measureUserAgentSpecificMemory", "10回"],
+      "required_marker_groups": ["増やさず|増やさない", "失敗時", "解放", "変更しない", "確認"]
+    },
+    {
+      "id": "holdout-noisy-lua-plugin-timeout",
+      "input_text": "NeovimのLua pluginで外部formatterを呼ぶ部分を直してほしです。timeoutは最初5000msと書きましたが正しくは3000msです。意味なし文字%%abc123。timeout時はprocessを終了し、編集中bufferを書き換えないでください。既存の:Formatコマンド名は維持し、plenary.nvimで成功、timeout、非0 exit codeをテストしてください。",
+      "required_terms": ["Neovim", "Lua", "formatter", "3000ms", "process", "buffer", ":Format", "plenary.nvim", "timeout", "exit code"],
+      "required_marker_groups": ["終了", "書き換えない", "維持", "成功.*timeout.*非0|テスト"]
+    }
+  ]
+}

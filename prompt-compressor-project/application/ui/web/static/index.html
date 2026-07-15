@@ -95,66 +95,84 @@
         </div>
       </header>
 
-      <section class="primary-flow" aria-label="Compression workspace">
-        <div class="input-card">
-          <div class="section-head">
-            <div>
-              <h2>圧縮予定の文</h2>
-              <p id="settingsSummary">Standard / Level 2 標準</p>
-            </div>
-            <div class="head-actions">
-              <select class="sample-select" id="sampleSelect" aria-label="サンプル文章">
-                <option value="">サンプルを選択</option>
-                <option value="search">検索条件と URL</option>
-                <option value="bugfix">API のバグ修正</option>
-                <option value="tests">テスト追加</option>
-                <option value="refactor">コンポーネント整理</option>
-                <option value="logs">障害ログ解析</option>
-                <option value="design">設計検討</option>
-              </select>
-              <button class="secondary" id="clearInputButton" type="button">クリア</button>
-              <button id="compressButton" type="button">圧縮する</button>
-            </div>
-          </div>
-          <textarea
-            id="promptInput"
-            spellcheck="false"
-            placeholder="ここに圧縮したい依頼文を入れてください。"
-          ></textarea>
+      <section class="model-setup" id="modelSetup" aria-live="polite" hidden>
+        <div class="model-setup-copy">
+          <strong id="modelSetupTitle">ローカルモデルの取得が必要です</strong>
+          <span id="modelSetupDetail"></span>
+          <progress id="modelDownloadProgress" max="100" value="0" hidden></progress>
+        </div>
+        <div class="model-setup-actions">
+          <button class="secondary" id="modelCancelButton" type="button" hidden>中止</button>
+          <button id="modelInstallButton" type="button">モデルを取得</button>
         </div>
       </section>
 
-      <section class="output-grid" aria-label="Compression result">
-        <div class="output-card">
-          <div class="section-head">
-            <div class="result-title-row">
-              <h2>圧縮結果</h2>
-              <span class="result-latency" id="compressionLatency"></span>
+      <div class="workspace-grid">
+        <section class="primary-flow" aria-label="Compression workspace">
+          <div class="input-card">
+            <div class="section-head">
+              <div>
+                <h2>圧縮予定の文</h2>
+                <p id="settingsSummary">Standard / Level 2 標準</p>
+              </div>
+              <div class="head-actions">
+                <select class="sample-select" id="sampleSelect" aria-label="サンプル文章">
+                  <option value="">サンプルを選択</option>
+                  <option value="search">検索条件と URL</option>
+                  <option value="bugfix">API のバグ修正</option>
+                  <option value="tests">テスト追加</option>
+                  <option value="refactor">コンポーネント整理</option>
+                  <option value="logs">障害ログ解析</option>
+                  <option value="design">設計検討</option>
+                </select>
+                <button class="secondary" id="clearInputButton" type="button">クリア</button>
+                <button id="compressButton" type="button">圧縮する</button>
+              </div>
             </div>
-            <button class="secondary" id="copyButton" type="button">コピー</button>
+            <textarea
+              id="promptInput"
+              spellcheck="false"
+              placeholder="ここに圧縮したい依頼文を入れてください。"
+            ></textarea>
           </div>
-          <textarea id="promptOutput" spellcheck="false" readonly></textarea>
-        </div>
+        </section>
 
-        <aside class="result-panel">
-          <div class="metric-grid">
-            <div class="metric">
-              <span>トークン（推定）</span>
-              <strong id="tokenComparison">-</strong>
-              <small id="tokenRatioValue">-</small>
+        <section class="output-grid" aria-label="Compression result">
+          <div class="output-card">
+            <div class="section-head">
+              <div class="result-title-row">
+                <h2>圧縮結果</h2>
+                <span class="result-latency" id="compressionLatency"></span>
+              </div>
+              <button class="secondary" id="copyButton" type="button">コピー</button>
             </div>
-            <div class="metric">
-              <span>文字数</span>
-              <strong id="characterComparison">-</strong>
-              <small id="characterRatioValue">-</small>
+            <div class="result-notice" id="resultNotice" role="status" hidden>
+              <strong>圧縮結果を採用できませんでした。原文を表示しています。</strong>
+              <span id="resultNoticeDetail">自動コピーは行っていません。</span>
             </div>
-            <div class="metric metric-fallback">
-              <span>原文推奨</span>
-              <strong id="fallbackValue">-</strong>
-            </div>
+            <textarea id="promptOutput" spellcheck="false" readonly></textarea>
           </div>
-        </aside>
-      </section>
+
+          <aside class="result-panel">
+            <div class="metric-grid">
+              <div class="metric">
+                <span>トークン（推定）</span>
+                <strong id="tokenComparison">-</strong>
+                <small id="tokenRatioValue">-</small>
+              </div>
+              <div class="metric">
+                <span>文字数</span>
+                <strong id="characterComparison">-</strong>
+                <small id="characterRatioValue">-</small>
+              </div>
+              <div class="metric metric-fallback">
+                <span>原文推奨</span>
+                <strong id="fallbackValue">-</strong>
+              </div>
+            </div>
+          </aside>
+        </section>
+      </div>
     </main>
     <script src="/app.js"></script>
   </body>

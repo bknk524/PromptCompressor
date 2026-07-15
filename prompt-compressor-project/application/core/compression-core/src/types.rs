@@ -2,26 +2,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CompressionError, Result};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskType {
-    Coding,
-    LogAnalysis,
-    Refactor,
-    DesignDiscussion,
-    General,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompressionMode {
-    Lossless,
-    InstructionExtract,
-    CodexOptimized,
-    PrivacyRedaction,
-    DeveloperMode,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CompressionLevel(u8);
 
@@ -83,15 +63,12 @@ impl RequestTarget {
 #[serde(rename_all = "snake_case")]
 pub enum RequestSource {
     Cli,
-    Mcp,
     Desktop,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompressionRequest {
     pub input_text: String,
-    pub task_type: TaskType,
-    pub compression_mode: CompressionMode,
     pub compression_level: CompressionLevel,
     pub profile: String,
     pub constraints: CompressionConstraints,

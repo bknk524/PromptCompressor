@@ -2,7 +2,7 @@
 
 This directory contains version-controlled application defaults.
 
-- `model-catalog.yaml`: Model capabilities and local model locations.
+- `model-catalog.yaml`: Model capabilities, local paths, and verified Hugging Face download sources.
 - `compression-profiles.yaml`: User-selectable profiles that map model, policy, runtime, and fallback behavior. The UI currently exposes only LM Studio free selection and Sarashina 2.2 3B Instruct.
 - `runtime-backends.yaml`: Embedded llama.cpp settings plus the optional LM Studio connection.
 - `compression-policies/`: Compression behavior and preservation rules. `level-prompt-profiles-v1.yaml` defines the shared baseline and the one-request prompt profile used for the three compression levels.

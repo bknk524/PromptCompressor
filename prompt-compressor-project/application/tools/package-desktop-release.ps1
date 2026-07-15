@@ -128,6 +128,42 @@ function Stop-PackageProcesses {
     }
 }
 
+function Remove-PackagedModel {
+    param(
+        [Parameter(Mandatory = $true)][string]$PackagePath,
+        [Parameter(Mandatory = $true)][string]$ModelPath
+    )
+
+    Stop-PackageProcesses -PackagePath $PackagePath
+    foreach ($path in @($ModelPath, "$ModelPath.verified.json")) {
+        for ($attempt = 0; $attempt -lt 20; $attempt++) {
+            $stream = $null
+            if (-not (Test-Path -LiteralPath $path)) {
+                break
+            }
+            try {
+                $stream = [System.IO.File]::Open(
+                    $path,
+                    [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::ReadWrite,
+                    [System.IO.FileShare]::None
+                )
+                $stream.Dispose()
+                [System.IO.File]::Delete($path)
+                break
+            } catch {
+                if ($null -ne $stream) {
+                    $stream.Dispose()
+                }
+                if ($attempt -eq 19) {
+                    throw
+                }
+                Start-Sleep -Milliseconds 500
+            }
+        }
+    }
+}
+
 function Assert-PackagedFile {
     param(
         [Parameter(Mandatory = $true)][string]$RelativePath,
@@ -147,25 +183,40 @@ function Assert-PackagedFile {
 
 function Test-PackagedLocalModelCompression {
     param(
-        [Parameter(Mandatory = $true)][string]$PackagePath,
-        [Parameter(Mandatory = $true)][string]$SettingsDir
+        [Parameter(Mandatory = $true)][string]$PackagePath
     )
 
     Write-Host "Running packaged local model compression smoke test..."
-    $sampleBase64 = "UmVhY3Qg44Gu5qSc57Si55S76Z2i44Gn44CB5qSc57Si44Oc44K/44Oz44KS5oq844GX44Gf44Go44GN44Gg44GRIEFQSSDjgpLlkbzjgbPlh7rjgZfjgabjgY/jgaDjgZXjgYTjgILml6LlrZjjga4gdXNlU2VhcmNoUGFyYW1zIOOBq+OCiOOCiyBVUkwg44Kv44Ko44Oq566h55CG44Gv57at5oyB44GX44CB5aSn6KaP5qih44Gq44Oq44OV44Kh44Kv44K/44Oq44Oz44Kw44Gv6YG/44GR44Gm44GP44Gg44GV44GE44CC"
-    $sample = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($sampleBase64))
-    Push-Location $projectRoot
-    try {
-        Use-LlvmBuildTools
-        $jsonLines = & cargo run --release -q -p prompt-compressor-cli -- --settings-dir $SettingsDir --profile internal_llm --format json --level 2 $sample
-        if ($LASTEXITCODE -ne 0) {
-            throw "Packaged local model smoke test failed with exit code $LASTEXITCODE"
-        }
-    } finally {
-        Pop-Location
+    $packagedExe = Join-Path $PackagePath "PromptCompressor.exe"
+    $resultPath = Join-Path $PackagePath "application\local\state\package-smoke-result.json"
+    if (-not (Test-Path -LiteralPath $packagedExe -PathType Leaf)) {
+        throw "Packaged executable is missing: $packagedExe"
+    }
+    if (Test-Path -LiteralPath $resultPath) {
+        Remove-Item -LiteralPath $resultPath -Force
     }
 
-    $json = ($jsonLines | Out-String).Trim()
+    $json = $null
+    try {
+        $process = Start-Process `
+            -FilePath $packagedExe `
+            -WorkingDirectory $PackagePath `
+            -ArgumentList "--package-smoke-test" `
+            -WindowStyle Hidden `
+            -Wait `
+            -PassThru
+        if (Test-Path -LiteralPath $resultPath -PathType Leaf) {
+            $json = (Get-Content -LiteralPath $resultPath -Raw -Encoding UTF8).Trim()
+        }
+        if ($process.ExitCode -ne 0) {
+            throw "Packaged executable smoke test failed with exit code $($process.ExitCode): $json"
+        }
+    } finally {
+        if (Test-Path -LiteralPath $resultPath) {
+            Remove-Item -LiteralPath $resultPath -Force
+        }
+    }
+
     if ([string]::IsNullOrWhiteSpace($json)) {
         throw "Packaged local model smoke test returned no JSON"
     }
@@ -273,7 +324,9 @@ New-Item -ItemType Directory -Force -Path $packagePath | Out-Null
 Copy-Item -LiteralPath $releaseExe -Destination $packageExe -Force
 
 Copy-Directory -Source $configPath -Destination (Join-Path $packagePath "application\config")
-Copy-Directory -Source $resourcesPath -Destination (Join-Path $packagePath "application\resources")
+Copy-Directory `
+    -Source (Join-Path $resourcesPath "prompts") `
+    -Destination (Join-Path $packagePath "application\resources\prompts")
 
 $profilesPath = Join-Path $configPath "compression-profiles.yaml"
 $modelsPath = Join-Path $configPath "model-catalog.yaml"
@@ -284,8 +337,8 @@ $runtimeRef = Read-ProfileValue -Path $profilesPath -ProfileId $defaultProfile -
 $modelPath = Read-ProfileValue -Path $modelsPath -ProfileId $modelRef -Key "model_path"
 $runtimeExecutablePath = Try-Read-ProfileValue -Path $runtimesPath -ProfileId $runtimeRef -Key "executable_path"
 
-Copy-RelativeFile -RelativePath $modelPath
-Assert-PackagedFile -RelativePath "application\$modelPath" -MinimumBytes 1048576
+$packagedModelPath = Join-Path (Join-Path $packagePath "application") $modelPath
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $packagedModelPath) | Out-Null
 
 if (-not [string]::IsNullOrWhiteSpace($runtimeExecutablePath)) {
     $runtimeAssetPath = $runtimeExecutablePath
@@ -319,7 +372,7 @@ Prompt Compressor desktop package
 Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
 Executable: PromptCompressor.exe
 Default profile: $defaultProfile
-Model: application/$modelPath
+Model: downloaded from Hugging Face on first launch to application/$modelPath
 Runtime: $runtimeManifest
 Desktop transport: WebView2 custom protocol (no HTTP server, no localhost port)
 
@@ -329,9 +382,14 @@ project folder and contains only the desktop executable plus runtime assets.
 $manifest | Set-Content -Encoding UTF8 (Join-Path $packagePath "PACKAGE_MANIFEST.txt")
 
 if (-not $SkipLocalModelSmokeTest) {
-    Test-PackagedLocalModelCompression `
-        -PackagePath $packagePath `
-        -SettingsDir (Join-Path $packagePath "application\config")
+    Copy-RelativeFile -RelativePath $modelPath
+    Assert-PackagedFile -RelativePath "application\$modelPath" -MinimumBytes 1048576
+    try {
+        Test-PackagedLocalModelCompression `
+            -PackagePath $packagePath
+    } finally {
+        Remove-PackagedModel -PackagePath $packagePath -ModelPath $packagedModelPath
+    }
 }
 
 if ($Zip) {
