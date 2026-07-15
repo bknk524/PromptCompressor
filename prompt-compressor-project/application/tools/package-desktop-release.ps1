@@ -13,7 +13,7 @@ $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $projectRoot = Resolve-Path (Join-Path $scriptRoot "..\..")
 $projectParent = Split-Path -Parent $projectRoot
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
-    $packagePath = Join-Path $projectParent "prompt-compressor-project-exe"
+    $packagePath = Join-Path $projectParent "TrimPrompt-exe"
 } elseif ([System.IO.Path]::IsPathRooted($OutputPath)) {
     $packagePath = $OutputPath
 } else {
@@ -25,7 +25,7 @@ $applicationPath = Join-Path $projectRoot "application"
 $configPath = Join-Path $applicationPath "config"
 $resourcesPath = Join-Path $applicationPath "resources"
 $releaseExe = Join-Path $projectRoot "target\release\prompt-compressor-desktop.exe"
-$packageExe = Join-Path $packagePath "PromptCompressor.exe"
+$packageExe = Join-Path $packagePath "TrimPrompt.exe"
 
 function Assert-ChildPath {
     param(
@@ -83,7 +83,7 @@ function Reset-PackageManagedContent {
         throw "Package path must not be a reparse point: $PackagePath"
     }
 
-    # PCごとのモデルや状態を残し、ビルドで管理するファイルだけを更新する。
+    # Preserve machine-local models and state while refreshing managed package files.
     foreach ($entry in Get-ChildItem -LiteralPath $PackagePath -Force) {
         if ($entry.Name -ieq "application" -and $entry.PSIsContainer) {
             continue
@@ -168,13 +168,14 @@ function Stop-PackageProcesses {
     param([Parameter(Mandatory = $true)][string]$PackagePath)
 
     $packageFull = [System.IO.Path]::GetFullPath($PackagePath)
+    $desktopExecutableNames = @("TrimPrompt.exe", "PromptCompressor.exe")
     $processes = Get-CimInstance Win32_Process | Where-Object {
         -not [string]::IsNullOrWhiteSpace($_.CommandLine) -and
         $_.CommandLine.IndexOf($packageFull, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
-        ($_.Name -eq "PromptCompressor.exe" -or $_.Name -eq "msedgewebview2.exe")
+        ($desktopExecutableNames -contains $_.Name -or $_.Name -eq "msedgewebview2.exe")
     }
 
-    $desktopProcesses = $processes | Where-Object { $_.Name -eq "PromptCompressor.exe" }
+    $desktopProcesses = $processes | Where-Object { $desktopExecutableNames -contains $_.Name }
     foreach ($process in $desktopProcesses) {
         Write-Host "Stopping running packaged app process: $($process.ProcessId)"
         Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
@@ -254,7 +255,7 @@ function Test-PackagedLocalModelCompression {
     )
 
     Write-Host "Running packaged local model compression smoke test..."
-    $packagedExe = Join-Path $PackagePath "PromptCompressor.exe"
+    $packagedExe = Join-Path $PackagePath "TrimPrompt.exe"
     $resultPath = Join-Path $PackagePath "application\local\state\package-smoke-result.json"
     if (-not (Test-Path -LiteralPath $packagedExe -PathType Leaf)) {
         throw "Packaged executable is missing: $packagedExe"
@@ -434,10 +435,10 @@ if (Test-Path (Join-Path $projectRoot "README.md")) {
 }
 
 $manifest = @"
-Prompt Compressor desktop package
+TrimPrompt desktop package
 
 Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-Executable: PromptCompressor.exe
+Executable: TrimPrompt.exe
 Default profile: $defaultProfile
 Model: downloaded from Hugging Face on first launch to application/$modelPath
 Runtime: $runtimeManifest

@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Prompt Compressor</title>
+    <title>TrimPrompt</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -42,7 +42,7 @@
     <main class="app-shell">
       <header class="topbar">
         <div class="topbar-brand">
-          <h1>Prompt Compressor</h1>
+          <h1>TrimPrompt</h1>
           <p
             class="current-settings"
             id="settingsSummary"
@@ -53,8 +53,14 @@
         </div>
         <div class="topbar-actions">
           <div class="status-group" aria-label="状態">
-            <div class="status-pill" id="modelStatus" aria-live="polite">モデル: 待機中</div>
-            <div class="status-pill" id="workStatus" aria-live="polite">作業: 入力待ち</div>
+            <div class="status-pill" id="modelStatus" aria-live="polite">
+              <span class="status-label">モデル:</span>
+              <span class="status-text">待機中</span>
+            </div>
+            <div class="status-pill" id="workStatus" aria-live="polite">
+              <span class="status-label">作業:</span>
+              <span class="status-text">入力待ち</span>
+            </div>
           </div>
           <button
             class="icon-button settings-trigger"
@@ -70,7 +76,6 @@
           <div class="settings-menu" id="settingsMenu" hidden>
             <div class="settings-menu-head">
               <h2>設定</h2>
-              <p>モデル、圧縮モード、表示</p>
             </div>
             <div class="settings-grid" aria-label="Compression settings">
               <label>
@@ -142,7 +147,7 @@
                   <option value="logs">障害ログの調査</option>
                 </select>
                 <button class="secondary" id="clearInputButton" type="button">クリア</button>
-                <button id="compressButton" type="button">圧縮する</button>
+                <button id="compressButton" type="button">圧縮</button>
               </div>
             </div>
             <textarea
@@ -172,7 +177,7 @@
           <aside class="result-panel">
             <div class="metric-grid">
               <div class="metric">
-                <span>トークン（推定）</span>
+                <span>推定トークン</span>
                 <strong id="tokenComparison">-</strong>
                 <small id="tokenRatioValue">-</small>
               </div>

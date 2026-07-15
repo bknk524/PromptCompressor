@@ -1,8 +1,8 @@
-# Prompt Compressor Project Instructions
+# TrimPrompt Project Instructions
 
 ## Project summary
 
-Prompt Compressor is a local-first prompt compression layer for Codex-oriented workflows.
+TrimPrompt is a local-first prompt compression layer for Codex-oriented workflows.
 
 The near-term goal is to compress long natural-language coding requests into shorter,
 safer, structured prompts before they are sent to Codex.

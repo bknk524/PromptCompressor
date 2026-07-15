@@ -198,7 +198,7 @@ fn download_from_hugging_face(
     let client = HFClient::builder()
         .endpoint("https://huggingface.co")
         .cache_enabled(false)
-        .user_agent("PromptCompressor/0.1")
+        .user_agent("TrimPrompt/0.1")
         .retry_max_attempts(3)
         .build_sync()
         .map_err(hugging_face_error)?;
@@ -784,7 +784,7 @@ mod tests {
         let bytes = HFClient::builder()
             .endpoint("https://huggingface.co")
             .cache_enabled(false)
-            .user_agent("PromptCompressor/0.1-test")
+            .user_agent("TrimPrompt/0.1-test")
             .build_sync()
             .expect("Hugging Face client should be created")
             .model("mmnga", "sarashina2.2-3b-instruct-v0.1-gguf")

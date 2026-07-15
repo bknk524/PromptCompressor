@@ -1,12 +1,12 @@
-# Codex Project Reference: Prompt Compressor
+# Codex Project Reference: TrimPrompt
 
-このファイルは、Codex の新しいプロジェクトとして Prompt Compressor を始めるための参照元です。
+このファイルは、Codex の新しいプロジェクトとして TrimPrompt を始めるための参照元です。
 
 新しい Codex プロジェクトでは、まずこのファイルと `AGENTS.md` を読んでください。
 
 ## 1. プロジェクト概要
 
-Prompt Compressor は、Codex に送る前の長い依頼文を、ローカル LLM で短く安全な実行プロンプトへ整えるアプリです。
+TrimPrompt は、Codex に送る前の長い依頼文を、ローカル LLM で短く安全な実行プロンプトへ整えるアプリです。
 
 初期フォーカス:
 
@@ -223,7 +223,7 @@ Runtime:
 新しい Codex プロジェクトでは、最初に次の指示を使う。
 
 ```text
-このプロジェクトは Prompt Compressor です。
+このプロジェクトは TrimPrompt です。
 
 まず AGENTS.md と 資料\企画資料\Codex用プロジェクト参照.md を読み、資料\企画資料\進捗状況.md と 資料\企画資料\作業リスト.md で現在地を確認してください。
 
