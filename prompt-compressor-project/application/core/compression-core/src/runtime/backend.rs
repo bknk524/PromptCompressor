@@ -1,15 +1,18 @@
 use std::collections::{hash_map::DefaultHasher, BTreeMap};
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::compression::verifier::preserves_requested_numbers;
 use crate::config::profile::ProfileDefinition;
@@ -26,21 +29,25 @@ use super::model_download::{
 pub use super::model_download::{ModelDownloadCancellation, ModelDownloadProgress};
 use super::prompt_structure::PromptStructure;
 
-mod compression_cache;
+#[cfg(feature = "embedded-llama")]
+mod embedded_llama;
 mod http_client;
 mod openai_compatible;
 mod output_parser;
+mod thread_tuning;
 
-#[cfg(test)]
-use compression_cache::MAX_COMPRESSION_CACHE_ENTRIES;
-use compression_cache::{CompressionCacheKey, CompressionDraftCache};
+#[cfg(feature = "embedded-llama")]
+use embedded_llama as llama_cpp;
 use http_client::{http_json_request, parse_http_base_url};
 use openai_compatible::{request_openai_completion, resolve_lmstudio_model_name};
 #[cfg(feature = "embedded-llama")]
 use output_parser::first_complete_json_object_end;
 use output_parser::{output_snippet, parse_compression_output};
+#[cfg(test)]
+use thread_tuning::automatic_runtime_thread_counts;
+use thread_tuning::{parse_runtime_threads, RuntimeThreadCounts, ThreadTuningStore};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CompressionDraft {
     pub distilled_prompt: String,
     pub removed_content_summary: Vec<String>,
@@ -100,13 +107,6 @@ impl RuntimeCompressionObservation {
             final_draft,
             transformations: vec![RuntimeTransformation::RuntimeFallback],
         }
-    }
-
-    fn is_cacheable(&self) -> bool {
-        self.raw_model_draft.is_some()
-            && !self
-                .transformations
-                .contains(&RuntimeTransformation::RuntimeFallback)
     }
 }
 
@@ -168,7 +168,7 @@ pub struct ConfiguredRuntimeBackend {
     managed_runtimes: Arc<ManagedRuntimeManager>,
     embedded_models: Arc<EmbeddedModelManager>,
     model_files: Arc<ModelFileCoordinator>,
-    compression_cache: Arc<Mutex<CompressionDraftCache>>,
+    thread_tuning: Arc<ThreadTuningStore>,
 }
 
 #[derive(Debug, Default)]
@@ -268,6 +268,8 @@ struct EmbeddedModelManager {
     models: Mutex<BTreeMap<String, llama_cpp::LlamaModel>>,
     #[cfg(feature = "embedded-llama")]
     prepared_prompt_sessions: Mutex<BTreeMap<String, llama_cpp::LlamaSession>>,
+    #[cfg(feature = "embedded-llama")]
+    prepared_input_session: Mutex<Option<(String, llama_cpp::LlamaSession)>>,
 }
 
 impl std::fmt::Debug for EmbeddedModelManager {
@@ -281,8 +283,14 @@ impl std::fmt::Debug for EmbeddedModelManager {
                 .lock()
                 .map(|sessions| sessions.len())
                 .unwrap_or(0);
+            let prepared_input = self
+                .prepared_input_session
+                .lock()
+                .map(|session| session.is_some())
+                .unwrap_or(false);
             debug.field("model_count", &model_count);
             debug.field("prepared_prompt_count", &prepared_prompt_count);
+            debug.field("prepared_input", &prepared_input);
         }
         debug.finish()
     }
@@ -312,6 +320,7 @@ const MAX_PREPARED_PROMPT_SESSIONS: usize = 3;
 impl EmbeddedModelManager {
     #[cfg(feature = "embedded-llama")]
     fn load_or_get(&self, cache_key: &str, model_path: &Path) -> Result<llama_cpp::LlamaModel> {
+        ensure_embedded_cpu_engine_is_supported()?;
         let mut models = self.models.lock().map_err(|_| {
             CompressionError::Runtime("embedded model registry is unavailable".into())
         })?;
@@ -320,14 +329,13 @@ impl EmbeddedModelManager {
             return Ok(model.clone());
         }
 
-        let loaded =
-            llama_cpp::LlamaModel::load_from_file(model_path, llama_cpp::LlamaParams::default())
-                .map_err(|error| {
-                    CompressionError::Runtime(format!(
-                        "failed to load embedded llama.cpp model at {}: {error}",
-                        model_path.display()
-                    ))
-                })?;
+        let loaded = llama_cpp::LlamaModel::load_from_file(model_path, llama_cpp::LlamaParams)
+            .map_err(|error| {
+                CompressionError::Runtime(format!(
+                    "failed to load embedded llama.cpp model at {}: {error}",
+                    model_path.display()
+                ))
+            })?;
 
         models.insert(cache_key.to_string(), loaded.clone());
         Ok(loaded)
@@ -394,6 +402,105 @@ impl EmbeddedModelManager {
         })?;
         self.store_prepared_session(cache_key, prepared)
     }
+
+    #[cfg(feature = "embedded-llama")]
+    fn has_prepared_input_session(&self, cache_key: &str) -> Result<bool> {
+        let prepared = self.prepared_input_session.lock().map_err(|_| {
+            CompressionError::Runtime("embedded input session cache is unavailable".into())
+        })?;
+        Ok(prepared
+            .as_ref()
+            .is_some_and(|(stored_key, _)| stored_key == cache_key))
+    }
+
+    #[cfg(feature = "embedded-llama")]
+    fn take_prepared_input_session(
+        &self,
+        cache_key: &str,
+    ) -> Result<Option<llama_cpp::LlamaSession>> {
+        let mut prepared = self.prepared_input_session.lock().map_err(|_| {
+            CompressionError::Runtime("embedded input session cache is unavailable".into())
+        })?;
+        Ok(take_matching_prepared_value(&mut prepared, cache_key))
+    }
+
+    #[cfg(feature = "embedded-llama")]
+    fn store_prepared_input_session(
+        &self,
+        cache_key: String,
+        prepared_session: llama_cpp::LlamaSession,
+    ) -> Result<()> {
+        let mut prepared = self.prepared_input_session.lock().map_err(|_| {
+            CompressionError::Runtime("embedded input session cache is unavailable".into())
+        })?;
+        *prepared = Some((cache_key, prepared_session));
+        Ok(())
+    }
+}
+
+#[cfg(all(
+    feature = "embedded-llama-avx512",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+fn ensure_embedded_cpu_engine_is_supported() -> Result<()> {
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma")
+        && std::arch::is_x86_feature_detected!("f16c")
+        && std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512cd")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512dq")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+    {
+        return Ok(());
+    }
+
+    Err(CompressionError::Runtime(
+        "this build requires AVX512F, AVX512CD, AVX512BW, AVX512DQ, and AVX512VL; use the AVX2 or compatible CPU engine".into(),
+    ))
+}
+
+#[cfg(all(
+    not(feature = "embedded-llama-avx512"),
+    feature = "embedded-llama-avx2",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+fn ensure_embedded_cpu_engine_is_supported() -> Result<()> {
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma")
+        && std::arch::is_x86_feature_detected!("f16c")
+    {
+        return Ok(());
+    }
+
+    Err(CompressionError::Runtime(
+        "this build requires AVX2, FMA, and F16C; use the compatible CPU engine".into(),
+    ))
+}
+
+#[cfg(not(all(
+    any(feature = "embedded-llama-avx2", feature = "embedded-llama-avx512"),
+    any(target_arch = "x86", target_arch = "x86_64"),
+    any(
+        feature = "embedded-llama-avx512",
+        all(
+            not(feature = "embedded-llama-avx512"),
+            feature = "embedded-llama-avx2"
+        )
+    )
+)))]
+fn ensure_embedded_cpu_engine_is_supported() -> Result<()> {
+    Ok(())
+}
+
+fn take_matching_prepared_value<T>(prepared: &mut Option<(String, T)>, key: &str) -> Option<T> {
+    if !prepared
+        .as_ref()
+        .is_some_and(|(stored_key, _)| stored_key == key)
+    {
+        return None;
+    }
+    prepared.take().map(|(_, value)| value)
 }
 
 impl Drop for ManagedRuntimeManager {
@@ -420,10 +527,12 @@ impl ConfiguredRuntimeBackend {
             })?
             .to_path_buf();
 
+        let prompts_dir = project_root.join("resources").join("prompts");
+        let models = ModelRegistry::from_path(settings_dir.join("model-catalog.yaml"))?;
         Ok(Self {
             project_root: project_root.clone(),
-            prompts_dir: project_root.join("resources").join("prompts"),
-            models: ModelRegistry::from_path(settings_dir.join("model-catalog.yaml"))?,
+            prompts_dir,
+            models,
             runtimes: RuntimeRegistry::from_path(settings_dir.join("runtime-backends.yaml"))?,
             prompt_profiles: PromptProfileRegistry::from_path(
                 settings_dir
@@ -433,7 +542,12 @@ impl ConfiguredRuntimeBackend {
             managed_runtimes: Arc::new(ManagedRuntimeManager::default()),
             embedded_models: Arc::new(EmbeddedModelManager::default()),
             model_files: Arc::new(ModelFileCoordinator::default()),
-            compression_cache: Arc::new(Mutex::new(CompressionDraftCache::default())),
+            thread_tuning: Arc::new(ThreadTuningStore::new(
+                project_root
+                    .join("local")
+                    .join("state")
+                    .join("inference-tuning-v1"),
+            )),
         })
     }
 
@@ -493,6 +607,52 @@ impl ConfiguredRuntimeBackend {
         }
     }
 
+    pub fn tune_profile_threads(
+        &self,
+        profile: &ProfileDefinition,
+        cancellation: &AtomicBool,
+    ) -> Result<bool> {
+        let (model, runtime) = self.resolve_model_and_runtime(profile)?;
+        match (runtime.backend_kind.as_str(), &runtime.launch_mode) {
+            ("llama.cpp", RuntimeLaunchMode::Embedded) => {
+                self.require_model_file(model, &runtime.id)?;
+                self.tune_embedded_llama_threads(model, runtime, cancellation)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub fn reset_profile_thread_tuning(&self, profile: &ProfileDefinition) -> Result<bool> {
+        let (model, runtime) = self.resolve_model_and_runtime(profile)?;
+        match (runtime.backend_kind.as_str(), &runtime.launch_mode) {
+            ("llama.cpp", RuntimeLaunchMode::Embedded) => {
+                let model_path = self.resolve_model_file_path(model, &runtime.id)?;
+                self.thread_tuning.reset(model, &model_path, runtime)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub fn profile_thread_tuning_required(&self, profile: &ProfileDefinition) -> Result<bool> {
+        let (model, runtime) = self.resolve_model_and_runtime(profile)?;
+        match (runtime.backend_kind.as_str(), &runtime.launch_mode) {
+            ("llama.cpp", RuntimeLaunchMode::Embedded) => {
+                let model_path = self.resolve_model_file_path(model, &runtime.id)?;
+                self.thread_tuning.is_required(model, &model_path, runtime)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub fn profile_supports_embedded_cpu_tuning(
+        &self,
+        profile: &ProfileDefinition,
+    ) -> Result<bool> {
+        let (_, runtime) = self.resolve_model_and_runtime(profile)?;
+        Ok(runtime.backend_kind == "llama.cpp"
+            && matches!(runtime.launch_mode, RuntimeLaunchMode::Embedded))
+    }
+
     pub fn install_profile_with_progress(
         &self,
         profile: &ProfileDefinition,
@@ -534,8 +694,11 @@ impl ConfiguredRuntimeBackend {
 
         let (model, runtime) = self.resolve_model_and_runtime(profile)?;
         match (runtime.backend_kind.as_str(), &runtime.launch_mode) {
-            ("llama.cpp", RuntimeLaunchMode::Embedded) => {
+            ("llama.cpp", RuntimeLaunchMode::Embedded) if request.input_text.trim().is_empty() => {
                 self.prepare_embedded_llama_prompt_prefix(request, profile, model, runtime)
+            }
+            ("llama.cpp", RuntimeLaunchMode::Embedded) => {
+                self.prepare_embedded_llama_input(request, profile, model, runtime)
             }
             _ => Ok(false),
         }
@@ -686,6 +849,54 @@ impl ConfiguredRuntimeBackend {
             .map(|_| ())
     }
 
+    #[cfg(feature = "embedded-llama")]
+    fn resolve_embedded_thread_counts(
+        &self,
+        model: &ModelDefinition,
+        model_path: &Path,
+        runtime: &RuntimeDefinition,
+    ) -> Result<RuntimeThreadCounts> {
+        let threads = match self.thread_tuning.resolve(model, model_path, runtime) {
+            Ok(threads) => threads,
+            Err(error) => {
+                eprintln!("embedded thread tuning is unavailable: {error}");
+                parse_runtime_threads(runtime)?
+            }
+        };
+        trace_runtime_value("embedded.generation_threads", threads.generation as usize);
+        trace_runtime_value("embedded.batch_threads", threads.batch as usize);
+        Ok(threads)
+    }
+
+    #[cfg(feature = "embedded-llama")]
+    fn tune_embedded_llama_threads(
+        &self,
+        model: &ModelDefinition,
+        runtime: &RuntimeDefinition,
+        cancellation: &AtomicBool,
+    ) -> Result<bool> {
+        let model_path = self.resolve_model_file_path(model, &runtime.id)?;
+        let cache_key = embedded_model_cache_key(model, &model_path);
+        let llama_model = self.embedded_models.load_or_get(&cache_key, &model_path)?;
+        self.thread_tuning
+            .tune(&llama_model, model, &model_path, runtime, || {
+                cancellation.load(Ordering::Relaxed)
+            })
+    }
+
+    #[cfg(not(feature = "embedded-llama"))]
+    fn tune_embedded_llama_threads(
+        &self,
+        _model: &ModelDefinition,
+        runtime: &RuntimeDefinition,
+        _cancellation: &AtomicBool,
+    ) -> Result<bool> {
+        Err(CompressionError::InvalidConfig(format!(
+            "runtime '{}' uses embedded llama.cpp, but this build was compiled without the 'embedded-llama' feature",
+            runtime.id
+        )))
+    }
+
     #[cfg(not(feature = "embedded-llama"))]
     fn preload_embedded_llama_model(
         &self,
@@ -716,7 +927,26 @@ impl ConfiguredRuntimeBackend {
         let model_path = self.resolve_model_file_path(model, &runtime.id)?;
         let model_cache_key = embedded_model_cache_key(model, &model_path);
         let prompt_prefix = format_embedded_llama_prompt_prefix(&prompt_parts.prefix);
-        let prompt_cache_key = embedded_prompt_cache_key(model, &model_path, &prompt_prefix);
+        let model_started_at = Instant::now();
+        let llama_model = self
+            .embedded_models
+            .load_or_get(&model_cache_key, &model_path)?;
+        trace_runtime_timing(
+            "embedded.prepare_model_load_or_cache",
+            model_started_at.elapsed(),
+        );
+        let threads = self.resolve_embedded_thread_counts(model, &model_path, runtime)?;
+        let max_tokens = effective_max_output_tokens(request, model) as usize;
+        let context_length = select_embedded_context_length(
+            &llama_model,
+            &prompt_prefix,
+            "",
+            max_tokens,
+            model.context_length as usize,
+        )?;
+        trace_runtime_value("embedded.selected_context", context_length as usize);
+        let prompt_cache_key =
+            embedded_prompt_cache_key(model, &model_path, context_length, threads, &prompt_prefix);
         if self
             .embedded_models
             .has_prepared_session(&prompt_cache_key)?
@@ -727,18 +957,9 @@ impl ConfiguredRuntimeBackend {
         }
 
         trace_runtime_value("embedded.prepare_prompt_cache_hit", 0);
-        let model_started_at = Instant::now();
-        let llama_model = self
-            .embedded_models
-            .load_or_get(&model_cache_key, &model_path)?;
-        trace_runtime_timing(
-            "embedded.prepare_model_load_or_cache",
-            model_started_at.elapsed(),
-        );
-
         let session_started_at = Instant::now();
         let mut session = llama_model
-            .create_session(embedded_session_params(model, runtime)?)
+            .create_session(embedded_session_params(context_length, threads))
             .map_err(|error| {
                 CompressionError::Runtime(format!(
                     "failed to create prepared embedded llama.cpp session for '{}': {error}",
@@ -773,8 +994,147 @@ impl ConfiguredRuntimeBackend {
         Ok(true)
     }
 
+    #[cfg(feature = "embedded-llama")]
+    fn prepare_embedded_llama_input(
+        &self,
+        request: &CompressionRequest,
+        profile: &ProfileDefinition,
+        model: &ModelDefinition,
+        runtime: &RuntimeDefinition,
+    ) -> Result<bool> {
+        self.preload_embedded_llama_model(model, runtime)?;
+        let total_started_at = Instant::now();
+        let prompt_parts = self.build_prompt_parts(request, profile, model)?;
+        let model_path = self.resolve_model_file_path(model, &runtime.id)?;
+        let model_cache_key = embedded_model_cache_key(model, &model_path);
+        let use_prompt_cache = !prompt_parts.prefix.trim().is_empty();
+        let (embedded_prefix, embedded_suffix) = if use_prompt_cache {
+            let prefix = format_embedded_llama_prompt_prefix(&prompt_parts.prefix);
+            (
+                prefix,
+                format_embedded_llama_prompt_suffix(&prompt_parts.suffix),
+            )
+        } else {
+            (
+                String::new(),
+                format_embedded_llama_prompt(&prompt_parts.combined()),
+            )
+        };
+        let model_started_at = Instant::now();
+        let llama_model = self
+            .embedded_models
+            .load_or_get(&model_cache_key, &model_path)?;
+        trace_runtime_timing(
+            "embedded.prepare_input_model_load_or_cache",
+            model_started_at.elapsed(),
+        );
+        let threads = self.resolve_embedded_thread_counts(model, &model_path, runtime)?;
+        let max_tokens = effective_max_output_tokens(request, model) as usize;
+        let context_length = select_embedded_context_length(
+            &llama_model,
+            &embedded_prefix,
+            &embedded_suffix,
+            max_tokens,
+            model.context_length as usize,
+        )?;
+        trace_runtime_value("embedded.selected_context", context_length as usize);
+        let prompt_cache_key = use_prompt_cache.then(|| {
+            embedded_prompt_cache_key(
+                model,
+                &model_path,
+                context_length,
+                threads,
+                &embedded_prefix,
+            )
+        });
+        let input_cache_key = embedded_input_cache_key(
+            model,
+            &model_path,
+            context_length,
+            threads,
+            &embedded_prefix,
+            &embedded_suffix,
+        );
+        if self
+            .embedded_models
+            .has_prepared_input_session(&input_cache_key)?
+        {
+            trace_runtime_value("embedded.prepare_input_cache_hit", 1);
+            trace_runtime_timing("embedded.prepare_input_total", total_started_at.elapsed());
+            return Ok(true);
+        }
+        trace_runtime_value("embedded.prepare_input_cache_hit", 0);
+
+        let mut session = if let Some(prompt_cache_key) = prompt_cache_key.as_deref() {
+            if let Some(session) = self
+                .embedded_models
+                .get_prepared_session(prompt_cache_key)?
+            {
+                session
+            } else {
+                let mut session = llama_model
+                    .create_session(embedded_session_params(context_length, threads))
+                    .map_err(|error| {
+                        CompressionError::Runtime(format!(
+                            "failed to create prepared embedded llama.cpp session for '{}': {error}",
+                            model.id
+                        ))
+                    })?;
+                session
+                    .advance_context(embedded_prefix.as_bytes())
+                    .map_err(|error| {
+                        CompressionError::Runtime(format!(
+                            "failed to prepare prompt prefix for embedded llama.cpp model '{}': {error}",
+                            model.id
+                        ))
+                    })?;
+                self.embedded_models
+                    .store_prepared_session_copy(prompt_cache_key.to_string(), &session)?;
+                session
+            }
+        } else {
+            llama_model
+                .create_session(embedded_session_params(context_length, threads))
+                .map_err(|error| {
+                    CompressionError::Runtime(format!(
+                        "failed to create prepared embedded llama.cpp session for '{}': {error}",
+                        model.id
+                    ))
+                })?
+        };
+
+        let feed_started_at = Instant::now();
+        session
+            .advance_context(embedded_suffix.as_bytes())
+            .map_err(|error| {
+                CompressionError::Runtime(format!(
+                    "failed to prepare input for embedded llama.cpp model '{}': {error}",
+                    model.id
+                ))
+            })?;
+        trace_runtime_timing("embedded.prepare_input_eval", feed_started_at.elapsed());
+        self.embedded_models
+            .store_prepared_input_session(input_cache_key, session)?;
+        trace_runtime_timing("embedded.prepare_input_total", total_started_at.elapsed());
+        Ok(true)
+    }
+
     #[cfg(not(feature = "embedded-llama"))]
     fn prepare_embedded_llama_prompt_prefix(
+        &self,
+        _request: &CompressionRequest,
+        _profile: &ProfileDefinition,
+        _model: &ModelDefinition,
+        runtime: &RuntimeDefinition,
+    ) -> Result<bool> {
+        Err(CompressionError::InvalidConfig(format!(
+            "runtime '{}' uses embedded llama.cpp, but this build was compiled without the 'embedded-llama' feature",
+            runtime.id
+        )))
+    }
+
+    #[cfg(not(feature = "embedded-llama"))]
+    fn prepare_embedded_llama_input(
         &self,
         _request: &CompressionRequest,
         _profile: &ProfileDefinition,
@@ -850,22 +1210,20 @@ impl ConfiguredRuntimeBackend {
         let model_started_at = Instant::now();
         let llama_model = self.embedded_models.load_or_get(&cache_key, &model_path)?;
         trace_runtime_timing("embedded.model_load_or_cache", model_started_at.elapsed());
+        let threads = self.resolve_embedded_thread_counts(model, &model_path, runtime)?;
 
         let prompt_started_at = Instant::now();
         let use_prompt_cache = allow_prompt_cache && !prompt_parts.prefix.trim().is_empty();
-        let (embedded_prefix, embedded_suffix, prompt_cache_key) = if use_prompt_cache {
+        let (embedded_prefix, embedded_suffix) = if use_prompt_cache {
             let prefix = format_embedded_llama_prompt_prefix(&prompt_parts.prefix);
-            let cache_key = embedded_prompt_cache_key(model, &model_path, &prefix);
             (
                 prefix,
                 format_embedded_llama_prompt_suffix(&prompt_parts.suffix),
-                Some(cache_key),
             )
         } else {
             (
                 String::new(),
                 format_embedded_llama_prompt(&prompt_parts.combined()),
-                None,
             )
         };
         trace_runtime_timing("embedded.prompt_format", prompt_started_at.elapsed());
@@ -874,16 +1232,45 @@ impl ConfiguredRuntimeBackend {
             embedded_prefix.len() + embedded_suffix.len(),
         );
         let max_tokens = effective_max_output_tokens(request, model) as usize;
-        ensure_embedded_prompt_fits_context(
+        let context_length = select_embedded_context_length(
             &llama_model,
             &embedded_prefix,
             &embedded_suffix,
             max_tokens,
             model.context_length as usize,
         )?;
+        trace_runtime_value("embedded.selected_context", context_length as usize);
+        let prompt_cache_key = use_prompt_cache.then(|| {
+            embedded_prompt_cache_key(
+                model,
+                &model_path,
+                context_length,
+                threads,
+                &embedded_prefix,
+            )
+        });
+        let input_cache_key = embedded_input_cache_key(
+            model,
+            &model_path,
+            context_length,
+            threads,
+            &embedded_prefix,
+            &embedded_suffix,
+        );
 
         let mut prompt_prefix_eval_elapsed = Duration::ZERO;
-        let (mut session, prompt_cache_hit) = if let Some(cache_key) = prompt_cache_key.as_deref() {
+        let prepared_input_started_at = Instant::now();
+        let prepared_input = self
+            .embedded_models
+            .take_prepared_input_session(&input_cache_key)?;
+        let input_cache_hit = prepared_input.is_some();
+        trace_runtime_timing(
+            "embedded.input_session_restore",
+            prepared_input_started_at.elapsed(),
+        );
+        let (mut session, prompt_cache_hit) = if let Some(session) = prepared_input {
+            (session, true)
+        } else if let Some(cache_key) = prompt_cache_key.as_deref() {
             let restore_started_at = Instant::now();
             if let Some(session) = self.embedded_models.get_prepared_session(cache_key)? {
                 trace_runtime_timing("embedded.session_restore", restore_started_at.elapsed());
@@ -891,7 +1278,7 @@ impl ConfiguredRuntimeBackend {
             } else {
                 let session_started_at = Instant::now();
                 let mut session = llama_model
-                    .create_session(embedded_session_params(model, runtime)?)
+                    .create_session(embedded_session_params(context_length, threads))
                     .map_err(|error| {
                         CompressionError::Runtime(format!(
                             "failed to create embedded llama.cpp session for '{}': {error}",
@@ -918,7 +1305,7 @@ impl ConfiguredRuntimeBackend {
         } else {
             let session_started_at = Instant::now();
             let session = llama_model
-                .create_session(embedded_session_params(model, runtime)?)
+                .create_session(embedded_session_params(context_length, threads))
                 .map_err(|error| {
                     CompressionError::Runtime(format!(
                         "failed to create embedded llama.cpp session for '{}': {error}",
@@ -929,17 +1316,22 @@ impl ConfiguredRuntimeBackend {
             (session, false)
         };
         trace_runtime_value("embedded.prompt_cache_hit", usize::from(prompt_cache_hit));
+        trace_runtime_value("embedded.input_cache_hit", usize::from(input_cache_hit));
 
-        let suffix_started_at = Instant::now();
-        session
-            .advance_context(embedded_suffix.as_bytes())
-            .map_err(|error| {
-                CompressionError::Runtime(format!(
-                    "failed to feed prompt to embedded llama.cpp model '{}': {error}",
-                    model.id
-                ))
-            })?;
-        let suffix_elapsed = suffix_started_at.elapsed();
+        let suffix_elapsed = if input_cache_hit {
+            Duration::ZERO
+        } else {
+            let suffix_started_at = Instant::now();
+            session
+                .advance_context(embedded_suffix.as_bytes())
+                .map_err(|error| {
+                    CompressionError::Runtime(format!(
+                        "failed to feed prompt to embedded llama.cpp model '{}': {error}",
+                        model.id
+                    ))
+                })?;
+            suffix_started_at.elapsed()
+        };
         trace_runtime_timing("embedded.prompt_suffix_eval", suffix_elapsed);
         trace_runtime_timing(
             "embedded.prompt_eval",
@@ -1282,24 +1674,8 @@ impl RuntimeBackend for ConfiguredRuntimeBackend {
         request: &CompressionRequest,
         profile: &ProfileDefinition,
     ) -> Result<CompressionDraft> {
-        let cache_key = CompressionCacheKey::new(request, profile);
-        if let Ok(mut cache) = self.compression_cache.lock() {
-            if let Some(draft) = cache.get(&cache_key) {
-                trace_runtime_value("compression_result_cache_hit", 1);
-                return Ok(draft);
-            }
-        }
-        trace_runtime_value("compression_result_cache_hit", 0);
-
-        let observation = self.compress_observed_configured(request, profile)?;
-        let should_cache = observation.is_cacheable();
-        let draft = observation.final_draft;
-        if should_cache {
-            if let Ok(mut cache) = self.compression_cache.lock() {
-                cache.insert(cache_key, draft.clone());
-            }
-        }
-        Ok(draft)
+        self.compress_observed_configured(request, profile)
+            .map(|observation| observation.final_draft)
     }
 
     fn compress_observed(
@@ -1591,43 +1967,6 @@ fn trim_after_stop_marker(output: &str) -> &str {
         .unwrap_or(output)
 }
 
-const MAX_AUTOMATIC_RUNTIME_THREADS: usize = 8;
-
-fn automatic_runtime_thread_count(available_threads: usize) -> u32 {
-    let reserved_threads = match available_threads {
-        0 | 1 => 0,
-        _ => 1,
-    };
-
-    available_threads
-        .saturating_sub(reserved_threads)
-        .clamp(1, MAX_AUTOMATIC_RUNTIME_THREADS) as u32
-}
-
-fn parse_runtime_threads(runtime: &RuntimeDefinition) -> Result<u32> {
-    if runtime.threads.eq_ignore_ascii_case("auto") {
-        let available_threads = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1);
-        return Ok(automatic_runtime_thread_count(available_threads));
-    }
-
-    let threads = runtime.threads.parse::<u32>().map_err(|error| {
-        CompressionError::InvalidConfig(format!(
-            "runtime '{}' has invalid threads value '{}': {error}",
-            runtime.id, runtime.threads
-        ))
-    })?;
-    if threads == 0 {
-        return Err(CompressionError::InvalidConfig(format!(
-            "runtime '{}' threads must be greater than zero",
-            runtime.id
-        )));
-    }
-
-    Ok(threads)
-}
-
 fn embedded_model_cache_key(model: &ModelDefinition, model_path: &Path) -> String {
     format!("{}:{}", model.id, model_path.display())
 }
@@ -1647,33 +1986,60 @@ fn trace_model_prompt(stage: &str, prompt: &str) {
 fn embedded_prompt_cache_key(
     model: &ModelDefinition,
     model_path: &Path,
+    context_length: u32,
+    threads: RuntimeThreadCounts,
     embedded_prompt_prefix: &str,
 ) -> String {
     let mut hasher = DefaultHasher::new();
     embedded_prompt_prefix.hash(&mut hasher);
     format!(
-        "{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}",
         model.id,
         model_path.display(),
-        model.context_length,
+        context_length,
+        threads.generation,
+        threads.batch,
         hasher.finish()
+    )
+}
+
+fn embedded_input_cache_key(
+    model: &ModelDefinition,
+    model_path: &Path,
+    context_length: u32,
+    threads: RuntimeThreadCounts,
+    embedded_prompt_prefix: &str,
+    embedded_prompt_suffix: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((embedded_prompt_prefix.len() as u64).to_le_bytes());
+    hasher.update(embedded_prompt_prefix.as_bytes());
+    hasher.update(embedded_prompt_suffix.as_bytes());
+    let digest = hasher.finalize();
+    let mut digest_hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut digest_hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    format!(
+        "{}:{}:{}:{}:{}:input:{digest_hex}",
+        model.id,
+        model_path.display(),
+        context_length,
+        threads.generation,
+        threads.batch
     )
 }
 
 #[cfg(feature = "embedded-llama")]
 fn embedded_session_params(
-    model: &ModelDefinition,
-    runtime: &RuntimeDefinition,
-) -> Result<llama_cpp::SessionParams> {
-    let mut session_params = llama_cpp::SessionParams {
-        n_ctx: model.context_length,
-        ..Default::default()
-    };
-    let threads = parse_runtime_threads(runtime)?;
-    session_params.n_threads = threads;
-    session_params.n_threads_batch = threads;
-
-    Ok(session_params)
+    context_length: u32,
+    threads: RuntimeThreadCounts,
+) -> llama_cpp::SessionParams {
+    llama_cpp::SessionParams {
+        n_ctx: context_length,
+        n_threads: threads.generation,
+        n_threads_batch: threads.batch,
+    }
 }
 
 fn effective_max_output_tokens(request: &CompressionRequest, model: &ModelDefinition) -> u32 {
@@ -1700,14 +2066,17 @@ fn effective_max_output_tokens(request: &CompressionRequest, model: &ModelDefini
         .max(32)
 }
 
+const EMBEDDED_CONTEXT_LENGTH_TIERS: [u32; 3] = [1_024, 2_048, 4_096];
+const CONTEXT_SAFETY_MARGIN: usize = 8;
+
 #[cfg(feature = "embedded-llama")]
-fn ensure_embedded_prompt_fits_context(
+fn select_embedded_context_length(
     llama_model: &llama_cpp::LlamaModel,
     prefix: &str,
     suffix: &str,
     max_output_tokens: usize,
-    context_length: usize,
-) -> Result<()> {
+    model_context_length: usize,
+) -> Result<u32> {
     let prefix_tokens = llama_model
         .tokenize_bytes(prefix.as_bytes(), false, true)
         .map_err(|error| {
@@ -1720,11 +2089,27 @@ fn ensure_embedded_prompt_fits_context(
             CompressionError::Runtime(format!("failed to tokenize prompt input: {error}"))
         })?
         .len();
-    validate_prompt_token_budget(
+    select_context_length_for_token_budget(
         prefix_tokens.saturating_add(suffix_tokens),
         max_output_tokens,
-        context_length,
+        model_context_length,
     )
+}
+
+fn select_context_length_for_token_budget(
+    prompt_tokens: usize,
+    max_output_tokens: usize,
+    model_context_length: usize,
+) -> Result<u32> {
+    validate_prompt_token_budget(prompt_tokens, max_output_tokens, model_context_length)?;
+    let required_tokens = prompt_tokens
+        .saturating_add(max_output_tokens)
+        .saturating_add(CONTEXT_SAFETY_MARGIN);
+    let selected = EMBEDDED_CONTEXT_LENGTH_TIERS
+        .into_iter()
+        .find(|tier| *tier as usize >= required_tokens && *tier as usize <= model_context_length)
+        .unwrap_or(model_context_length as u32);
+    Ok(selected)
 }
 
 fn validate_prompt_token_budget(
@@ -1732,7 +2117,6 @@ fn validate_prompt_token_budget(
     max_output_tokens: usize,
     context_length: usize,
 ) -> Result<()> {
-    const CONTEXT_SAFETY_MARGIN: usize = 8;
     let required_tokens = prompt_tokens
         .saturating_add(max_output_tokens)
         .saturating_add(CONTEXT_SAFETY_MARGIN);

@@ -28,6 +28,7 @@
     }
 
     promptInput.value = sample;
+    promptInput.dispatchEvent(new Event("input", { bubbles: true }));
     sampleSelect.value = "";
     promptInput.focus();
   });

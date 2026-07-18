@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "application/interfaces/cli",
+  "application/ui/launcher",
   "application/ui/desktop",
   "application/ui/web",
   "application/core/compression-core",
@@ -26,8 +27,11 @@ uuid = { version = "1.17.0", features = ["v4", "serde"] }
 
 # Local development runs the embedded CPU model too. Keep application code easy
 # to debug while avoiding an artificially slow inference library.
-[profile.dev.package.llama_cpp]
+[profile.dev.package.llama-cpp-4]
 opt-level = 3
 
-[profile.dev.package.llama_cpp_sys]
+[profile.dev.package.llama-cpp-sys-4]
 opt-level = 3
+
+[patch.crates-io]
+llama-cpp-sys-4 = { path = "application/vendor/llama-cpp-sys-4" }

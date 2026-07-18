@@ -3,7 +3,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -17,7 +18,7 @@ use anyhow::{Context, Result};
 use prompt_compressor_core::{
     CompressionConstraints, CompressionError, CompressionLevel, CompressionRequest,
     CompressionService, ConfiguredRuntimeBackend, ModelDownloadCancellation, ModelDownloadProgress,
-    ProfileRegistry, RequestSource, RequestTarget,
+    ProfileDefinition, ProfileRegistry, RequestSource, RequestTarget,
 };
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +50,16 @@ const MAX_CLIPBOARD_CHARS: usize = 100_000;
 const HTTP_WORKER_COUNT: usize = 4;
 const HTTP_QUEUE_CAPACITY: usize = 16;
 const INSTALL_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
+const CPU_ENGINE_SELECTION_SCHEMA_VERSION: u32 = 1;
+const CPU_ENGINE_MINIMUM_GAIN_PERCENT: u64 = 3;
+const CPU_ENGINE_SELECTION_FILE: &str = "cpu-engine-selection-v1.json";
+const CPU_ENGINE_PIPELINE_PROBE_INPUTS: [&str; 5] = [
+    "ReactとTypeScriptで検索フォームを修正してください。検索ボタンを押した時だけAPIを呼び、入力が空なら通信せずエラーを表示します。既存のキーボード操作とテストは維持し、変更したファイルと確認結果も示してください。",
+    "ユーザー登録APIに入力検証を追加してください。メールアドレスの形式とパスワード12文字以上を確認し、不正ならHTTP 400を返します。失敗時はデータベースへ書き込まず、正常系と異常系のテストを追加してください。",
+    "CSV取込処理を改善してください。最大10MB、UTF-8 BOM付きにも対応し、不正な行は行番号と理由を返してください。一部だけ保存せずトランザクションで処理し、既存の列名と数値精度は変えないでください。",
+    "CIの依存関係キャッシュを最適化してください。OS、ロックファイル、Rustのバージョンが変わった時だけ無効化し、キャッシュがなくても通常ビルドへ進めるようにします。シークレットをログへ出さないでください。",
+    "監視ログの集計を追加してください。5分単位でエラー件数と95パーセンタイルの応答時間を計算し、個人情報は保存前に除去します。処理が30秒を超えた場合は中断し、元データを削除しないでください。",
+];
 static SETTINGS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -123,6 +134,17 @@ impl EmbeddedWebApp {
         start_default_profile_warmup(self.state.clone());
     }
 
+    pub fn benchmark_default_cpu_engine(&self) -> Result<Option<u64>> {
+        let profile_id = self
+            .state
+            .registry
+            .default_profile_id()
+            .context("default profile is not configured")?;
+        let profile = self.state.registry.resolve(profile_id)?;
+        let cancellation = AtomicBool::new(false);
+        benchmark_cpu_engine_pipeline(profile, &self.state, &cancellation)
+    }
+
     pub fn handle_request(&self, method: &str, path: &str, body: &[u8]) -> LocalAppResponse {
         route_application_request(method, path, body, &self.state)
     }
@@ -137,6 +159,7 @@ pub struct LocalAppResponse {
 
 #[derive(Clone)]
 struct AppState {
+    application_root: PathBuf,
     registry: ProfileRegistry,
     backend: ConfiguredRuntimeBackend,
     service: Arc<CompressionService<ConfiguredRuntimeBackend>>,
@@ -144,6 +167,7 @@ struct AppState {
     ui_settings: PersistedUiSettings,
     inference_gate: InferenceGate,
     model_downloads: ModelDownloadControl,
+    runtime_tuning_cancellation: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Default)]
@@ -165,6 +189,30 @@ impl InferenceGate {
             Err(TryLockError::Poisoned(_)) => Err(InferenceGateError::Unavailable),
         }
     }
+
+    fn enter(&self) -> std::result::Result<std::sync::MutexGuard<'_, ()>, InferenceGateError> {
+        self.slot
+            .lock()
+            .map_err(|_| InferenceGateError::Unavailable)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CpuEngineProbeResult {
+    schema_version: u32,
+    build_id: String,
+    cpu_engine: String,
+    elapsed_micros: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedCpuEngineSelection {
+    schema_version: u32,
+    build_id: String,
+    cpu_key: String,
+    cpu_engine: String,
 }
 
 #[derive(Clone, Default)]
@@ -414,6 +462,13 @@ impl PersistedUiSettings {
                 "error": format!("failed to read UI settings: {error}")
             }),
         }
+    }
+
+    fn snapshot(&self) -> Result<UiSettings> {
+        self.settings
+            .lock()
+            .map(|settings| settings.clone())
+            .map_err(|error| anyhow::anyhow!("failed to read UI settings: {error}"))
     }
 
     fn save(&self, mut settings: UiSettings) -> Result<serde_json::Value> {
@@ -676,6 +731,7 @@ fn prepare_app_state(settings_dir: &Path) -> Result<Arc<AppState>> {
             .join("ui-settings.json"),
     );
     let state = Arc::new(AppState {
+        application_root: application_root.to_path_buf(),
         registry,
         backend,
         service,
@@ -683,18 +739,25 @@ fn prepare_app_state(settings_dir: &Path) -> Result<Arc<AppState>> {
         ui_settings,
         inference_gate: InferenceGate::default(),
         model_downloads: ModelDownloadControl::default(),
+        runtime_tuning_cancellation: Arc::new(AtomicBool::new(false)),
     });
     Ok(state)
 }
 
 fn start_default_profile_warmup(state: Arc<AppState>) {
-    let Some(profile_id) = state.registry.default_profile_id().map(str::to_owned) else {
-        state
-            .warmup
-            .set("skipped", None, "先読み対象の既定モデルがありません", None);
-        return;
+    let request = match startup_compression_request(&state.registry, &state.ui_settings) {
+        Ok(request) => request,
+        Err(error) => {
+            state.warmup.set(
+                "error",
+                None,
+                "起動時の圧縮設定を解決できません",
+                Some(error.to_string()),
+            );
+            return;
+        }
     };
-
+    let profile_id = request.profile.clone();
     let profile = match state.registry.resolve(&profile_id) {
         Ok(profile) => profile.clone(),
         Err(error) => {
@@ -717,6 +780,18 @@ fn start_default_profile_warmup(state: Arc<AppState>) {
 
     thread::spawn(move || {
         let profile_id = profile.id.clone();
+        let _inference_permit = match state.inference_gate.slot.lock() {
+            Ok(permit) => permit,
+            Err(error) => {
+                state.warmup.set(
+                    "error",
+                    Some(profile_id),
+                    "起動時準備を開始できません",
+                    Some(error.to_string()),
+                );
+                return;
+            }
+        };
         let status = match state.backend.profile_model_status(&profile) {
             Ok(status) => status,
             Err(error) => {
@@ -743,12 +818,34 @@ fn start_default_profile_warmup(state: Arc<AppState>) {
             None,
         );
         match state.backend.warm_profile(&profile) {
-            Ok(true) => state.warmup.set(
-                "ready",
-                Some(profile_id),
-                "アプリ内モデルは準備完了です",
-                None,
-            ),
+            Ok(true) => {
+                state.warmup.set(
+                    "loading",
+                    Some(profile_id.clone()),
+                    "保存済みの圧縮レベルを準備中",
+                    None,
+                );
+                match state.service.prepare(request) {
+                    Ok(true) => state.warmup.set(
+                        "ready",
+                        Some(profile_id),
+                        "アプリ内モデルは準備完了です",
+                        None,
+                    ),
+                    Ok(false) => state.warmup.set(
+                        "ready",
+                        Some(profile_id),
+                        "アプリ内モデルは準備完了です",
+                        None,
+                    ),
+                    Err(error) => state.warmup.set(
+                        "error",
+                        Some(profile_id),
+                        "圧縮プロンプトの準備に失敗しました",
+                        Some(error.to_string()),
+                    ),
+                }
+            }
             Ok(false) => state.warmup.set(
                 "skipped",
                 Some(profile_id),
@@ -763,6 +860,32 @@ fn start_default_profile_warmup(state: Arc<AppState>) {
             ),
         }
     });
+}
+
+fn startup_compression_request(
+    registry: &ProfileRegistry,
+    ui_settings: &PersistedUiSettings,
+) -> Result<CompressionRequest> {
+    let settings = ui_settings.snapshot()?;
+    let profile = settings
+        .profile
+        .filter(|profile| {
+            registry
+                .resolve(profile)
+                .is_ok_and(|definition| definition.selectable)
+        })
+        .or_else(|| registry.default_profile_id().map(str::to_owned))
+        .context("no selectable startup profile is available")?;
+    let level = settings.level.unwrap_or(2).clamp(2, 3);
+
+    Ok(CompressionRequest {
+        input_text: String::new(),
+        compression_level: CompressionLevel::from_u8(level)?,
+        profile,
+        constraints: CompressionConstraints::default(),
+        target: RequestTarget::codex_default(),
+        source: RequestSource::Desktop,
+    })
 }
 
 fn serve(
@@ -957,7 +1080,29 @@ fn route_application_request(
         ("POST", "/api/prepare-compression") => {
             run_inference_route(state, || prepare_compression_from_body(body, state))
         }
-        ("POST", "/api/compress") => run_inference_route(state, || compress_from_body(body, state)),
+        ("POST", "/api/prepare-input") => {
+            run_inference_route(state, || prepare_input_from_body(body, state))
+        }
+        ("POST", "/api/tune-runtime") => {
+            run_inference_route(state, || tune_runtime_from_body(body, state))
+        }
+        ("POST", "/api/runtime-setup-status") => {
+            match runtime_setup_status_from_body(body, state) {
+                Ok(value) => json_response(200, &value),
+                Err(error) => {
+                    json_response(400, &serde_json::json!({ "error": error.to_string() }))
+                }
+            }
+        }
+        ("POST", "/api/tune-runtime-reset") => {
+            state
+                .runtime_tuning_cancellation
+                .store(true, Ordering::Relaxed);
+            run_waiting_inference_route(state, || reset_runtime_tuning_from_body(body, state))
+        }
+        ("POST", "/api/compress") => {
+            run_waiting_inference_route(state, || compress_from_body(body, state))
+        }
         _ => json_response(
             404,
             &serde_json::json!({
@@ -973,8 +1118,11 @@ fn request_body_limit(path: &str) -> usize {
         | "/api/prepare-compression"
         | "/api/model-status"
         | "/api/model-install"
-        | "/api/model-cancel" => MAX_SETTINGS_BODY_BYTES,
-        "/api/clipboard" | "/api/compress" => MAX_REQUEST_BODY_BYTES,
+        | "/api/model-cancel"
+        | "/api/runtime-setup-status"
+        | "/api/tune-runtime"
+        | "/api/tune-runtime-reset" => MAX_SETTINGS_BODY_BYTES,
+        "/api/clipboard" | "/api/compress" | "/api/prepare-input" => MAX_REQUEST_BODY_BYTES,
         _ => MAX_SETTINGS_BODY_BYTES,
     }
 }
@@ -997,6 +1145,27 @@ fn run_inference_route(
                 &serde_json::json!({ "error": "compression gate is unavailable" }),
             );
         }
+    };
+
+    match operation() {
+        Ok(value) => json_response(200, &value),
+        Err(error) => json_response(400, &serde_json::json!({ "error": error.to_string() })),
+    }
+}
+
+fn run_waiting_inference_route(
+    state: &AppState,
+    operation: impl FnOnce() -> Result<serde_json::Value>,
+) -> LocalAppResponse {
+    let _permit = match state.inference_gate.enter() {
+        Ok(permit) => permit,
+        Err(InferenceGateError::Unavailable) => {
+            return json_response(
+                500,
+                &serde_json::json!({ "error": "compression gate is unavailable" }),
+            );
+        }
+        Err(InferenceGateError::Busy) => unreachable!("blocking inference entry cannot be busy"),
     };
 
     match operation() {
@@ -1259,6 +1428,383 @@ fn prepare_compression_from_body(body: &[u8], state: &AppState) -> Result<serde_
             Err(error.into())
         }
     }
+}
+
+fn prepare_input_from_body(body: &[u8], state: &AppState) -> Result<serde_json::Value> {
+    let payload: CompressPayload =
+        serde_json::from_slice(body).context("invalid JSON input prepare request")?;
+    validate_text_field("input_text", &payload.input_text, MAX_PROMPT_CHARS, false)?;
+    validate_text_field("profile", &payload.profile, MAX_PROFILE_CHARS, false)?;
+    let request = CompressionRequest {
+        input_text: payload.input_text,
+        compression_level: CompressionLevel::from_u8(payload.compression_level)
+            .context("invalid compression level")?,
+        profile: payload.profile,
+        constraints: payload.constraints.unwrap_or_default(),
+        target: RequestTarget::codex_default(),
+        source: RequestSource::Desktop,
+    };
+
+    let started_at = Instant::now();
+    let prepared = state.service.prepare(request)?;
+    Ok(serde_json::json!({
+        "prepared": prepared,
+        "elapsed_ms": started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+    }))
+}
+
+fn tune_runtime_from_body(body: &[u8], state: &AppState) -> Result<serde_json::Value> {
+    let payload: PrepareCompressionPayload =
+        serde_json::from_slice(body).context("invalid JSON runtime tuning request")?;
+    validate_text_field("profile", &payload.profile, MAX_PROFILE_CHARS, false)?;
+    CompressionLevel::from_u8(payload.compression_level).context("invalid compression level")?;
+    let profile = state.registry.resolve(&payload.profile)?;
+
+    state
+        .runtime_tuning_cancellation
+        .store(false, Ordering::Relaxed);
+    let started_at = Instant::now();
+    let tuned = state
+        .backend
+        .tune_profile_threads(profile, &state.runtime_tuning_cancellation)?;
+    let cpu_engine_tuned = if state.runtime_tuning_cancellation.load(Ordering::Relaxed)
+        || !state
+            .backend
+            .profile_supports_embedded_cpu_tuning(profile)?
+    {
+        false
+    } else {
+        match tune_cpu_engine_for_next_launch(profile, state) {
+            Ok(tuned) => tuned,
+            Err(error) => {
+                eprintln!("CPU engine tuning is unavailable: {error:#}");
+                false
+            }
+        }
+    };
+    let cancelled = state.runtime_tuning_cancellation.load(Ordering::Relaxed);
+    Ok(serde_json::json!({
+        "completed": !cancelled,
+        "tuned": tuned,
+        "cpu_engine_tuned": cpu_engine_tuned,
+        "restart_required": !cancelled && (tuned || cpu_engine_tuned),
+        "elapsed_ms": started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+    }))
+}
+
+fn runtime_setup_status_from_body(body: &[u8], state: &AppState) -> Result<serde_json::Value> {
+    let payload: PrepareCompressionPayload =
+        serde_json::from_slice(body).context("invalid JSON runtime setup status request")?;
+    validate_text_field("profile", &payload.profile, MAX_PROFILE_CHARS, false)?;
+    CompressionLevel::from_u8(payload.compression_level).context("invalid compression level")?;
+    let profile = state.registry.resolve(&payload.profile)?;
+    let model_status = state.backend.profile_model_status(profile)?;
+    let model_ready = !model_status.requires_install || model_status.installed;
+    if !model_ready {
+        return Ok(serde_json::json!({
+            "required": false,
+            "model_ready": false,
+            "thread_tuning_required": false,
+            "cpu_engine_tuning_required": false
+        }));
+    }
+
+    let thread_tuning_required = state.backend.profile_thread_tuning_required(profile)?;
+    let cpu_engine_tuning_required = state
+        .backend
+        .profile_supports_embedded_cpu_tuning(profile)?
+        && cpu_engine_tuning_required(&state.application_root);
+    Ok(serde_json::json!({
+        "required": thread_tuning_required || cpu_engine_tuning_required,
+        "model_ready": true,
+        "thread_tuning_required": thread_tuning_required,
+        "cpu_engine_tuning_required": cpu_engine_tuning_required
+    }))
+}
+
+fn tune_cpu_engine_for_next_launch(
+    profile: &prompt_compressor_core::ProfileDefinition,
+    state: &AppState,
+) -> Result<bool> {
+    let build_id = match std::env::var("TRIMPROMPT_EXPECTED_BUILD_ID") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => return Ok(false),
+    };
+    if !cpu_supports_avx512_engine() {
+        return Ok(false);
+    }
+    let current_engine = match std::env::var("TRIMPROMPT_CPU_ENGINE").as_deref() {
+        Ok("avx2") => "avx2",
+        Ok("avx512") => "avx512",
+        _ => return Ok(false),
+    };
+    let selection_path = cpu_engine_selection_path(&state.application_root);
+    let cpu_key = current_cpu_key();
+    if valid_cpu_engine_selection(&selection_path, &build_id, &cpu_key) {
+        return Ok(false);
+    }
+
+    let current_elapsed =
+        benchmark_cpu_engine_pipeline(profile, state, &state.runtime_tuning_cancellation)?
+            .context("current CPU engine benchmark was cancelled")?;
+    if state.runtime_tuning_cancellation.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
+
+    let alternate_engine = if current_engine == "avx2" {
+        "avx512"
+    } else {
+        "avx2"
+    };
+    let alternate_elapsed = run_external_cpu_engine_probe(
+        &state.application_root,
+        alternate_engine,
+        &build_id,
+        &state.runtime_tuning_cancellation,
+    )?
+    .context("alternate CPU engine benchmark was cancelled")?;
+    if state.runtime_tuning_cancellation.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
+
+    let (avx2_elapsed, avx512_elapsed) = if current_engine == "avx2" {
+        (current_elapsed, alternate_elapsed)
+    } else {
+        (alternate_elapsed, current_elapsed)
+    };
+    let selected = select_benchmarked_cpu_engine(avx2_elapsed, avx512_elapsed);
+    let record = PersistedCpuEngineSelection {
+        schema_version: CPU_ENGINE_SELECTION_SCHEMA_VERSION,
+        build_id,
+        cpu_key,
+        cpu_engine: selected.to_string(),
+    };
+    let bytes =
+        serde_json::to_vec_pretty(&record).context("failed to serialize CPU engine selection")?;
+    if let Some(parent) = selection_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    atomic_write_file(&selection_path, &bytes)?;
+    Ok(true)
+}
+
+fn benchmark_cpu_engine_pipeline(
+    profile: &ProfileDefinition,
+    state: &AppState,
+    cancellation: &AtomicBool,
+) -> Result<Option<u64>> {
+    anyhow::ensure!(
+        state.backend.warm_profile(profile)?,
+        "CPU engine benchmark requires an embedded model"
+    );
+
+    let mut total_elapsed = Duration::ZERO;
+    for input_text in CPU_ENGINE_PIPELINE_PROBE_INPUTS {
+        if cancellation.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+
+        let request = CompressionRequest {
+            input_text: input_text.to_string(),
+            compression_level: CompressionLevel::from_u8(2)?,
+            profile: profile.id.clone(),
+            constraints: CompressionConstraints::default(),
+            target: RequestTarget::codex_default(),
+            source: RequestSource::Desktop,
+        };
+        let started_at = Instant::now();
+        state.service.prepare(request.clone())?;
+        let observed = state.service.compress_with_observation(request)?;
+        anyhow::ensure!(
+            observed.runtime_observation.is_some(),
+            "CPU engine benchmark inference did not complete"
+        );
+        anyhow::ensure!(
+            !observed.result.distilled_prompt.trim().is_empty(),
+            "CPU engine benchmark returned an empty result"
+        );
+        total_elapsed += started_at.elapsed();
+    }
+
+    let average_micros = total_elapsed.as_micros()
+        / u128::try_from(CPU_ENGINE_PIPELINE_PROBE_INPUTS.len()).unwrap_or(1);
+    Ok(Some(average_micros.max(1).min(u128::from(u64::MAX)) as u64))
+}
+
+fn select_benchmarked_cpu_engine(avx2_elapsed: u64, avx512_elapsed: u64) -> &'static str {
+    let avx512_limit = u128::from(avx2_elapsed) * u128::from(100 - CPU_ENGINE_MINIMUM_GAIN_PERCENT);
+    if u128::from(avx512_elapsed) * 100 <= avx512_limit {
+        "avx512"
+    } else {
+        "avx2"
+    }
+}
+
+fn run_external_cpu_engine_probe(
+    application_root: &Path,
+    engine: &str,
+    build_id: &str,
+    cancellation: &AtomicBool,
+) -> Result<Option<u64>> {
+    let engine_root = fs::canonicalize(application_root.join("runtime").join("cpu"))
+        .context("CPU engine directory is unavailable")?;
+    let executable = fs::canonicalize(engine_root.join(format!("TrimPrompt-{engine}.exe")))
+        .with_context(|| format!("{engine} CPU engine is unavailable"))?;
+    anyhow::ensure!(
+        executable.starts_with(&engine_root) && executable.is_file(),
+        "CPU engine path is outside the package"
+    );
+
+    let result_path = cpu_engine_probe_path(application_root, engine);
+    match fs::remove_file(&result_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let package_root = application_root
+        .parent()
+        .context("application directory has no package root")?;
+    let mut child = Command::new(&executable)
+        .arg("--cpu-engine-speed-probe")
+        .current_dir(package_root)
+        .env("TRIMPROMPT_CPU_ENGINE", engine)
+        .env("TRIMPROMPT_EXPECTED_BUILD_ID", build_id)
+        .spawn()
+        .with_context(|| format!("failed to start {}", executable.display()))?;
+
+    loop {
+        if cancellation.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to poll CPU engine probe")?
+        {
+            anyhow::ensure!(status.success(), "{engine} CPU engine probe failed");
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let bytes = fs::read(&result_path)
+        .with_context(|| format!("failed to read {}", result_path.display()))?;
+    let result: CpuEngineProbeResult =
+        serde_json::from_slice(&bytes).context("invalid CPU engine probe result")?;
+    let _ = fs::remove_file(result_path);
+    anyhow::ensure!(
+        result.schema_version == CPU_ENGINE_SELECTION_SCHEMA_VERSION
+            && result.build_id == build_id
+            && result.cpu_engine == engine
+            && result.elapsed_micros > 0,
+        "CPU engine probe result does not match the running package"
+    );
+    Ok(Some(result.elapsed_micros))
+}
+
+fn valid_cpu_engine_selection(path: &Path, build_id: &str, cpu_key: &str) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let Ok(record) = serde_json::from_slice::<PersistedCpuEngineSelection>(&bytes) else {
+        return false;
+    };
+    record.schema_version == CPU_ENGINE_SELECTION_SCHEMA_VERSION
+        && record.build_id == build_id
+        && record.cpu_key == cpu_key
+        && matches!(record.cpu_engine.as_str(), "avx2" | "avx512")
+}
+
+fn cpu_engine_tuning_required(application_root: &Path) -> bool {
+    let Ok(build_id) = std::env::var("TRIMPROMPT_EXPECTED_BUILD_ID") else {
+        return false;
+    };
+    if build_id.trim().is_empty() || !cpu_supports_avx512_engine() {
+        return false;
+    }
+    if !matches!(
+        std::env::var("TRIMPROMPT_CPU_ENGINE").as_deref(),
+        Ok("avx2" | "avx512")
+    ) {
+        return false;
+    }
+
+    !valid_cpu_engine_selection(
+        &cpu_engine_selection_path(application_root),
+        &build_id,
+        &current_cpu_key(),
+    )
+}
+
+fn cpu_engine_selection_path(application_root: &Path) -> PathBuf {
+    application_root
+        .join("local")
+        .join("state")
+        .join(CPU_ENGINE_SELECTION_FILE)
+}
+
+fn cpu_engine_probe_path(application_root: &Path, engine: &str) -> PathBuf {
+    application_root
+        .join("local")
+        .join("state")
+        .join(format!("cpu-engine-probe-{engine}.json"))
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn cpu_supports_avx512_engine() -> bool {
+    std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma")
+        && std::arch::is_x86_feature_detected!("f16c")
+        && std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512cd")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512dq")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+fn cpu_supports_avx512_engine() -> bool {
+    false
+}
+
+fn current_cpu_key() -> String {
+    let processor = std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_else(|_| "unknown".to_string());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    return format!(
+        "{processor}|avx2={}|fma={}|f16c={}|avx512f={}|avx512cd={}|avx512bw={}|avx512dq={}|avx512vl={}",
+        u8::from(std::arch::is_x86_feature_detected!("avx2")),
+        u8::from(std::arch::is_x86_feature_detected!("fma")),
+        u8::from(std::arch::is_x86_feature_detected!("f16c")),
+        u8::from(std::arch::is_x86_feature_detected!("avx512f")),
+        u8::from(std::arch::is_x86_feature_detected!("avx512cd")),
+        u8::from(std::arch::is_x86_feature_detected!("avx512bw")),
+        u8::from(std::arch::is_x86_feature_detected!("avx512dq")),
+        u8::from(std::arch::is_x86_feature_detected!("avx512vl")),
+    );
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    processor
+}
+
+fn reset_runtime_tuning_from_body(body: &[u8], state: &AppState) -> Result<serde_json::Value> {
+    let payload: PrepareCompressionPayload =
+        serde_json::from_slice(body).context("invalid JSON runtime tuning reset request")?;
+    validate_text_field("profile", &payload.profile, MAX_PROFILE_CHARS, false)?;
+    CompressionLevel::from_u8(payload.compression_level).context("invalid compression level")?;
+    let profile = state.registry.resolve(&payload.profile)?;
+    let removed = state.backend.reset_profile_thread_tuning(profile)?;
+    let engine_selection_path = cpu_engine_selection_path(&state.application_root);
+    let engine_removed = match fs::remove_file(engine_selection_path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(serde_json::json!({
+        "reset": true,
+        "removed": removed,
+        "cpu_engine_removed": engine_removed
+    }))
 }
 
 fn compress_from_body(body: &[u8], state: &AppState) -> Result<serde_json::Value> {
@@ -1914,9 +2460,53 @@ mod tests {
     }
 
     #[test]
+    fn input_pause_prepares_model_state_without_reusing_compression_results() {
+        assert_eq!(
+            request_body_limit("/api/prepare-input"),
+            MAX_REQUEST_BODY_BYTES
+        );
+        assert!(APP_JS.contains("inputPrepareDelayMs = 1200"));
+        assert!(APP_JS.contains("promptInput.addEventListener(\"input\""));
+        assert!(APP_JS.contains("fetch(\"/api/prepare-input\""));
+        assert!(APP_JS.contains("await inputPreparePromise"));
+        assert!(APP_JS.contains("readyInputPrepareKey = \"\";"));
+        assert!(APP_JS.contains("fetch(\"/api/compress\""));
+    }
+
+    #[test]
+    fn runtime_tuning_uses_an_explicit_startup_gate_and_restart() {
+        assert_eq!(
+            request_body_limit("/api/tune-runtime"),
+            MAX_SETTINGS_BODY_BYTES
+        );
+        assert_eq!(
+            request_body_limit("/api/runtime-setup-status"),
+            MAX_SETTINGS_BODY_BYTES
+        );
+        assert!(APP_JS.contains("fetch(\"/api/tune-runtime\""));
+        assert!(APP_JS.contains("fetch(\"/api/runtime-setup-status\""));
+        assert!(APP_JS.contains("fetch(\"/api/tune-runtime-reset\""));
+        assert!(APP_JS.contains("postDesktopMessage(\"app:restart\")"));
+        assert!(!APP_JS.contains("runtimeTuningIdleDelayMs"));
+        assert!(!APP_JS.contains("tune-runtime-cancel"));
+        assert!(!APP_JS.contains("document.addEventListener(\"pointerdown\", deferRuntimeTuning"));
+        assert!(INDEX_HTML.contains("id=\"runtimeTuningResetButton\""));
+        assert!(INDEX_HTML.contains("id=\"runtimeSetupScreen\""));
+        assert!(INDEX_HTML.contains("初期設定中") || APP_JS.contains("初期設定中"));
+    }
+
+    #[test]
+    fn avx512_requires_a_measurable_gain_over_avx2() {
+        assert_eq!(select_benchmarked_cpu_engine(1_000, 970), "avx512");
+        assert_eq!(select_benchmarked_cpu_engine(1_000, 971), "avx2");
+        assert_eq!(select_benchmarked_cpu_engine(1_000, 1_000), "avx2");
+    }
+
+    #[test]
     fn sample_prompts_only_populate_the_input() {
         assert!(INDEX_HTML.contains("src=\"/sample-prompts.js\""));
         assert!(SAMPLE_PROMPTS_JS.contains("promptInput.value = sample;"));
+        assert!(SAMPLE_PROMPTS_JS.contains("new Event(\"input\", { bubbles: true })"));
         assert!(!APP_JS.contains("sampleSelect"));
         for forbidden in [
             "levelInput",
@@ -1994,6 +2584,7 @@ mod tests {
         assert!(INDEX_HTML.contains("高圧縮"));
         assert!(APP_JS.contains("compressionLevelMin = 2"));
         assert!(APP_JS.contains("name: \"高圧縮\""));
+        assert!(APP_JS.contains("await refreshModelAvailability(false)"));
         assert!(STYLES_CSS.contains(".level-switch"));
         assert!(STYLES_CSS.contains(".level-option[aria-pressed=\"true\"]"));
     }
@@ -2054,6 +2645,34 @@ mod tests {
         assert_eq!(value["level"], 3);
         assert!(value["theme"].is_null());
         assert_eq!(value["future_panel"]["density"], "compact");
+    }
+
+    #[test]
+    fn startup_prepare_uses_saved_profile_and_supported_level() {
+        let registry = ProfileRegistry::bootstrap();
+        let settings = PersistedUiSettings {
+            path: PathBuf::from("unused-startup-settings.json"),
+            settings: Arc::new(Mutex::new(UiSettings {
+                profile: Some("lmstudio_local".to_string()),
+                level: Some(3),
+                ..UiSettings::default()
+            })),
+        };
+
+        let request =
+            startup_compression_request(&registry, &settings).expect("resolve startup request");
+        assert_eq!(request.profile, "lmstudio_local");
+        assert_eq!(request.compression_level.value(), 3);
+
+        *settings.settings.lock().expect("lock settings") = UiSettings {
+            profile: Some("missing-profile".to_string()),
+            level: Some(1),
+            ..UiSettings::default()
+        };
+        let fallback = startup_compression_request(&registry, &settings)
+            .expect("fallback to supported defaults");
+        assert_eq!(fallback.profile, "internal_llm");
+        assert_eq!(fallback.compression_level.value(), 2);
     }
 
     #[test]

@@ -5,6 +5,7 @@ const levelHelp = document.querySelector("#levelHelp");
 const themeToggle = document.querySelector("#themeToggle");
 const settingsButton = document.querySelector("#settingsButton");
 const settingsMenu = document.querySelector("#settingsMenu");
+const runtimeTuningResetButton = document.querySelector("#runtimeTuningResetButton");
 const windowDragRegion = document.querySelector("#windowDragRegion");
 const windowMinimizeButton = document.querySelector("#windowMinimizeButton");
 const windowMaximizeButton = document.querySelector("#windowMaximizeButton");
@@ -31,6 +32,9 @@ const modelInstallButton = document.querySelector("#modelInstallButton");
 const modelCancelButton = document.querySelector("#modelCancelButton");
 const settingsSummary = document.querySelector("#settingsSummary");
 const compressionLatency = document.querySelector("#compressionLatency");
+const runtimeSetupScreen = document.querySelector("#runtimeSetupScreen");
+const runtimeSetupTitle = document.querySelector("#runtimeSetupTitle");
+const runtimeSetupDetail = document.querySelector("#runtimeSetupDetail");
 const settingsStorageKey = "trimPromptSettingsV1";
 const legacySettingsStorageKeys = [
   "promptCompressorSettingsV3",
@@ -41,8 +45,10 @@ const legacyThemeStorageKey = "promptCompressorThemeV1";
 const compressionLevelMin = 2;
 const compressionLevelMax = 3;
 const settingsSaveDelayMs = 250;
+const inputPrepareDelayMs = 1200;
 let isCompressing = false;
 let prepareTimerId = 0;
+let inputPrepareTimerId = 0;
 let settingsSaveTimerId = 0;
 let settingsSaveInFlight = false;
 let pendingServerSettings = null;
@@ -50,6 +56,10 @@ let lastLocalSettingsJson = "";
 let lastServerSettingsFingerprint = "";
 let inFlightPrepareKey = "";
 let readyPrepareKey = "";
+let inFlightInputPrepareKey = "";
+let readyInputPrepareKey = "";
+let inputPreparePromise = null;
+let runtimeSetupInFlight = false;
 let modelInstalled = false;
 let modelRuntimeReady = false;
 let modelInstallInFlight = false;
@@ -78,6 +88,7 @@ for (const levelButton of levelButtons) {
     renderCompressionLevel();
     saveSettings();
     updateSettingsSummary();
+    invalidatePreparedInput();
     scheduleCompressionPrepare();
   });
 }
@@ -138,7 +149,15 @@ profileSelect.addEventListener("change", () => {
   saveSettings();
   updateSettingsSummary();
   readyPrepareKey = "";
+  invalidatePreparedInput();
   refreshModelAvailability();
+});
+
+runtimeTuningResetButton.addEventListener("click", resetRuntimeTuning);
+
+promptInput.addEventListener("input", () => {
+  invalidatePreparedInput();
+  scheduleInputPrepare();
 });
 
 copyButton.addEventListener("click", async () => {
@@ -153,6 +172,7 @@ copyButton.addEventListener("click", async () => {
 
 clearInputButton.addEventListener("click", () => {
   promptInput.value = "";
+  invalidatePreparedInput();
   clearResultLists();
   setWorkStatus("入力待ち", "");
   promptInput.focus();
@@ -174,23 +194,30 @@ compressButton.addEventListener("click", async () => {
     promptInput.focus();
     return;
   }
+  const compressionPayload = {
+    input_text: inputText,
+    profile: profileSelect.value,
+    compression_level: Number(levelInput.value),
+    constraints: defaultCompressionConstraints()
+  };
+  const inputPrepareKey = JSON.stringify(compressionPayload);
 
   isCompressing = true;
   setLoading(true);
   setWorkStatus("圧縮中", "running");
+  window.clearTimeout(inputPrepareTimerId);
+  inputPrepareTimerId = 0;
 
   try {
+    if (inputPreparePromise && inFlightInputPrepareKey === inputPrepareKey) {
+      await inputPreparePromise;
+    }
     const response = await fetch("/api/compress", {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({
-        input_text: inputText,
-        profile: profileSelect.value,
-        compression_level: Number(levelInput.value),
-        constraints: defaultCompressionConstraints()
-      })
+      body: JSON.stringify(compressionPayload)
     });
 
     const payload = await response.json();
@@ -215,6 +242,8 @@ compressButton.addEventListener("click", async () => {
   } finally {
     setLoading(false);
     isCompressing = false;
+    readyInputPrepareKey = "";
+    scheduleInputPrepare();
     refreshRuntimeStatus();
   }
 });
@@ -247,10 +276,10 @@ async function loadProfiles() {
   }
   updateSettingsSummary();
   saveSettings();
-  await refreshModelAvailability();
+  await refreshModelAvailability(false);
 }
 
-async function refreshModelAvailability() {
+async function refreshModelAvailability(prepareWhenInstalled = true) {
   if (!profileSelect.value || modelInstallInFlight) {
     return;
   }
@@ -273,8 +302,11 @@ async function refreshModelAvailability() {
     modelInstalled = !status.requires_install || Boolean(status.installed);
     renderModelSetup(status);
     updateCompressButtonState();
-    if (modelInstalled) {
-      scheduleCompressionPrepare(50);
+    if (modelInstalled && prepareWhenInstalled) {
+      const restarting = await runRuntimeSetupGate();
+      if (!restarting) {
+        scheduleCompressionPrepare(50);
+      }
     }
   } catch (_error) {
     selectedModelStatus = null;
@@ -363,7 +395,13 @@ async function installSelectedModel() {
     modelInstallButton.textContent = "再試行";
     modelCancelButton.hidden = true;
     modelCancelButton.disabled = false;
-    await refreshModelAvailability();
+    await refreshModelAvailability(false);
+    if (modelInstalled) {
+      const restarting = await runRuntimeSetupGate();
+      if (!restarting) {
+        scheduleCompressionPrepare(50);
+      }
+    }
   }
 }
 
@@ -457,6 +495,7 @@ async function prepareCompressionSelection() {
     }
     modelRuntimeReady = true;
     setModelReadyStatus();
+    scheduleInputPrepare();
   } catch (_error) {
     modelRuntimeReady = false;
     setModelStatus("準備エラー", "error");
@@ -478,6 +517,240 @@ function currentPreparePayload() {
     compression_level: Number(clampCompressionLevel(levelInput.value)),
     constraints: defaultCompressionConstraints()
   };
+}
+
+function invalidatePreparedInput() {
+  window.clearTimeout(inputPrepareTimerId);
+  inputPrepareTimerId = 0;
+  readyInputPrepareKey = "";
+}
+
+function scheduleInputPrepare(delayMs = inputPrepareDelayMs) {
+  const payload = currentInputPreparePayload();
+  if (
+    !payload ||
+    !modelInstalled ||
+    !modelRuntimeReady ||
+    modelInstallInFlight ||
+    isCompressing ||
+    inputPrepareTimerId
+  ) {
+    return;
+  }
+
+  const prepareKey = JSON.stringify(payload);
+  if (prepareKey === readyInputPrepareKey || prepareKey === inFlightInputPrepareKey) {
+    return;
+  }
+  inputPrepareTimerId = window.setTimeout(() => {
+    inputPrepareTimerId = 0;
+    prepareInputSelection();
+  }, delayMs);
+}
+
+async function prepareInputSelection() {
+  const payload = currentInputPreparePayload();
+  if (!payload || isCompressing) {
+    return;
+  }
+  const prepareKey = JSON.stringify(payload);
+  if (prepareKey === readyInputPrepareKey || prepareKey === inFlightInputPrepareKey) {
+    return;
+  }
+
+  inFlightInputPrepareKey = prepareKey;
+  let shouldRetry = false;
+  const operation = (async () => {
+    const response = await fetch("/api/prepare-input", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+    if (response.status === 429) {
+      shouldRetry = true;
+      return;
+    }
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.error || "input prepare failed");
+    }
+    if (result.prepared && prepareKey === JSON.stringify(currentInputPreparePayload())) {
+      readyInputPrepareKey = prepareKey;
+    }
+  })();
+  inputPreparePromise = operation;
+
+  try {
+    await operation;
+  } catch (_error) {
+    // Input preparation is opportunistic; normal compression remains available.
+  } finally {
+    if (inFlightInputPrepareKey === prepareKey) {
+      inFlightInputPrepareKey = "";
+    }
+    if (inputPreparePromise === operation) {
+      inputPreparePromise = null;
+    }
+    if (shouldRetry || prepareKey !== JSON.stringify(currentInputPreparePayload())) {
+      scheduleInputPrepare(150);
+    }
+  }
+}
+
+function currentInputPreparePayload() {
+  const inputText = promptInput.value.trim();
+  if (!inputText || !profileSelect.value) {
+    return null;
+  }
+  return {
+    input_text: inputText,
+    profile: profileSelect.value,
+    compression_level: Number(clampCompressionLevel(levelInput.value)),
+    constraints: defaultCompressionConstraints()
+  };
+}
+
+async function runRuntimeSetupGate() {
+  if (runtimeSetupInFlight || !modelInstalled || !profileSelect.value) {
+    return false;
+  }
+  const payload = currentPreparePayload();
+  if (!payload) {
+    revealApplication();
+    return false;
+  }
+
+  runtimeSetupInFlight = true;
+  try {
+    const status = await fetchRuntimeSetupStatus(payload);
+    if (!status.required) {
+      revealApplication();
+      return false;
+    }
+
+    showRuntimeSetup("初期設定中", "このPCに最適な設定を診断しています");
+    const result = await requestRuntimeTuning(payload);
+    if (result.restart_required) {
+      showRuntimeSetup("初期設定を反映しています", "まもなく自動で再起動します");
+      await delay(300);
+      if (!postDesktopMessage("app:restart")) {
+        window.location.reload();
+      }
+      return true;
+    }
+
+    const updatedStatus = await fetchRuntimeSetupStatus(payload);
+    if (updatedStatus.required) {
+      throw new Error("runtime setup did not produce a valid saved configuration");
+    }
+
+    revealApplication();
+    return false;
+  } catch (_error) {
+    showRuntimeSetupError(
+      "初期設定を完了できませんでした",
+      "TrimPromptを再起動して、もう一度お試しください"
+    );
+    return true;
+  } finally {
+    runtimeSetupInFlight = false;
+  }
+}
+
+async function fetchRuntimeSetupStatus(payload) {
+  const response = await fetch("/api/runtime-setup-status", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+  const status = await response.json();
+  if (!response.ok) {
+    throw new Error(status.error || "runtime setup status failed");
+  }
+  return status;
+}
+
+async function requestRuntimeTuning(payload) {
+  while (true) {
+    const response = await fetch("/api/tune-runtime", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+    if (response.status === 429) {
+      await delay(400);
+      continue;
+    }
+    const result = await response.json();
+    if (!response.ok || !result.completed) {
+      throw new Error(result.error || "runtime tuning failed");
+    }
+    return result;
+  }
+}
+
+function showRuntimeSetup(title, detail) {
+  document.body.classList.remove("startup-gated");
+  document.body.classList.add("runtime-setup-active");
+  runtimeSetupScreen.classList.remove("error");
+  runtimeSetupScreen.hidden = false;
+  runtimeSetupTitle.textContent = title;
+  runtimeSetupDetail.textContent = detail;
+}
+
+function showRuntimeSetupError(title, detail) {
+  showRuntimeSetup(title, detail);
+  runtimeSetupScreen.classList.add("error");
+}
+
+function revealApplication() {
+  document.body.classList.remove("startup-gated", "runtime-setup-active");
+  runtimeSetupScreen.classList.remove("error");
+  runtimeSetupScreen.hidden = true;
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+async function resetRuntimeTuning() {
+  const payload = currentPreparePayload();
+  if (!payload || runtimeTuningResetButton.disabled) {
+    return;
+  }
+
+  runtimeTuningResetButton.disabled = true;
+  runtimeTuningResetButton.textContent = "処理中";
+  try {
+    const response = await fetch("/api/tune-runtime-reset", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+    const result = await response.json();
+    if (!response.ok || !result.reset) {
+      throw new Error(result.error || "runtime tuning reset failed");
+    }
+
+    closeSettingsMenu();
+    const restarting = await runRuntimeSetupGate();
+    if (!restarting) {
+      setWorkStatus("CPU最適化完了", "");
+    }
+  } catch (_error) {
+    setWorkStatus("再調整エラー", "error");
+  } finally {
+    runtimeTuningResetButton.disabled = false;
+    runtimeTuningResetButton.textContent = "再調整";
+  }
 }
 
 function defaultCompressionConstraints() {
@@ -725,6 +998,7 @@ async function refreshRuntimeStatus() {
         activeModelDownloadProfile = "";
         modelCancelButton.hidden = true;
         setModelReadyStatus();
+        scheduleInputPrepare();
         break;
       case "error":
         modelRuntimeReady = false;
@@ -741,6 +1015,7 @@ async function refreshRuntimeStatus() {
       case "skipped":
         modelRuntimeReady = true;
         setModelReadyStatus();
+        scheduleInputPrepare();
         break;
       default:
         modelRuntimeReady = false;
@@ -997,13 +1272,22 @@ renderCompressionLevel();
 updateCompressButtonState();
 
 loadProfiles()
-  .then(() => {
+  .then(async () => {
     clearResultLists();
+    if (modelInstalled) {
+      const restarting = await runRuntimeSetupGate();
+      if (restarting) {
+        return;
+      }
+    } else {
+      revealApplication();
+    }
     refreshRuntimeStatus();
     setInterval(refreshRuntimeStatus, 1500);
   })
   .catch((error) => {
-    setModelStatus("設定読み込み失敗", "error");
-    setWorkStatus("エラー", "error");
-    promptOutput.value = String(error.message || error);
+    showRuntimeSetupError(
+      "TrimPromptを起動できませんでした",
+      String(error.message || error)
+    );
   });

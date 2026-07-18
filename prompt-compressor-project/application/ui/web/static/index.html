@@ -6,7 +6,7 @@
     <title>TrimPrompt</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
-  <body>
+  <body class="startup-gated">
     <div class="window-chrome" id="windowChrome">
       <div class="window-chrome-drag" id="windowDragRegion" aria-hidden="true"></div>
       <div class="window-controls">
@@ -39,6 +39,18 @@
         </button>
       </div>
     </div>
+    <section
+      class="runtime-setup-screen"
+      id="runtimeSetupScreen"
+      role="status"
+      aria-live="polite"
+    >
+      <span class="runtime-setup-ring" aria-hidden="true"></span>
+      <div class="runtime-setup-copy">
+        <strong id="runtimeSetupTitle">起動しています</strong>
+        <span id="runtimeSetupDetail">保存済みの設定を確認しています</span>
+      </div>
+    </section>
     <main class="app-shell">
       <header class="topbar">
         <div class="topbar-brand">
@@ -112,6 +124,12 @@
                 </div>
                 <span class="level-help" id="levelHelp">要件を保ちながらバランスよく圧縮</span>
               </fieldset>
+              <div class="settings-action">
+                <span>CPU最適化</span>
+                <button class="secondary" id="runtimeTuningResetButton" type="button">
+                  再調整
+                </button>
+              </div>
             </div>
           </div>
         </div>

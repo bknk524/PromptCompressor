@@ -5,12 +5,16 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["embedded-llama"]
-embedded-llama = ["dep:llama_cpp"]
+default = ["embedded-llama-avx2"]
+embedded-llama = ["dep:llama_cpp", "dep:llama_cpp_sys"]
+embedded-llama-compatible = ["embedded-llama"]
+embedded-llama-avx2 = ["embedded-llama-compatible", "llama_cpp_sys/avx2"]
+embedded-llama-avx512 = ["embedded-llama-compatible", "llama_cpp_sys/avx512"]
 
 [dependencies]
 hf-hub.workspace = true
-llama_cpp = { version = "0.3.2", optional = true }
+llama_cpp = { package = "llama-cpp-4", version = "=0.4.2", optional = true, default-features = false, features = ["openmp"] }
+llama_cpp_sys = { package = "llama-cpp-sys-4", version = "=0.4.2", optional = true, default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

@@ -117,6 +117,70 @@ body {
   overflow: hidden;
 }
 
+.runtime-setup-screen {
+  height: calc(100vh - 34px);
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 18px;
+  padding: 32px;
+  color: var(--text);
+  text-align: center;
+}
+
+.runtime-setup-screen[hidden] {
+  display: none;
+}
+
+.runtime-setup-ring {
+  width: 36px;
+  height: 36px;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: runtime-setup-spin 720ms linear infinite;
+}
+
+.runtime-setup-screen.error .runtime-setup-ring {
+  border-color: var(--danger);
+  animation: none;
+}
+
+.runtime-setup-copy {
+  display: grid;
+  gap: 6px;
+  max-width: 420px;
+}
+
+.runtime-setup-copy strong {
+  font-size: 18px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+.runtime-setup-copy span {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+body.startup-gated .app-shell,
+body.runtime-setup-active .app-shell {
+  display: none;
+}
+
+@keyframes runtime-setup-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .runtime-setup-ring {
+    animation-duration: 1400ms;
+  }
+}
+
 button,
 select,
 textarea,
@@ -722,6 +786,17 @@ button.secondary:hover {
   grid-template-columns: 1fr;
   gap: 14px;
   padding: 14px;
+}
+
+.settings-action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 500;
 }
 
 .section-head {

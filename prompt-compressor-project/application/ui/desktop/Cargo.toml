@@ -4,10 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["embedded-llama-avx2"]
+embedded-llama-compatible = ["prompt-compressor-local-ui/embedded-llama-compatible"]
+embedded-llama-avx2 = ["prompt-compressor-local-ui/embedded-llama-avx2"]
+embedded-llama-avx512 = ["prompt-compressor-local-ui/embedded-llama-avx512"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-prompt-compressor-local-ui = { path = "../web" }
+prompt-compressor-local-ui = { path = "../web", default-features = false }
 serde_json.workspace = true
 tao = "0.35.3"
 wry = "0.55.1"
@@ -16,6 +22,7 @@ windows-sys = { version = "0.61.2", features = [
   "Win32_Graphics_Dwm",
   "Win32_Graphics_Gdi",
   "Win32_System_Threading",
+  "Win32_UI_Controls",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }

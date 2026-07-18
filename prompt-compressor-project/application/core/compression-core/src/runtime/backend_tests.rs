@@ -1,22 +1,22 @@
 use super::{
-    automatic_runtime_thread_count, contains_ascii_case_insensitive, contains_japanese_text,
-    contains_required_technical_terms, effective_max_output_tokens, finalize_observed_model_draft,
-    is_meta_task_restatement, missing_constraint_restoration_phrases,
-    missing_verification_restoration_phrases, normalize_input_whitespace,
-    normalize_known_input_typos_for_llm, organize_input_for_model, parse_compression_output,
-    parse_http_base_url, polish_model_output_for_request, preprocess_input_for_llm,
-    preserves_negative_constraints, preserves_targeted_change_constraints,
-    remove_obvious_input_noise, remove_polite_request_fillers, required_constraint_clauses,
-    required_technical_terms, restore_missing_required_constraints, restore_missing_required_terms,
-    state_persistence_clause_satisfied, structured_candidate_preserves_requirements,
-    structured_constraint_clause, trusted_precompacted_fallback_draft, validate_compression_draft,
+    automatic_runtime_thread_counts, contains_ascii_case_insensitive, contains_japanese_text,
+    contains_required_technical_terms, effective_max_output_tokens, embedded_input_cache_key,
+    finalize_observed_model_draft, is_meta_task_restatement,
+    missing_constraint_restoration_phrases, missing_verification_restoration_phrases,
+    normalize_input_whitespace, normalize_known_input_typos_for_llm, organize_input_for_model,
+    parse_compression_output, parse_http_base_url, polish_model_output_for_request,
+    preprocess_input_for_llm, preserves_negative_constraints,
+    preserves_targeted_change_constraints, remove_obvious_input_noise,
+    remove_polite_request_fillers, required_constraint_clauses, required_technical_terms,
+    restore_missing_required_constraints, restore_missing_required_terms,
+    select_context_length_for_token_budget, state_persistence_clause_satisfied,
+    structured_candidate_preserves_requirements, structured_constraint_clause,
+    take_matching_prepared_value, trusted_precompacted_fallback_draft, validate_compression_draft,
     validate_prompt_token_budget, verification_constraint_satisfied, verified_structured_candidate,
-    CompressionCacheKey, CompressionDraft, CompressionDraftCache, ModelDefinition,
-    ModelFileCoordinator, RuntimeCompressionObservation, RuntimeTransformation,
-    MAX_COMPRESSION_CACHE_ENTRIES,
+    CompressionDraft, ModelDefinition, ModelFileCoordinator, RuntimeCompressionObservation,
+    RuntimeThreadCounts, RuntimeTransformation,
 };
 use crate::compression::verifier::SimpleVerifier;
-use crate::config::profile::ProfileDefinition;
 use crate::types::{
     CompressionConstraints, CompressionLevel, CompressionRequest, RequestSource, RequestTarget,
 };
@@ -67,82 +67,111 @@ fn model_file_coordinator_reuses_path_lock_and_invalidates_changed_files() {
 
 #[test]
 fn automatic_runtime_threads_leave_capacity_for_the_app() {
-    assert_eq!(automatic_runtime_thread_count(1), 1);
-    assert_eq!(automatic_runtime_thread_count(2), 1);
-    assert_eq!(automatic_runtime_thread_count(3), 2);
-    assert_eq!(automatic_runtime_thread_count(4), 3);
-    assert_eq!(automatic_runtime_thread_count(8), 7);
-    assert_eq!(automatic_runtime_thread_count(16), 8);
+    let expected = [
+        (1, (1, 1)),
+        (2, (1, 1)),
+        (3, (2, 2)),
+        (4, (3, 3)),
+        (8, (6, 7)),
+        (16, (7, 8)),
+    ];
+
+    for (available, (generation, batch)) in expected {
+        let counts = automatic_runtime_thread_counts(available);
+        assert_eq!(counts.generation, generation);
+        assert_eq!(counts.batch, batch);
+    }
 }
 
 #[test]
-fn compression_cache_reuses_exact_requests_and_evicts_least_recently_used() {
-    let profile = test_profile_definition();
-    let mut cache = CompressionDraftCache::default();
-    let first_request = test_request("依頼0".to_string(), 2);
-    let first_key = CompressionCacheKey::new(&first_request, &profile);
-    cache.insert(
-        first_key.clone(),
-        CompressionDraft {
-            distilled_prompt: "圧縮0".to_string(),
-            removed_content_summary: Vec::new(),
-        },
-    );
-    let mut second_key = None;
-    for index in 1..MAX_COMPRESSION_CACHE_ENTRIES {
-        let request = test_request(format!("依頼{index}"), 2);
-        let key = CompressionCacheKey::new(&request, &profile);
-        if index == 1 {
-            second_key = Some(key.clone());
-        }
-        cache.insert(
-            key,
-            CompressionDraft {
-                distilled_prompt: format!("圧縮{index}"),
-                removed_content_summary: Vec::new(),
-            },
-        );
-    }
+fn prepared_input_key_changes_with_the_formatted_input_without_storing_its_text() {
+    let model = test_model_definition(256);
+    let model_path = PathBuf::from("models/test.gguf");
+    let threads = test_runtime_threads();
+    let first =
+        embedded_input_cache_key(&model, &model_path, 1_024, threads, "prefix", "秘密の入力A");
+    let second =
+        embedded_input_cache_key(&model, &model_path, 1_024, threads, "prefix", "秘密の入力B");
+
+    assert_ne!(first, second);
+    assert!(!first.contains("秘密の入力A"));
+}
+
+#[test]
+fn prepared_input_is_moved_once_only_for_an_exact_key() {
+    let mut prepared = Some(("exact".to_string(), 42));
 
     assert_eq!(
-        cache
-            .get(&first_key)
-            .expect("exact request should be cached")
-            .distilled_prompt,
-        "圧縮0"
+        take_matching_prepared_value(&mut prepared, "different"),
+        None
     );
-    let last_request = test_request(format!("依頼{MAX_COMPRESSION_CACHE_ENTRIES}"), 2);
-    cache.insert(
-        CompressionCacheKey::new(&last_request, &profile),
-        CompressionDraft {
-            distilled_prompt: format!("圧縮{MAX_COMPRESSION_CACHE_ENTRIES}"),
-            removed_content_summary: Vec::new(),
-        },
+    assert_eq!(prepared.as_ref().map(|(_, value)| *value), Some(42));
+    assert_eq!(
+        take_matching_prepared_value(&mut prepared, "exact"),
+        Some(42)
     );
-
-    assert!(cache
-        .get(&second_key.expect("second key should be recorded"))
-        .is_none());
-    assert!(cache.get(&first_key).is_some());
-    assert_eq!(cache.entries.len(), MAX_COMPRESSION_CACHE_ENTRIES);
+    assert!(prepared.is_none());
+    assert_eq!(take_matching_prepared_value(&mut prepared, "exact"), None);
 }
 
 #[test]
-fn compression_cache_key_separates_levels_and_constraints() {
-    let profile = test_profile_definition();
-    let level_two = test_request("同じ依頼".to_string(), 2);
-    let level_three = test_request("同じ依頼".to_string(), 3);
-    let mut different_constraints = level_two.clone();
-    different_constraints.constraints.preserve_numbers = false;
+fn prepared_input_key_separates_context_sizes() {
+    let model = test_model_definition(256);
+    let model_path = PathBuf::from("models/test.gguf");
+    let threads = test_runtime_threads();
 
     assert_ne!(
-        CompressionCacheKey::new(&level_two, &profile),
-        CompressionCacheKey::new(&level_three, &profile)
+        embedded_input_cache_key(&model, &model_path, 1_024, threads, "prefix", "input"),
+        embedded_input_cache_key(&model, &model_path, 2_048, threads, "prefix", "input")
     );
+}
+
+#[test]
+fn prepared_input_key_separates_thread_settings() {
+    let model = test_model_definition(256);
+    let model_path = PathBuf::from("models/test.gguf");
+
     assert_ne!(
-        CompressionCacheKey::new(&level_two, &profile),
-        CompressionCacheKey::new(&different_constraints, &profile)
+        embedded_input_cache_key(
+            &model,
+            &model_path,
+            1_024,
+            RuntimeThreadCounts {
+                generation: 6,
+                batch: 7,
+            },
+            "prefix",
+            "input",
+        ),
+        embedded_input_cache_key(
+            &model,
+            &model_path,
+            1_024,
+            RuntimeThreadCounts {
+                generation: 5,
+                batch: 6,
+            },
+            "prefix",
+            "input",
+        )
     );
+}
+
+#[test]
+fn selects_the_smallest_context_tier_that_preserves_the_full_token_budget() {
+    assert_eq!(
+        select_context_length_for_token_budget(700, 192, 4_096).expect("1K context"),
+        1_024
+    );
+    assert_eq!(
+        select_context_length_for_token_budget(1_000, 192, 4_096).expect("2K context"),
+        2_048
+    );
+    assert_eq!(
+        select_context_length_for_token_budget(2_000, 192, 4_096).expect("4K context"),
+        4_096
+    );
+    assert!(select_context_length_for_token_budget(4_000, 192, 4_096).is_err());
 }
 
 #[test]
@@ -187,7 +216,7 @@ fn observation_preserves_raw_model_output_before_runtime_transformations() {
 }
 
 #[test]
-fn runtime_fallback_is_not_reported_as_raw_model_output_or_cached() {
+fn runtime_fallback_is_not_reported_as_raw_model_output() {
     let fallback = CompressionDraft {
         distilled_prompt: "README.mdの説明を簡潔にする。".to_string(),
         removed_content_summary: vec!["実行時フォールバック".to_string()],
@@ -201,7 +230,6 @@ fn runtime_fallback_is_not_reported_as_raw_model_output_or_cached() {
         observation.transformations,
         [RuntimeTransformation::RuntimeFallback]
     );
-    assert!(!observation.is_cacheable());
 }
 
 #[test]
@@ -1765,19 +1793,6 @@ fn test_request(input_text: String, level: u8) -> CompressionRequest {
     }
 }
 
-fn test_profile_definition() -> ProfileDefinition {
-    ProfileDefinition {
-        id: "internal_llm".to_string(),
-        label: "Internal".to_string(),
-        selectable: true,
-        model_ref: "model".to_string(),
-        policy_ref: "policy".to_string(),
-        runtime_ref: "runtime".to_string(),
-        fallback_profile: "internal_llm".to_string(),
-        target_tokenizer_profile: "codex_default".to_string(),
-    }
-}
-
 fn test_model_definition(default_max_output: u32) -> ModelDefinition {
     ModelDefinition {
         id: "test".to_string(),
@@ -1794,5 +1809,12 @@ fn test_model_definition(default_max_output: u32) -> ModelDefinition {
         prompt_template: "test".to_string(),
         prompt_style: "concise".to_string(),
         supports_json_schema: false,
+    }
+}
+
+fn test_runtime_threads() -> RuntimeThreadCounts {
+    RuntimeThreadCounts {
+        generation: 6,
+        batch: 7,
     }
 }

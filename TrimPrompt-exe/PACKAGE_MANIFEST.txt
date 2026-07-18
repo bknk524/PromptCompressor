@@ -1,10 +1,11 @@
 ﻿TrimPrompt desktop package
 
-Generated: 2026-07-15 21:57:22
+Generated: 2026-07-18 14:15:43
+Build ID: 20260718051419-1da1a4d42d94
 Executable: TrimPrompt.exe
 Default profile: internal_llm
 Model: downloaded from Hugging Face on first launch to application/local/models/sarashina2.2-3b-instruct-v0.1/sarashina2.2-3b-instruct-v0.1-Q4_K_S.gguf
-Runtime: llama_cpp_embedded (embedded in executable)
+Runtime: llama_cpp_embedded (embedded in executable); CPU dispatch selects AVX-512, AVX2, or compatible engine at startup
 Desktop transport: WebView2 custom protocol (no HTTP server, no localhost port)
 Update behavior: application/local and application/config/user are preserved by -Clean
 

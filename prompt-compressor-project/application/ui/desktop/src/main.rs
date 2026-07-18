@@ -48,6 +48,12 @@ struct Args {
 
     #[arg(long, hide = true)]
     package_smoke_test: bool,
+
+    #[arg(long, hide = true)]
+    cpu_engine_speed_probe: bool,
+
+    #[arg(long, hide = true, value_name = "PID")]
+    restart_after_pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +97,7 @@ enum DesktopEvent {
     ShowNotification(DesktopNotification),
     RestoreFromTray,
     OpenSettingsFromTray,
+    RestartRequested,
     ExitRequested,
 }
 
@@ -109,17 +116,109 @@ enum WindowControl {
 }
 
 fn main() {
+    if let Err(error) = ensure_cpu_engine_is_supported() {
+        show_startup_error(&error);
+        std::process::exit(1);
+    }
     let args = Args::parse();
-    let package_smoke_test = args.package_smoke_test;
+    let background_probe = args.package_smoke_test || args.cpu_engine_speed_probe;
     if let Err(error) = run(args) {
-        if !package_smoke_test {
+        if !background_probe {
             show_startup_error(&error);
         }
         std::process::exit(1);
     }
 }
 
+#[cfg(all(
+    feature = "embedded-llama-avx512",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+fn ensure_cpu_engine_is_supported() -> Result<()> {
+    ensure_dispatched_engine_matches_build()?;
+    anyhow::ensure!(
+        std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+            && std::arch::is_x86_feature_detected!("f16c")
+            && std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512cd")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512dq")
+            && std::arch::is_x86_feature_detected!("avx512vl"),
+        "このCPUではAVX-512版の推論エンジンを利用できません。TrimPrompt.exeから起動してください。"
+    );
+    Ok(())
+}
+
+#[cfg(all(
+    not(feature = "embedded-llama-avx512"),
+    feature = "embedded-llama-avx2",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+fn ensure_cpu_engine_is_supported() -> Result<()> {
+    ensure_dispatched_engine_matches_build()?;
+    anyhow::ensure!(
+        std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+            && std::arch::is_x86_feature_detected!("f16c"),
+        "このCPUではAVX2版の推論エンジンを利用できません。TrimPrompt.exeから起動してください。"
+    );
+    Ok(())
+}
+
+#[cfg(not(all(
+    any(feature = "embedded-llama-avx2", feature = "embedded-llama-avx512"),
+    any(target_arch = "x86", target_arch = "x86_64"),
+    any(
+        feature = "embedded-llama-avx512",
+        all(
+            not(feature = "embedded-llama-avx512"),
+            feature = "embedded-llama-avx2"
+        )
+    )
+)))]
+fn ensure_cpu_engine_is_supported() -> Result<()> {
+    ensure_dispatched_engine_matches_build()
+}
+
+fn ensure_dispatched_engine_matches_build() -> Result<()> {
+    let Some(dispatched_engine) = std::env::var_os("TRIMPROMPT_CPU_ENGINE") else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        dispatched_engine == compiled_cpu_engine(),
+        "CPU推論エンジンの構成が一致しません。パッケージを更新してください。"
+    );
+    if let Some(expected_build_id) = std::env::var_os("TRIMPROMPT_EXPECTED_BUILD_ID") {
+        anyhow::ensure!(
+            expected_build_id == compiled_build_id(),
+            "CPU推論エンジンのバージョンが一致しません。パッケージを更新してください。"
+        );
+    }
+    Ok(())
+}
+
+fn compiled_cpu_engine() -> &'static str {
+    if cfg!(feature = "embedded-llama-avx512") {
+        "avx512"
+    } else if cfg!(feature = "embedded-llama-avx2") {
+        "avx2"
+    } else {
+        "compatible"
+    }
+}
+
+fn compiled_build_id() -> &'static str {
+    option_env!("TRIMPROMPT_BUILD_ID").unwrap_or("development")
+}
+
 fn run(args: Args) -> Result<()> {
+    if let Some(process_id) = args.restart_after_pid {
+        wait_for_process_exit(process_id)?;
+    }
+    if args.cpu_engine_speed_probe {
+        return run_cpu_engine_speed_probe(args.settings_dir);
+    }
     if args.package_smoke_test {
         return run_packaged_local_model_smoke_test(args.settings_dir);
     }
@@ -231,6 +330,7 @@ fn acquire_single_instance() -> Result<Option<SingleInstanceGuard>> {
 }
 
 const PACKAGED_SMOKE_RESULT_FILE: &str = "package-smoke-result.json";
+const CPU_ENGINE_PROBE_SCHEMA_VERSION: u32 = 1;
 const PACKAGED_SMOKE_INPUT: &str = "React の検索画面で、検索ボタンを押したときだけ API を呼ぶようにしてください。既存の useSearchParams による URL クエリ管理は維持し、大規模なリファクタリングは避けてください。";
 
 fn run_packaged_local_model_smoke_test(settings_dir: Option<PathBuf>) -> Result<()> {
@@ -249,18 +349,73 @@ fn run_packaged_local_model_smoke_test(settings_dir: Option<PathBuf>) -> Result<
     }
 
     let request_body = packaged_smoke_request_body()?;
-    let response = app.handle_request("POST", "/api/compress", &request_body);
-    fs::write(&result_path, &response.body)
-        .with_context(|| format!("failed to write {}", result_path.display()))?;
+    let prepare_response = app.handle_request("POST", "/api/prepare-input", &request_body);
     anyhow::ensure!(
-        response.status == 200,
-        "packaged local model smoke test returned HTTP {}",
-        response.status
+        prepare_response.status == 200,
+        "packaged input prepare smoke test returned HTTP {}",
+        prepare_response.status
     );
+    let prepare_result: serde_json::Value = serde_json::from_slice(&prepare_response.body)
+        .context("input prepare smoke test response was not valid JSON")?;
+    validate_packaged_smoke_prepare_result(&prepare_result)?;
 
-    let result: serde_json::Value =
+    let response = app.handle_request("POST", "/api/compress", &request_body);
+    if response.status != 200 {
+        fs::write(&result_path, &response.body)
+            .with_context(|| format!("failed to write {}", result_path.display()))?;
+        anyhow::bail!(
+            "packaged local model smoke test returned HTTP {}",
+            response.status
+        );
+    }
+
+    let mut result: serde_json::Value =
         serde_json::from_slice(&response.body).context("smoke test response was not valid JSON")?;
+    if let Some(object) = result.as_object_mut() {
+        object.insert(
+            "cpu_engine".to_string(),
+            serde_json::Value::String(compiled_cpu_engine().to_string()),
+        );
+    }
+    fs::write(&result_path, serde_json::to_vec(&result)?)
+        .with_context(|| format!("failed to write {}", result_path.display()))?;
     validate_packaged_smoke_result(&result)
+}
+
+fn run_cpu_engine_speed_probe(settings_dir: Option<PathBuf>) -> Result<()> {
+    let app = prepare_embedded_web_app(settings_dir)?;
+    let application_root = app
+        .settings_dir()
+        .parent()
+        .context("settings directory must be inside the application directory")?;
+    let result_path = application_root
+        .join("local")
+        .join("state")
+        .join(format!("cpu-engine-probe-{}.json", compiled_cpu_engine()));
+    if let Some(parent) = result_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let elapsed_micros = app
+        .benchmark_default_cpu_engine()?
+        .context("CPU engine benchmark was not available")?;
+    let result = serde_json::json!({
+        "schema_version": CPU_ENGINE_PROBE_SCHEMA_VERSION,
+        "build_id": compiled_build_id(),
+        "cpu_engine": compiled_cpu_engine(),
+        "elapsed_micros": elapsed_micros
+    });
+    fs::write(&result_path, serde_json::to_vec(&result)?)
+        .with_context(|| format!("failed to write {}", result_path.display()))
+}
+
+fn validate_packaged_smoke_prepare_result(result: &serde_json::Value) -> Result<()> {
+    anyhow::ensure!(
+        result.get("prepared").and_then(serde_json::Value::as_bool) == Some(true),
+        "packaged input prepare smoke test did not prepare model state"
+    );
+    Ok(())
 }
 
 fn packaged_smoke_request_body() -> Result<Vec<u8>> {
@@ -288,6 +443,10 @@ fn validate_packaged_smoke_result(result: &serde_json::Value) -> Result<()> {
     anyhow::ensure!(
         result.get("runtime").and_then(serde_json::Value::as_str) == Some("llama_cpp_embedded"),
         "packaged local model smoke test used an unexpected runtime"
+    );
+    anyhow::ensure!(
+        result.get("cpu_engine").and_then(serde_json::Value::as_str) == Some(compiled_cpu_engine()),
+        "packaged local model smoke test used an unexpected CPU engine"
     );
     anyhow::ensure!(
         result
@@ -320,16 +479,14 @@ fn validate_packaged_smoke_result(result: &serde_json::Value) -> Result<()> {
 }
 
 fn show_startup_error(error: &anyhow::Error) {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(PathBuf::from))
-        .unwrap_or_else(std::env::temp_dir);
+    let exe_dir = startup_report_directory();
     let message = format!(
         "TrimPrompt could not start.\n\n\
          This desktop package must keep TrimPrompt.exe next to the application folder.\n\
          Required shape:\n\n\
          TrimPrompt.exe\n\
          application\\config\\\n\
+         application\\runtime\\cpu\\\n\
          application\\resources\\\n\n\
          The local model is downloaded from Hugging Face after startup.\n\n\
          Error details:\n{error:#}\n"
@@ -347,6 +504,20 @@ fn show_startup_error(error: &anyhow::Error) {
     let _ = Command::new("notepad.exe").arg(report_path).spawn();
 }
 
+fn startup_report_directory() -> PathBuf {
+    let Some(executable) = std::env::current_exe().ok() else {
+        return std::env::temp_dir();
+    };
+    let Some(executable_directory) = executable.parent() else {
+        return std::env::temp_dir();
+    };
+    executable_directory
+        .ancestors()
+        .find(|ancestor| ancestor.join("application").join("config").is_dir())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| executable_directory.to_path_buf())
+}
+
 fn run_window(app: EmbeddedWebApp) -> Result<()> {
     let application_root = app
         .settings_dir()
@@ -362,6 +533,11 @@ fn run_window(app: EmbeddedWebApp) -> Result<()> {
         .join("local")
         .join("state")
         .join("notification.log");
+    let tray_notice_suppression_path = application_root
+        .join("local")
+        .join("state")
+        .join("hide-to-tray-notice.disabled");
+    let restart_executable = resolve_restart_executable(application_root)?;
 
     let initial_theme = AppTheme::from_settings_file(application_root);
     write_notification_log(
@@ -411,6 +587,8 @@ fn run_window(app: EmbeddedWebApp) -> Result<()> {
                 let _ = desktop_proxy.send_event(DesktopEvent::WindowControl(control));
             } else if let Some(notification) = DesktopNotification::from_ipc_message(message) {
                 let _ = desktop_proxy.send_event(DesktopEvent::ShowNotification(notification));
+            } else if message == "app:restart" {
+                let _ = desktop_proxy.send_event(DesktopEvent::RestartRequested);
             }
         })
         .with_url("prompt-compressor://localhost/")
@@ -425,9 +603,13 @@ fn run_window(app: EmbeddedWebApp) -> Result<()> {
             }
             Event::UserEvent(DesktopEvent::WindowControl(control)) => {
                 if control == WindowControl::Close {
-                    drop(tray_icon.take());
-                    drop(tray_message_window.take());
-                    *control_flow = ControlFlow::Exit;
+                    if should_exit_on_window_close(tray_icon.is_some()) {
+                        drop(tray_message_window.take());
+                        *control_flow = ControlFlow::Exit;
+                    } else {
+                        hide_window_to_tray(&window);
+                        show_hide_to_tray_notice_if_needed(&tray_notice_suppression_path);
+                    }
                 } else {
                     handle_window_control(&window, control);
                 }
@@ -446,6 +628,20 @@ fn run_window(app: EmbeddedWebApp) -> Result<()> {
                 restore_window_from_tray(&window);
                 let _ = webview.evaluate_script("window.trimPromptOpenSettings?.();");
             }
+            Event::UserEvent(DesktopEvent::RestartRequested) => {
+                match spawn_restarted_process(&restart_executable) {
+                    Ok(()) => {
+                        drop(tray_icon.take());
+                        drop(tray_message_window.take());
+                        *control_flow = ControlFlow::Exit;
+                    }
+                    Err(error) => {
+                        let error =
+                            error.context("初期設定の反映後にTrimPromptを再起動できませんでした");
+                        show_startup_error(&error);
+                    }
+                }
+            }
             Event::UserEvent(DesktopEvent::ExitRequested) => {
                 drop(tray_icon.take());
                 drop(tray_message_window.take());
@@ -455,13 +651,74 @@ fn run_window(app: EmbeddedWebApp) -> Result<()> {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                drop(tray_icon.take());
-                drop(tray_message_window.take());
-                *control_flow = ControlFlow::Exit;
+                if should_exit_on_window_close(tray_icon.is_some()) {
+                    drop(tray_message_window.take());
+                    *control_flow = ControlFlow::Exit;
+                } else {
+                    hide_window_to_tray(&window);
+                    show_hide_to_tray_notice_if_needed(&tray_notice_suppression_path);
+                }
             }
             _ => {}
         }
     });
+}
+
+fn resolve_restart_executable(application_root: &Path) -> Result<PathBuf> {
+    let package_root = application_root
+        .parent()
+        .context("application directory has no package root")?;
+    let launcher = package_root.join("TrimPrompt.exe");
+    if launcher.is_file() {
+        return fs::canonicalize(&launcher)
+            .with_context(|| format!("failed to resolve {}", launcher.display()));
+    }
+    std::env::current_exe().context("failed to resolve the current executable for restart")
+}
+
+fn spawn_restarted_process(executable: &Path) -> Result<()> {
+    Command::new(executable)
+        .arg("--restart-after-pid")
+        .arg(std::process::id().to_string())
+        .spawn()
+        .with_context(|| format!("failed to restart {}", executable.display()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn wait_for_process_exit(process_id: u32) -> Result<()> {
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::Threading::{OpenProcess, WaitForSingleObject},
+    };
+
+    const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+    const WAIT_FOREVER: u32 = u32::MAX;
+    const WAIT_FAILED_RESULT: u32 = u32::MAX;
+
+    let handle = unsafe { OpenProcess(SYNCHRONIZE_ACCESS, 0, process_id) };
+    if handle.is_null() {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(87) {
+            return Ok(());
+        }
+        return Err(error).context("failed to open the previous TrimPrompt process");
+    }
+
+    let wait_result = unsafe { WaitForSingleObject(handle, WAIT_FOREVER) };
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    anyhow::ensure!(
+        wait_result != WAIT_FAILED_RESULT,
+        "failed while waiting for the previous TrimPrompt process"
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn wait_for_process_exit(_process_id: u32) -> Result<()> {
+    Ok(())
 }
 
 fn configure_window_chrome(window: &tao::window::Window, theme: AppTheme) {
@@ -1041,6 +1298,76 @@ fn handle_window_control(window: &tao::window::Window, control: WindowControl) {
     }
 }
 
+fn should_exit_on_window_close(tray_available: bool) -> bool {
+    !tray_available
+}
+
+fn hide_window_to_tray(window: &tao::window::Window) {
+    window.set_visible(false);
+}
+
+fn tray_notice_is_suppressed(path: &Path) -> bool {
+    path.is_file()
+}
+
+fn persist_tray_notice_suppression(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, b"1")
+}
+
+#[cfg(windows)]
+fn show_hide_to_tray_notice_if_needed(suppression_path: &Path) {
+    if tray_notice_is_suppressed(suppression_path) {
+        return;
+    }
+
+    use std::mem::size_of;
+    use std::ptr;
+    use windows_sys::Win32::UI::Controls::{
+        TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TDCBF_OK_BUTTON,
+        TDF_ALLOW_DIALOG_CANCELLATION, TD_INFORMATION_ICON,
+    };
+
+    let title = wide_null(APP_WINDOW_TITLE);
+    let instruction = wide_null("TrimPromptはバックグラウンドで実行中です");
+    let content = wide_null(
+        "完全に終了するには、タスクトレイのTrimPromptアイコンを右クリックして「終了」を選択してください。",
+    );
+    let verification = wide_null("今後表示しない");
+    let config = TASKDIALOGCONFIG {
+        cbSize: size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: ptr::null_mut(),
+        hInstance: ptr::null_mut(),
+        dwFlags: TDF_ALLOW_DIALOG_CANCELLATION,
+        dwCommonButtons: TDCBF_OK_BUTTON,
+        pszWindowTitle: title.as_ptr(),
+        Anonymous1: TASKDIALOGCONFIG_0 {
+            pszMainIcon: TD_INFORMATION_ICON,
+        },
+        pszMainInstruction: instruction.as_ptr(),
+        pszContent: content.as_ptr(),
+        pszVerificationText: verification.as_ptr(),
+        ..Default::default()
+    };
+    let mut verification_checked = 0;
+    let result = unsafe {
+        TaskDialogIndirect(
+            &config,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut verification_checked,
+        )
+    };
+    if result >= 0 && verification_checked != 0 {
+        let _ = persist_tray_notice_suppression(suppression_path);
+    }
+}
+
+#[cfg(not(windows))]
+fn show_hide_to_tray_notice_if_needed(_suppression_path: &Path) {}
+
 fn restore_window_from_tray(window: &tao::window::Window) {
     window.set_visible(true);
     window.set_minimized(false);
@@ -1254,6 +1581,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn window_close_keeps_the_process_alive_when_tray_is_available() {
+        assert!(!should_exit_on_window_close(true));
+        assert!(should_exit_on_window_close(false));
+    }
+
+    #[test]
+    fn tray_notice_suppression_is_persisted_as_a_marker_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "trim-prompt-tray-notice-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should follow the Unix epoch")
+                .as_nanos()
+        ));
+        let marker = directory.join("hide-to-tray-notice.disabled");
+
+        assert!(!tray_notice_is_suppressed(&marker));
+        persist_tray_notice_suppression(&marker).expect("persist tray notice suppression");
+        assert!(tray_notice_is_suppressed(&marker));
+
+        fs::remove_dir_all(directory).expect("remove tray notice test directory");
+    }
+
     #[cfg(windows)]
     #[test]
     fn named_mutex_allows_only_one_desktop_instance() {
@@ -1276,6 +1628,7 @@ mod tests {
         serde_json::json!({
             "profile": "internal_llm",
             "runtime": "llama_cpp_embedded",
+            "cpu_engine": compiled_cpu_engine(),
             "should_send_original": false,
             "distilled_prompt": "検索ボタン押下時のみAPIを呼ぶ。",
             "metrics": {
@@ -1310,6 +1663,20 @@ mod tests {
         let mut unchanged = valid_smoke_result();
         unchanged["metrics"]["output_characters"] = serde_json::json!(100);
         assert!(validate_packaged_smoke_result(&unchanged).is_err());
+    }
+
+    #[test]
+    fn packaged_smoke_prepare_validation_requires_prepared_model_state() {
+        assert!(validate_packaged_smoke_prepare_result(&serde_json::json!({
+            "prepared": true,
+            "elapsed_ms": 10
+        }))
+        .is_ok());
+        assert!(validate_packaged_smoke_prepare_result(&serde_json::json!({
+            "prepared": false,
+            "elapsed_ms": 0
+        }))
+        .is_err());
     }
 
     #[test]
