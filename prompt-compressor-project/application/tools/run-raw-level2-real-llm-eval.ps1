@@ -6,6 +6,8 @@ param(
     [string[]]$Levels = @("2"),
     [int]$CaseLimit = 0,
     [int]$CaseOffset = 0,
+    [ValidateSet("compatible", "avx2", "avx512")]
+    [string]$CpuEngine = "avx2",
     [ValidateSet("raw-model", "final-pipeline")]
     [string]$EvaluationStage = "raw-model"
 )
@@ -132,6 +134,7 @@ function Write-RunStatus {
         case_limit = $CaseLimit
         case_offset = $CaseOffset
         evaluation_stage = $EvaluationStage
+        cpu_engine = $CpuEngine
         fixture = $FixturePath
         report = $reportPath
         progress_log = $progressPath
@@ -166,8 +169,12 @@ function Join-ProcessArguments {
 }
 
 $settingsDir = Join-Path $projectRoot "application\config"
+$engineFeature = "embedded-llama-$CpuEngine"
+$engineTargetDir = Join-Path $projectRoot "target\cpu-$CpuEngine"
 $cargoArguments = @(
-    "run", "-q", "-p", "prompt-compressor-cli", "--",
+    "run", "-q", "--release", "-p", "prompt-compressor-cli",
+    "--no-default-features", "--features", $engineFeature,
+    "--target-dir", $engineTargetDir, "--",
     "--settings-dir", $settingsDir,
     "--profile", $Profile,
     "--eval-fixture", $FixturePath,

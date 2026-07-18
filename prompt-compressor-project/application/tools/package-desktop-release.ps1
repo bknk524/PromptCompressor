@@ -24,8 +24,19 @@ $outputRootPath = Split-Path -Parent $packagePath
 $applicationPath = Join-Path $projectRoot "application"
 $configPath = Join-Path $applicationPath "config"
 $resourcesPath = Join-Path $applicationPath "resources"
-$releaseExe = Join-Path $projectRoot "target\release\prompt-compressor-desktop.exe"
+$launcherReleaseExe = Join-Path $projectRoot "target\release\trim-prompt-launcher.exe"
+$buildIdPath = Join-Path $projectRoot "target\trimprompt-build-id.txt"
+$avx2TargetPath = Join-Path $projectRoot "target\cpu-avx2"
+$avx2ReleaseExe = Join-Path $avx2TargetPath "release\prompt-compressor-desktop.exe"
+$avx512TargetPath = Join-Path $projectRoot "target\cpu-avx512"
+$avx512ReleaseExe = Join-Path $avx512TargetPath "release\prompt-compressor-desktop.exe"
+$compatibleTargetPath = Join-Path $projectRoot "target\cpu-compatible"
+$compatibleReleaseExe = Join-Path $compatibleTargetPath "release\prompt-compressor-desktop.exe"
 $packageExe = Join-Path $packagePath "TrimPrompt.exe"
+$packageCpuRuntimePath = Join-Path $packagePath "application\runtime\cpu"
+$packageAvx2Exe = Join-Path $packageCpuRuntimePath "TrimPrompt-avx2.exe"
+$packageAvx512Exe = Join-Path $packageCpuRuntimePath "TrimPrompt-avx512.exe"
+$packageCompatibleExe = Join-Path $packageCpuRuntimePath "TrimPrompt-compatible.exe"
 
 function Assert-ChildPath {
     param(
@@ -168,7 +179,13 @@ function Stop-PackageProcesses {
     param([Parameter(Mandatory = $true)][string]$PackagePath)
 
     $packageFull = [System.IO.Path]::GetFullPath($PackagePath)
-    $desktopExecutableNames = @("TrimPrompt.exe", "PromptCompressor.exe")
+    $desktopExecutableNames = @(
+        "TrimPrompt.exe",
+        "TrimPrompt-avx2.exe",
+        "TrimPrompt-avx512.exe",
+        "TrimPrompt-compatible.exe",
+        "PromptCompressor.exe"
+    )
     $processes = Get-CimInstance Win32_Process | Where-Object {
         -not [string]::IsNullOrWhiteSpace($_.CommandLine) -and
         $_.CommandLine.IndexOf($packageFull, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
@@ -296,6 +313,9 @@ function Test-PackagedLocalModelCompression {
     if ($result.runtime -ne "llama_cpp_embedded") {
         throw "Packaged local model smoke test used unexpected runtime: $($result.runtime)"
     }
+    if ($result.cpu_engine -notin @("avx512", "avx2", "compatible")) {
+        throw "Packaged local model smoke test used unexpected CPU engine: $($result.cpu_engine)"
+    }
     if ($result.should_send_original) {
         throw "Packaged local model smoke test returned original prompt: $($result.fallback_reason)"
     }
@@ -364,17 +384,57 @@ function Read-DefaultProfile {
 }
 
 if (-not $SkipBuild) {
+    $gitRevision = (& git -C $projectRoot rev-parse --short=12 HEAD 2>$null | Select-Object -First 1)
+    if ([string]::IsNullOrWhiteSpace($gitRevision)) {
+        $gitRevision = "unknown"
+    }
+    $buildTimestamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddHHmmss")
+    $buildId = "$buildTimestamp-$gitRevision"
+    $env:TRIMPROMPT_BUILD_ID = $buildId
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $buildIdPath) | Out-Null
+    $buildId | Set-Content -LiteralPath $buildIdPath -Encoding ASCII
+
     Push-Location $projectRoot
     try {
         Use-LlvmBuildTools
-        cargo build --release -p prompt-compressor-desktop
+        cargo build --release -p trim-prompt-launcher
+        cargo build `
+            --release `
+            -p prompt-compressor-desktop `
+            --no-default-features `
+            --features embedded-llama-avx2 `
+            --target-dir $avx2TargetPath
+        cargo build `
+            --release `
+            -p prompt-compressor-desktop `
+            --no-default-features `
+            --features embedded-llama-avx512 `
+            --target-dir $avx512TargetPath
+        cargo build `
+            --release `
+            -p prompt-compressor-desktop `
+            --no-default-features `
+            --features embedded-llama-compatible `
+            --target-dir $compatibleTargetPath
     } finally {
         Pop-Location
     }
+} else {
+    if (-not (Test-Path -LiteralPath $buildIdPath -PathType Leaf)) {
+        throw "Build ID was not found for -SkipBuild: $buildIdPath"
+    }
+    $buildId = (Get-Content -LiteralPath $buildIdPath -Raw -Encoding ASCII).Trim()
 }
 
-if (-not (Test-Path $releaseExe)) {
-    throw "Release executable not found: $releaseExe"
+foreach ($requiredExecutable in @(
+    $launcherReleaseExe,
+    $avx2ReleaseExe,
+    $avx512ReleaseExe,
+    $compatibleReleaseExe
+)) {
+    if (-not (Test-Path $requiredExecutable)) {
+        throw "Release executable not found: $requiredExecutable"
+    }
 }
 
 New-Item -ItemType Directory -Force -Path $outputRootPath | Out-Null
@@ -389,7 +449,15 @@ if (Test-Path $packagePath) {
 }
 
 New-Item -ItemType Directory -Force -Path $packagePath | Out-Null
-Copy-Item -LiteralPath $releaseExe -Destination $packageExe -Force
+New-Item -ItemType Directory -Force -Path $packageCpuRuntimePath | Out-Null
+Copy-Item -LiteralPath $launcherReleaseExe -Destination $packageExe -Force
+Copy-Item -LiteralPath $avx2ReleaseExe -Destination $packageAvx2Exe -Force
+Copy-Item -LiteralPath $avx512ReleaseExe -Destination $packageAvx512Exe -Force
+Copy-Item -LiteralPath $compatibleReleaseExe -Destination $packageCompatibleExe -Force
+Assert-PackagedFile -RelativePath "TrimPrompt.exe" -MinimumBytes 1024
+Assert-PackagedFile -RelativePath "application\runtime\cpu\TrimPrompt-avx2.exe" -MinimumBytes 1048576
+Assert-PackagedFile -RelativePath "application\runtime\cpu\TrimPrompt-avx512.exe" -MinimumBytes 1048576
+Assert-PackagedFile -RelativePath "application\runtime\cpu\TrimPrompt-compatible.exe" -MinimumBytes 1048576
 
 Copy-Directory -Source $configPath -Destination (Join-Path $packagePath "application\config")
 Copy-Directory `
@@ -438,10 +506,11 @@ $manifest = @"
 TrimPrompt desktop package
 
 Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+Build ID: $buildId
 Executable: TrimPrompt.exe
 Default profile: $defaultProfile
 Model: downloaded from Hugging Face on first launch to application/$modelPath
-Runtime: $runtimeManifest
+Runtime: $runtimeManifest; CPU dispatch selects AVX-512, AVX2, or compatible engine at startup
 Desktop transport: WebView2 custom protocol (no HTTP server, no localhost port)
 Update behavior: application/local and application/config/user are preserved by -Clean
 

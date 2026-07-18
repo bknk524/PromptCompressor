@@ -4,12 +4,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["embedded-llama-avx2"]
+embedded-llama-compatible = ["prompt-compressor-core/embedded-llama-compatible"]
+embedded-llama-avx2 = ["prompt-compressor-core/embedded-llama-avx2"]
+embedded-llama-avx512 = ["prompt-compressor-core/embedded-llama-avx512"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-prompt-compressor-core = { path = "../../core/compression-core" }
+prompt-compressor-core = { path = "../../core/compression-core", default-features = false }
 windows-sys = { version = "0.61.2", features = [
   "Win32_Foundation",
   "Win32_UI_Shell",
