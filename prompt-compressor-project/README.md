@@ -71,7 +71,7 @@ UIは既定のデスクトップサイズでページ全体を固定し、入力
 - AVX-512版: コンパイルと静的リンクに成功
 - compatible、AVX2、AVX-512の3種類のリリースビルド: 成功
 - パッケージ内の実モデルによる入力先読みと圧縮スモークテスト: 成功
-- スモークテストでは `internal_llm`、`llama_cpp_embedded`、AVX2版を使用し、103文字の入力を79文字へ圧縮
+- スモークテストでは `internal_llm`、`llama_cpp_embedded`、AVX2版を使用し、103文字の入力を75文字へ圧縮
 
 最新の `TrimPrompt.exe` は `../TrimPrompt-exe/` に生成済みです。
 

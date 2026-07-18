@@ -13,5 +13,8 @@ The UI and CLI choose profiles. The default profile is the bundled local model;
 the LM Studio profile is only an optional external connection for trying a
 user-loaded local model.
 
-The Web UI starts serving first, then warms the default embedded model in the
-background. Runtime warmup state is exposed through `/api/runtime-status`.
+The Web UI starts serving first, then warms the default embedded model. When
+saved CPU tuning is missing or stale, the normal workspace remains gated while
+the explicit initial-setup screen runs diagnostics. Runtime warmup state is
+exposed through `/api/runtime-status`; tuning readiness is exposed through
+`/api/runtime-setup-status`.
