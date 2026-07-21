@@ -26,17 +26,61 @@ $configPath = Join-Path $applicationPath "config"
 $resourcesPath = Join-Path $applicationPath "resources"
 $launcherReleaseExe = Join-Path $projectRoot "target\release\trim-prompt-launcher.exe"
 $buildIdPath = Join-Path $projectRoot "target\trimprompt-build-id.txt"
+$inferenceCompatibilityIdPath = Join-Path $projectRoot "target\trimprompt-inference-compatibility-id.txt"
+$cpuTargetTriple = "x86_64-pc-windows-msvc"
 $avx2TargetPath = Join-Path $projectRoot "target\cpu-avx2"
-$avx2ReleaseExe = Join-Path $avx2TargetPath "release\prompt-compressor-desktop.exe"
+$avx2ReleaseExe = Join-Path $avx2TargetPath "$cpuTargetTriple\release\prompt-compressor-desktop.exe"
 $avx512TargetPath = Join-Path $projectRoot "target\cpu-avx512"
-$avx512ReleaseExe = Join-Path $avx512TargetPath "release\prompt-compressor-desktop.exe"
+$avx512ReleaseExe = Join-Path $avx512TargetPath "$cpuTargetTriple\release\prompt-compressor-desktop.exe"
 $compatibleTargetPath = Join-Path $projectRoot "target\cpu-compatible"
-$compatibleReleaseExe = Join-Path $compatibleTargetPath "release\prompt-compressor-desktop.exe"
+$compatibleReleaseExe = Join-Path $compatibleTargetPath "$cpuTargetTriple\release\prompt-compressor-desktop.exe"
 $packageExe = Join-Path $packagePath "TrimPrompt.exe"
 $packageCpuRuntimePath = Join-Path $packagePath "application\runtime\cpu"
 $packageAvx2Exe = Join-Path $packageCpuRuntimePath "TrimPrompt-avx2.exe"
 $packageAvx512Exe = Join-Path $packageCpuRuntimePath "TrimPrompt-avx512.exe"
 $packageCompatibleExe = Join-Path $packageCpuRuntimePath "TrimPrompt-compatible.exe"
+
+function Get-InferenceCompatibilityId {
+    param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+
+    $inputs = @(
+        "Cargo.toml",
+        "Cargo.lock",
+        "application\core\compression-core\Cargo.toml",
+        "application\core\compression-core\src",
+        "application\ui\web\Cargo.toml",
+        "application\ui\web\src",
+        "application\ui\desktop\Cargo.toml",
+        "application\ui\desktop\src\main.rs",
+        "application\config",
+        "application\resources\prompts",
+        "application\vendor\llama-cpp-sys-4"
+    )
+    $files = foreach ($relativePath in $inputs) {
+        $path = Join-Path $ProjectRoot $relativePath
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            Get-Item -LiteralPath $path
+        } elseif (Test-Path -LiteralPath $path -PathType Container) {
+            Get-ChildItem -LiteralPath $path -Recurse -File
+        } else {
+            throw "Inference compatibility input is missing: $path"
+        }
+    }
+
+    $manifestLines = foreach ($file in ($files | Sort-Object -Property FullName -Unique)) {
+        $relativePath = $file.FullName.Substring($ProjectRoot.Length).TrimStart('\').Replace('\', '/')
+        $fileHash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        "$relativePath|$fileHash"
+    }
+    $payload = "trimprompt-inference-compatibility-v1`n$($manifestLines -join "`n")"
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($payload))
+    } finally {
+        $sha256.Dispose()
+    }
+    return [System.BitConverter]::ToString($digest).Replace("-", "").ToLowerInvariant()
+}
 
 function Assert-ChildPath {
     param(
@@ -79,11 +123,22 @@ function Remove-PackageEntry {
 
     Assert-ChildPath -Parent $PackageRoot -Child $Path
     $item = Get-Item -LiteralPath $Path -Force
-    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-        Remove-Item -LiteralPath $Path -Force
-        return
+    $isReparsePoint = ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        try {
+            if ($isReparsePoint) {
+                Remove-Item -LiteralPath $Path -Force
+            } else {
+                Remove-Item -LiteralPath $Path -Recurse -Force
+            }
+            return
+        } catch {
+            if ($attempt -eq 19) {
+                throw
+            }
+            Start-Sleep -Milliseconds 500
+        }
     }
-    Remove-Item -LiteralPath $Path -Recurse -Force
 }
 
 function Reset-PackageManagedContent {
@@ -173,6 +228,46 @@ function Use-LlvmBuildTools {
     }
 
     throw "LLVM build tools were not found. Install LLVM, or set LIBCLANG_PATH to the folder containing libclang.dll and llvm-nm.exe."
+}
+
+function Build-CpuRuntime {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$CargoFeature,
+        [Parameter(Mandatory = $true)][string]$TargetPath,
+        [Parameter(Mandatory = $true)][string]$RustTargetFeatures
+    )
+
+    $previousEncodedRustFlags = $env:CARGO_ENCODED_RUSTFLAGS
+    $previousRustFlags = $env:RUSTFLAGS
+    try {
+        # --targetを付けることで、AVX-512非対応のビルドPCでもbuild.rsは汎用命令のまま実行する。
+        # encoded形式ならPowerShellやCargoによる命令名の引数分割も避けられる。
+        Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
+        $env:CARGO_ENCODED_RUSTFLAGS = "-Ctarget-feature=$RustTargetFeatures"
+        Write-Host "Building $Name CPU runtime (Rust: $RustTargetFeatures)..."
+        cargo build `
+            --release `
+            --target $cpuTargetTriple `
+            -p prompt-compressor-desktop `
+            --no-default-features `
+            --features "$CargoFeature,cpu-profile-strict" `
+            --target-dir $TargetPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "$Name CPU runtime build failed with exit code $LASTEXITCODE"
+        }
+    } finally {
+        if ($null -eq $previousRustFlags) {
+            Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
+        } else {
+            $env:RUSTFLAGS = $previousRustFlags
+        }
+        if ($null -eq $previousEncodedRustFlags) {
+            Remove-Item Env:CARGO_ENCODED_RUSTFLAGS -ErrorAction SilentlyContinue
+        } else {
+            $env:CARGO_ENCODED_RUSTFLAGS = $previousEncodedRustFlags
+        }
+    }
 }
 
 function Stop-PackageProcesses {
@@ -266,16 +361,69 @@ function Assert-PackagedFile {
     }
 }
 
-function Test-PackagedLocalModelCompression {
+function Invoke-PackagedCpuEngine {
     param(
-        [Parameter(Mandatory = $true)][string]$PackagePath
+        [Parameter(Mandatory = $true)][string]$ExecutablePath,
+        [Parameter(Mandatory = $true)][string]$PackagePath,
+        [Parameter(Mandatory = $true)][string]$Engine,
+        [Parameter(Mandatory = $true)][string]$BuildId,
+        [Parameter(Mandatory = $true)][string]$InferenceCompatibilityId,
+        [Parameter(Mandatory = $true)][string]$Argument
     )
 
-    Write-Host "Running packaged local model compression smoke test..."
-    $packagedExe = Join-Path $PackagePath "TrimPrompt.exe"
+    $previousEngine = [System.Environment]::GetEnvironmentVariable("TRIMPROMPT_CPU_ENGINE", "Process")
+    $previousBuildId = [System.Environment]::GetEnvironmentVariable("TRIMPROMPT_EXPECTED_BUILD_ID", "Process")
+    $previousCompatibilityId = [System.Environment]::GetEnvironmentVariable("TRIMPROMPT_INFERENCE_COMPATIBILITY_ID", "Process")
+    try {
+        [System.Environment]::SetEnvironmentVariable("TRIMPROMPT_CPU_ENGINE", $Engine, "Process")
+        [System.Environment]::SetEnvironmentVariable("TRIMPROMPT_EXPECTED_BUILD_ID", $BuildId, "Process")
+        [System.Environment]::SetEnvironmentVariable("TRIMPROMPT_INFERENCE_COMPATIBILITY_ID", $InferenceCompatibilityId, "Process")
+        return Start-Process `
+            -FilePath $ExecutablePath `
+            -WorkingDirectory $PackagePath `
+            -ArgumentList $Argument `
+            -WindowStyle Hidden `
+            -Wait `
+            -PassThru
+    } finally {
+        [System.Environment]::SetEnvironmentVariable("TRIMPROMPT_CPU_ENGINE", $previousEngine, "Process")
+        [System.Environment]::SetEnvironmentVariable("TRIMPROMPT_EXPECTED_BUILD_ID", $previousBuildId, "Process")
+        [System.Environment]::SetEnvironmentVariable("TRIMPROMPT_INFERENCE_COMPATIBILITY_ID", $previousCompatibilityId, "Process")
+    }
+}
+
+function Test-PackagedCpuEngineSupport {
+    param(
+        [Parameter(Mandatory = $true)][string]$ExecutablePath,
+        [Parameter(Mandatory = $true)][string]$PackagePath,
+        [Parameter(Mandatory = $true)][string]$Engine,
+        [Parameter(Mandatory = $true)][string]$BuildId,
+        [Parameter(Mandatory = $true)][string]$InferenceCompatibilityId
+    )
+
+    $process = Invoke-PackagedCpuEngine `
+        -ExecutablePath $ExecutablePath `
+        -PackagePath $PackagePath `
+        -Engine $Engine `
+        -BuildId $BuildId `
+        -InferenceCompatibilityId $InferenceCompatibilityId `
+        -Argument "--cpu-engine-support-probe"
+    return $process.ExitCode -eq 0
+}
+
+function Test-PackagedLocalModelCompression {
+    param(
+        [Parameter(Mandatory = $true)][string]$ExecutablePath,
+        [Parameter(Mandatory = $true)][string]$PackagePath,
+        [Parameter(Mandatory = $true)][string]$Engine,
+        [Parameter(Mandatory = $true)][string]$BuildId,
+        [Parameter(Mandatory = $true)][string]$InferenceCompatibilityId
+    )
+
+    Write-Host "Running packaged $Engine local model quality test..."
     $resultPath = Join-Path $PackagePath "application\local\state\package-smoke-result.json"
-    if (-not (Test-Path -LiteralPath $packagedExe -PathType Leaf)) {
-        throw "Packaged executable is missing: $packagedExe"
+    if (-not (Test-Path -LiteralPath $ExecutablePath -PathType Leaf)) {
+        throw "Packaged executable is missing: $ExecutablePath"
     }
     if (Test-Path -LiteralPath $resultPath) {
         Remove-Item -LiteralPath $resultPath -Force
@@ -283,13 +431,13 @@ function Test-PackagedLocalModelCompression {
 
     $json = $null
     try {
-        $process = Start-Process `
-            -FilePath $packagedExe `
-            -WorkingDirectory $PackagePath `
-            -ArgumentList "--package-smoke-test" `
-            -WindowStyle Hidden `
-            -Wait `
-            -PassThru
+        $process = Invoke-PackagedCpuEngine `
+            -ExecutablePath $ExecutablePath `
+            -PackagePath $PackagePath `
+            -Engine $Engine `
+            -BuildId $BuildId `
+            -InferenceCompatibilityId $InferenceCompatibilityId `
+            -Argument "--package-smoke-test"
         if (Test-Path -LiteralPath $resultPath -PathType Leaf) {
             $json = (Get-Content -LiteralPath $resultPath -Raw -Encoding UTF8).Trim()
         }
@@ -313,8 +461,11 @@ function Test-PackagedLocalModelCompression {
     if ($result.runtime -ne "llama_cpp_embedded") {
         throw "Packaged local model smoke test used unexpected runtime: $($result.runtime)"
     }
-    if ($result.cpu_engine -notin @("avx512", "avx2", "compatible")) {
+    if ($result.cpu_engine -ne $Engine) {
         throw "Packaged local model smoke test used unexpected CPU engine: $($result.cpu_engine)"
+    }
+    if (-not $result.quality_passed -or $result.quality_case_count -ne 5) {
+        throw "Packaged local model quality gate did not pass all five cases"
     }
     if ($result.should_send_original) {
         throw "Packaged local model smoke test returned original prompt: $($result.fallback_reason)"
@@ -326,7 +477,7 @@ function Test-PackagedLocalModelCompression {
         throw "Packaged local model smoke test did not reduce character count"
     }
 
-    Write-Host "Packaged local model smoke test passed:"
+    Write-Host "Packaged $Engine local model quality test passed:"
     Write-Host $result.distilled_prompt
 }
 
@@ -390,32 +541,35 @@ if (-not $SkipBuild) {
     }
     $buildTimestamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddHHmmss")
     $buildId = "$buildTimestamp-$gitRevision"
+    $inferenceCompatibilityId = Get-InferenceCompatibilityId -ProjectRoot $projectRoot
     $env:TRIMPROMPT_BUILD_ID = $buildId
+    $env:TRIMPROMPT_INFERENCE_COMPATIBILITY_ID = $inferenceCompatibilityId
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $buildIdPath) | Out-Null
     $buildId | Set-Content -LiteralPath $buildIdPath -Encoding ASCII
+    $inferenceCompatibilityId | Set-Content -LiteralPath $inferenceCompatibilityIdPath -Encoding ASCII
 
     Push-Location $projectRoot
     try {
         Use-LlvmBuildTools
         cargo build --release -p trim-prompt-launcher
-        cargo build `
-            --release `
-            -p prompt-compressor-desktop `
-            --no-default-features `
-            --features embedded-llama-avx2 `
-            --target-dir $avx2TargetPath
-        cargo build `
-            --release `
-            -p prompt-compressor-desktop `
-            --no-default-features `
-            --features embedded-llama-avx512 `
-            --target-dir $avx512TargetPath
-        cargo build `
-            --release `
-            -p prompt-compressor-desktop `
-            --no-default-features `
-            --features embedded-llama-compatible `
-            --target-dir $compatibleTargetPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "launcher build failed with exit code $LASTEXITCODE"
+        }
+        Build-CpuRuntime `
+            -Name "SSE4.2 compatible" `
+            -CargoFeature "embedded-llama-compatible" `
+            -TargetPath $compatibleTargetPath `
+            -RustTargetFeatures "+sse4.2"
+        Build-CpuRuntime `
+            -Name "AVX2" `
+            -CargoFeature "embedded-llama-avx2" `
+            -TargetPath $avx2TargetPath `
+            -RustTargetFeatures "+sse4.2,+avx,+avx2,+fma,+f16c,+bmi2"
+        Build-CpuRuntime `
+            -Name "AVX-512" `
+            -CargoFeature "embedded-llama-avx512" `
+            -TargetPath $avx512TargetPath `
+            -RustTargetFeatures "+sse4.2,+avx,+avx2,+fma,+f16c,+bmi2,+avx512f,+avx512cd,+avx512bw,+avx512dq,+avx512vl"
     } finally {
         Pop-Location
     }
@@ -423,7 +577,11 @@ if (-not $SkipBuild) {
     if (-not (Test-Path -LiteralPath $buildIdPath -PathType Leaf)) {
         throw "Build ID was not found for -SkipBuild: $buildIdPath"
     }
+    if (-not (Test-Path -LiteralPath $inferenceCompatibilityIdPath -PathType Leaf)) {
+        throw "Inference compatibility ID was not found for -SkipBuild: $inferenceCompatibilityIdPath"
+    }
     $buildId = (Get-Content -LiteralPath $buildIdPath -Raw -Encoding ASCII).Trim()
+    $inferenceCompatibilityId = (Get-Content -LiteralPath $inferenceCompatibilityIdPath -Raw -Encoding ASCII).Trim()
 }
 
 foreach ($requiredExecutable in @(
@@ -507,10 +665,12 @@ TrimPrompt desktop package
 
 Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
 Build ID: $buildId
+Inference compatibility ID: $inferenceCompatibilityId
 Executable: TrimPrompt.exe
 Default profile: $defaultProfile
 Model: downloaded from Hugging Face on first launch to application/$modelPath
 Runtime: $runtimeManifest; CPU dispatch selects AVX-512, AVX2, or compatible engine at startup
+CPU builds: Rust and llama.cpp use matching SSE4.2, AVX2, or AVX-512 instruction profiles
 Desktop transport: WebView2 custom protocol (no HTTP server, no localhost port)
 Update behavior: application/local and application/config/user are preserved by -Clean
 
@@ -526,8 +686,34 @@ if (-not $SkipLocalModelSmokeTest) {
     }
     Assert-PackagedFile -RelativePath "application\$modelPath" -MinimumBytes 1048576
     try {
-        Test-PackagedLocalModelCompression `
-            -PackagePath $packagePath
+        $cpuEngines = @(
+            [PSCustomObject]@{ Name = "compatible"; Executable = $packageCompatibleExe },
+            [PSCustomObject]@{ Name = "avx2"; Executable = $packageAvx2Exe },
+            [PSCustomObject]@{ Name = "avx512"; Executable = $packageAvx512Exe }
+        )
+        $testedCpuEngineCount = 0
+        foreach ($cpuEngine in $cpuEngines) {
+            $supported = Test-PackagedCpuEngineSupport `
+                -ExecutablePath $cpuEngine.Executable `
+                -PackagePath $packagePath `
+                -Engine $cpuEngine.Name `
+                -BuildId $buildId `
+                -InferenceCompatibilityId $inferenceCompatibilityId
+            if (-not $supported) {
+                Write-Host "Skipping unsupported packaged CPU engine: $($cpuEngine.Name)"
+                continue
+            }
+            Test-PackagedLocalModelCompression `
+                -ExecutablePath $cpuEngine.Executable `
+                -PackagePath $packagePath `
+                -Engine $cpuEngine.Name `
+                -BuildId $buildId `
+                -InferenceCompatibilityId $inferenceCompatibilityId
+            $testedCpuEngineCount++
+        }
+        if ($testedCpuEngineCount -eq 0) {
+            throw "No packaged CPU engine could run the local model quality test"
+        }
     } finally {
         if (-not $preservedModel) {
             Remove-PackagedModel -PackagePath $packagePath -ModelPath $packagedModelPath

@@ -5,6 +5,13 @@ const levelHelp = document.querySelector("#levelHelp");
 const themeToggle = document.querySelector("#themeToggle");
 const settingsButton = document.querySelector("#settingsButton");
 const settingsMenu = document.querySelector("#settingsMenu");
+const cpuEngineSelect = document.querySelector("#cpuEngineSelect");
+const threadModeSelect = document.querySelector("#threadModeSelect");
+const manualThreadInputs = document.querySelector("#manualThreadInputs");
+const generationThreadsInput = document.querySelector("#generationThreadsInput");
+const batchThreadsInput = document.querySelector("#batchThreadsInput");
+const runtimeCurrentValue = document.querySelector("#runtimeCurrentValue");
+const runtimeApplyButton = document.querySelector("#runtimeApplyButton");
 const runtimeTuningResetButton = document.querySelector("#runtimeTuningResetButton");
 const windowDragRegion = document.querySelector("#windowDragRegion");
 const windowMinimizeButton = document.querySelector("#windowMinimizeButton");
@@ -45,7 +52,8 @@ const legacyThemeStorageKey = "promptCompressorThemeV1";
 const compressionLevelMin = 2;
 const compressionLevelMax = 3;
 const settingsSaveDelayMs = 250;
-const inputPrepareDelayMs = 1200;
+const inputPrepareDelayMs = 450;
+const pastedInputPrepareDelayMs = 50;
 let isCompressing = false;
 let prepareTimerId = 0;
 let inputPrepareTimerId = 0;
@@ -66,6 +74,8 @@ let modelInstallInFlight = false;
 let modelCancelRequested = false;
 let activeModelDownloadProfile = "";
 let selectedModelStatus = null;
+let runtimeConfiguration = null;
+let runtimePreferencesBaseline = "";
 
 const compressionLevelDetails = {
   2: {
@@ -76,6 +86,12 @@ const compressionLevelDetails = {
     name: "高圧縮",
     description: "短い表現を使い、さらに圧縮率を高める"
   }
+};
+
+const cpuEngineLabels = {
+  compatible: "SSE4.2 互換",
+  avx2: "AVX2",
+  avx512: "AVX-512"
 };
 
 for (const levelButton of levelButtons) {
@@ -151,13 +167,28 @@ profileSelect.addEventListener("change", () => {
   readyPrepareKey = "";
   invalidatePreparedInput();
   refreshModelAvailability();
+  refreshRuntimeConfiguration();
 });
 
 runtimeTuningResetButton.addEventListener("click", resetRuntimeTuning);
+runtimeApplyButton.addEventListener("click", applyRuntimeSettings);
 
-promptInput.addEventListener("input", () => {
+for (const control of [
+  cpuEngineSelect,
+  threadModeSelect,
+  generationThreadsInput,
+  batchThreadsInput
+]) {
+  control.addEventListener("change", () => {
+    updateRuntimeControls();
+    saveSettings();
+  });
+}
+
+promptInput.addEventListener("input", (event) => {
   invalidatePreparedInput();
-  scheduleInputPrepare();
+  const pasted = event.inputType === "insertFromPaste" || event.inputType === "insertFromDrop";
+  scheduleInputPrepare(pasted ? pastedInputPrepareDelayMs : inputPrepareDelayMs);
 });
 
 copyButton.addEventListener("click", async () => {
@@ -179,6 +210,7 @@ clearInputButton.addEventListener("click", () => {
 });
 
 compressButton.addEventListener("click", async () => {
+  const compressionStartedAt = performance.now();
   if (!modelInstalled) {
     setWorkStatus("モデル取得待ち", "error");
     modelInstallButton.focus();
@@ -225,7 +257,7 @@ compressButton.addEventListener("click", async () => {
       throw new Error(payload.error || "Compression failed");
     }
 
-    renderResult(payload);
+    renderResult(payload, compressionStartedAt);
     if (payload.should_send_original) {
       setWorkStatus("圧縮せず原文を保持", "error");
       showCompletionNotice(buildFallbackMessage(payload), "原文を保持");
@@ -237,8 +269,8 @@ compressButton.addEventListener("click", async () => {
     }
   } catch (error) {
     setWorkStatus("エラー", "error");
-    promptOutput.value = String(error.message || error);
     clearResultLists();
+    promptOutput.value = String(error.message || error);
   } finally {
     setLoading(false);
     isCompressing = false;
@@ -274,6 +306,10 @@ async function loadProfiles() {
   if (saved.theme) {
     applyTheme(saved.theme);
   }
+  applyRuntimePreferences(saved);
+  await refreshRuntimeConfiguration();
+  runtimePreferencesBaseline = runtimePreferencesFingerprint();
+  updateRuntimeControls();
   updateSettingsSummary();
   saveSettings();
   await refreshModelAvailability(false);
@@ -630,7 +666,10 @@ async function runRuntimeSetupGate() {
       return false;
     }
 
-    showRuntimeSetup("初期設定中", "このPCに最適な設定を診断しています");
+    showRuntimeSetup(
+      "初期設定中",
+      "このPCに最適な設定を診断しています。完了まで少し時間がかかります"
+    );
     const result = await requestRuntimeTuning(payload);
     if (result.restart_required) {
       showRuntimeSetup("初期設定を反映しています", "まもなく自動で再起動します");
@@ -719,6 +758,161 @@ function delay(milliseconds) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
+function applyRuntimePreferences(settings) {
+  cpuEngineSelect.value = ["compatible", "avx2", "avx512"].includes(settings.cpu_engine)
+    ? settings.cpu_engine
+    : "auto";
+  threadModeSelect.value = settings.thread_mode === "manual" ? "manual" : "auto";
+  generationThreadsInput.value = positiveIntegerOrEmpty(settings.generation_threads);
+  batchThreadsInput.value = positiveIntegerOrEmpty(settings.batch_threads);
+}
+
+async function refreshRuntimeConfiguration() {
+  if (!profileSelect.value) {
+    return;
+  }
+  const profile = profileSelect.value;
+  try {
+    const response = await fetch("/api/runtime-configuration", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ profile })
+    });
+    const configuration = await response.json();
+    if (!response.ok) {
+      throw new Error(configuration.error || "runtime configuration failed");
+    }
+    if (profileSelect.value !== profile) {
+      return;
+    }
+    runtimeConfiguration = configuration;
+    const maximum = Math.max(1, Number(configuration.available_threads) || 1);
+    generationThreadsInput.max = String(maximum);
+    batchThreadsInput.max = String(maximum);
+
+    for (const option of cpuEngineSelect.options) {
+      const availability = configuration.cpu_engines?.find((engine) => engine.id === option.value);
+      option.disabled = availability ? !availability.supported : option.value !== "auto";
+    }
+    if (cpuEngineSelect.selectedOptions[0]?.disabled) {
+      cpuEngineSelect.value = "auto";
+    }
+
+    if (!positiveIntegerOrEmpty(generationThreadsInput.value)) {
+      generationThreadsInput.value = String(configuration.generation_threads || 1);
+    }
+    if (!positiveIntegerOrEmpty(batchThreadsInput.value)) {
+      batchThreadsInput.value = String(configuration.batch_threads || 1);
+    }
+    renderCurrentRuntimeConfiguration();
+    updateRuntimeControls();
+  } catch (_error) {
+    runtimeConfiguration = null;
+    runtimeCurrentValue.textContent = "取得できませんでした";
+    updateRuntimeControls();
+  }
+}
+
+function renderCurrentRuntimeConfiguration() {
+  if (!runtimeConfiguration) {
+    runtimeCurrentValue.textContent = "取得できませんでした";
+    return;
+  }
+  const engine = cpuEngineLabels[runtimeConfiguration.current_cpu_engine] || "互換版";
+  const cpuMode = runtimeConfiguration.current_cpu_mode === "manual" ? "手動" : "自動";
+  const threadMode = runtimeConfiguration.current_thread_mode === "manual" ? "手動" : "自動";
+  runtimeCurrentValue.textContent =
+    `${engine}（${cpuMode}） / 生成 ${runtimeConfiguration.generation_threads}` +
+    ` / 入力評価 ${runtimeConfiguration.batch_threads}（${threadMode}）` +
+    ` / 入力単位 ${runtimeConfiguration.logical_batch_size}` +
+    `→${runtimeConfiguration.physical_batch_size}`;
+}
+
+function positiveIntegerOrEmpty(value) {
+  const numeric = Number(value);
+  return Number.isInteger(numeric) && numeric > 0 ? String(numeric) : "";
+}
+
+function runtimePreferencesFingerprint(settings = collectSettings()) {
+  return JSON.stringify({
+    cpu_engine: settings.cpu_engine,
+    thread_mode: settings.thread_mode,
+    generation_threads: settings.generation_threads,
+    batch_threads: settings.batch_threads
+  });
+}
+
+function runtimePreferencesAreValid() {
+  if (cpuEngineSelect.selectedOptions[0]?.disabled) {
+    return false;
+  }
+  if (threadModeSelect.value !== "manual") {
+    return true;
+  }
+  const maximum = Math.max(1, Number(runtimeConfiguration?.available_threads) || 1);
+  return [generationThreadsInput, batchThreadsInput].every((input) => {
+    const value = Number(input.value);
+    return Number.isInteger(value) && value >= 1 && value <= maximum;
+  });
+}
+
+function updateRuntimeControls() {
+  const manual = threadModeSelect.value === "manual";
+  manualThreadInputs.hidden = !manual;
+  generationThreadsInput.disabled = !manual;
+  batchThreadsInput.disabled = !manual;
+  const automatic = cpuEngineSelect.value === "auto" && !manual;
+  runtimeTuningResetButton.disabled = !automatic;
+  runtimeApplyButton.disabled =
+    !runtimePreferencesAreValid() ||
+    runtimePreferencesFingerprint() === runtimePreferencesBaseline;
+}
+
+async function applyRuntimeSettings() {
+  if (runtimeApplyButton.disabled || !runtimePreferencesAreValid()) {
+    return;
+  }
+
+  const settings = collectSettings();
+  saveSettings();
+  runtimeApplyButton.disabled = true;
+  runtimeApplyButton.textContent = "保存中";
+  if (settingsSaveTimerId) {
+    clearTimeout(settingsSaveTimerId);
+    settingsSaveTimerId = 0;
+  }
+  pendingServerSettings = null;
+  while (settingsSaveInFlight) {
+    await delay(25);
+  }
+
+  try {
+    const response = await fetch("/api/settings", {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(settings)
+    });
+    const saved = await response.json();
+    if (!response.ok) {
+      throw new Error(saved.error || "runtime settings save failed");
+    }
+    lastServerSettingsFingerprint = settingsFingerprint(saved);
+    closeSettingsMenu();
+    setWorkStatus("設定を反映中", "busy");
+    if (!postDesktopMessage("app:restart")) {
+      window.location.reload();
+    }
+  } catch (_error) {
+    setWorkStatus("設定エラー", "error");
+    runtimeApplyButton.textContent = "再起動して適用";
+    updateRuntimeControls();
+  }
+}
+
 async function resetRuntimeTuning() {
   const payload = currentPreparePayload();
   if (!payload || runtimeTuningResetButton.disabled) {
@@ -748,8 +942,8 @@ async function resetRuntimeTuning() {
   } catch (_error) {
     setWorkStatus("再調整エラー", "error");
   } finally {
-    runtimeTuningResetButton.disabled = false;
     runtimeTuningResetButton.textContent = "再調整";
+    updateRuntimeControls();
   }
 }
 
@@ -763,8 +957,11 @@ function defaultCompressionConstraints() {
   };
 }
 
-function renderResult(result) {
+function renderResult(result, startedAt) {
   promptOutput.value = result.distilled_prompt || "";
+  const displayedElapsedMs = Number.isFinite(startedAt)
+    ? performance.now() - startedAt
+    : result.metrics?.latency_ms;
   const metrics = result.metrics || {};
   tokenComparison.textContent = formatComparison(
     metrics.input_tokens_est,
@@ -781,7 +978,7 @@ function renderResult(result) {
     ? `${Math.round(metrics.character_ratio * 100)}%`
     : "-";
   fallbackValue.textContent = result.should_send_original ? "はい" : "いいえ";
-  compressionLatency.textContent = formatLatencySeconds(metrics.latency_ms);
+  compressionLatency.textContent = formatLatencySeconds(displayedElapsedMs);
   resultNotice.hidden = !result.should_send_original;
   resultNoticeDetail.textContent = result.should_send_original
     ? fallbackNoticeDetail(result.fallback_reason)
@@ -815,7 +1012,7 @@ function formatLatencySeconds(latencyMs) {
   }
 
   const seconds = latencyMs / 1000;
-  return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)}s`;
+  return `${seconds.toFixed(1)}s`;
 }
 
 function setLoading(isLoading) {
@@ -1174,7 +1371,15 @@ async function loadServerSettings() {
 
 function normalizeLoadedSettings(settings) {
   const normalized = {};
-  for (const key of ["profile", "level", "theme"]) {
+  for (const key of [
+    "profile",
+    "level",
+    "theme",
+    "cpu_engine",
+    "thread_mode",
+    "generation_threads",
+    "batch_threads"
+  ]) {
     const value = settings[key];
     if (value !== undefined && value !== null && value !== "") {
       normalized[key] = value;
@@ -1195,11 +1400,17 @@ function saveSettings() {
 }
 
 function collectSettings() {
+  const generationThreads = positiveIntegerOrEmpty(generationThreadsInput.value);
+  const batchThreads = positiveIntegerOrEmpty(batchThreadsInput.value);
   return {
     schema_version: 1,
     profile: profileSelect.value,
     level: Number(clampCompressionLevel(levelInput.value)),
-    theme: themeToggle.checked ? "dark" : "light"
+    theme: themeToggle.checked ? "dark" : "light",
+    cpu_engine: cpuEngineSelect.value || "auto",
+    thread_mode: threadModeSelect.value === "manual" ? "manual" : "auto",
+    generation_threads: generationThreads ? Number(generationThreads) : null,
+    batch_threads: batchThreads ? Number(batchThreads) : null
   };
 }
 
@@ -1207,7 +1418,15 @@ function settingsFingerprint(settings) {
   return JSON.stringify({
     profile: typeof settings.profile === "string" ? settings.profile : "",
     level: Number.isFinite(Number(settings.level)) ? Number(settings.level) : null,
-    theme: settings.theme === "dark" ? "dark" : "light"
+    theme: settings.theme === "dark" ? "dark" : "light",
+    cpu_engine: settings.cpu_engine || "auto",
+    thread_mode: settings.thread_mode === "manual" ? "manual" : "auto",
+    generation_threads: Number.isInteger(Number(settings.generation_threads))
+      ? Number(settings.generation_threads)
+      : null,
+    batch_threads: Number.isInteger(Number(settings.batch_threads))
+      ? Number(settings.batch_threads)
+      : null
   });
 }
 

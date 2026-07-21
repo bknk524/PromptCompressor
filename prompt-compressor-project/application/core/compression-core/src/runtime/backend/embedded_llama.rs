@@ -1,8 +1,10 @@
 use std::error::Error;
+use std::ffi::c_void;
 use std::fmt::{Display, Formatter};
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use llama_cpp::{
     context::params::LlamaContextParams,
@@ -31,6 +33,40 @@ impl Error for LlamaError {}
 
 fn llama_error(context: &str, error: impl Display) -> LlamaError {
     LlamaError(format!("{context}: {error}"))
+}
+
+#[derive(Debug)]
+pub(super) struct AbortSignal {
+    deadline: Instant,
+}
+
+impl AbortSignal {
+    pub(super) fn with_timeout(timeout: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            deadline: Instant::now() + timeout,
+        })
+    }
+
+    pub(super) fn is_aborted(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+}
+
+#[derive(Debug, Default)]
+struct AbortCallbackState {
+    active: Mutex<Option<Arc<AbortSignal>>>,
+}
+
+unsafe extern "C" fn llama_abort_callback(data: *mut c_void) -> bool {
+    if data.is_null() {
+        return true;
+    }
+    // SAFETY: create_session stores this allocation until after its context is dropped.
+    let state = unsafe { &*(data.cast::<AbortCallbackState>()) };
+    match state.active.lock() {
+        Ok(active) => active.as_ref().is_some_and(|signal| signal.is_aborted()),
+        Err(_) => true,
+    }
 }
 
 fn backend() -> LlamaResult<&'static LlamaBackend> {
@@ -73,6 +109,8 @@ pub(super) struct LlamaParams;
 #[derive(Debug, Clone)]
 pub(super) struct SessionParams {
     pub(super) n_ctx: u32,
+    pub(super) n_batch: u32,
+    pub(super) n_ubatch: u32,
     pub(super) n_threads: u32,
     pub(super) n_threads_batch: u32,
 }
@@ -81,6 +119,8 @@ impl Default for SessionParams {
     fn default() -> Self {
         Self {
             n_ctx: 512,
+            n_batch: 512,
+            n_ubatch: 512,
             n_threads: 1,
             n_threads_batch: 1,
         }
@@ -121,17 +161,30 @@ impl LlamaModel {
             .map_err(|error| llama_error("tokenization failed", error))
     }
 
-    pub(super) fn create_session(&self, params: SessionParams) -> LlamaResult<LlamaSession> {
+    pub(super) fn create_session(&self, mut params: SessionParams) -> LlamaResult<LlamaSession> {
+        params.n_batch = params.n_batch.clamp(1, params.n_ctx.max(1));
+        params.n_ubatch = params.n_ubatch.clamp(1, params.n_batch);
         let context_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(params.n_ctx))
-            .with_n_batch(params.n_ctx.clamp(1, 512))
-            .with_n_ubatch(params.n_ctx.clamp(1, 512))
+            .with_n_batch(params.n_batch)
+            .with_n_ubatch(params.n_ubatch)
             .with_n_threads(params.n_threads.max(1) as i32)
             .with_n_threads_batch(params.n_threads_batch.max(1) as i32);
         let model = Arc::clone(&self.inner);
-        let context = model
+        let mut context = model
             .new_context(backend()?, context_params)
             .map_err(|error| llama_error("context creation failed", error))?;
+        params.n_batch = context.n_batch();
+        params.n_ubatch = context.n_ubatch();
+
+        let abort_state = Box::<AbortCallbackState>::default();
+        let abort_state_ptr = (&*abort_state as *const AbortCallbackState)
+            .cast_mut()
+            .cast();
+        // SAFETY: abort_state is heap allocated and SessionInner drops context before abort_state.
+        unsafe {
+            context.set_abort_callback(Some(llama_abort_callback), abort_state_ptr);
+        }
 
         // contextはArc内のモデルを参照する。SessionInnerがcontextを先に破棄し、modelを
         // 後に保持・破棄するため、このライフタイム延長中も参照先は必ず有効である。
@@ -141,6 +194,7 @@ impl LlamaModel {
             inner: Arc::new(Mutex::new(SessionInner {
                 context,
                 model,
+                abort_state,
                 tokens: Vec::new(),
                 last_batch_size: 0,
                 params,
@@ -151,9 +205,10 @@ impl LlamaModel {
 
 #[derive(Debug)]
 struct SessionInner {
-    // 宣言順に破棄されるため、モデルより先にcontextを解放する。
+    // 宣言順に破棄されるため、モデルと中断状態より先にcontextを解放する。
     context: LlamaContext<'static>,
     model: Arc<InnerModel>,
+    abort_state: Box<AbortCallbackState>,
     tokens: Vec<Token>,
     last_batch_size: usize,
     params: SessionParams,
@@ -168,6 +223,17 @@ pub(super) struct LlamaSession {
 }
 
 impl LlamaSession {
+    pub(super) fn set_abort_signal(&mut self, signal: Arc<AbortSignal>) -> LlamaResult<()> {
+        let session = self.lock()?;
+        let mut active = session
+            .abort_state
+            .active
+            .lock()
+            .map_err(|_| LlamaError("llama.cpp abort state lock is poisoned".to_string()))?;
+        *active = Some(signal);
+        Ok(())
+    }
+
     pub(super) fn advance_context(&mut self, bytes: &[u8]) -> LlamaResult<()> {
         let model = {
             let session = self.lock()?;
@@ -185,7 +251,7 @@ impl LlamaSession {
         }
 
         let mut session = self.lock()?;
-        let maximum_batch = session.params.n_ctx.clamp(1, 512) as usize;
+        let maximum_batch = session.params.n_batch.max(1) as usize;
         let history_size = session.tokens.len();
         let mut processed = 0usize;
 
@@ -290,17 +356,26 @@ impl CompletionHandle {
         self
     }
 
-    fn finish_pending(&mut self) -> Option<String> {
+    fn finish_pending(&mut self) -> Option<LlamaResult<String>> {
         if self.pending_utf8.is_empty() {
             None
         } else {
-            Some(String::from_utf8_lossy(&std::mem::take(&mut self.pending_utf8)).into_owned())
+            Some(Ok(String::from_utf8_lossy(&std::mem::take(
+                &mut self.pending_utf8,
+            ))
+            .into_owned()))
         }
+    }
+
+    fn fail(&mut self, error: LlamaError) -> Option<LlamaResult<String>> {
+        self.finished = true;
+        self.pending_utf8.clear();
+        Some(Err(error))
     }
 }
 
 impl Iterator for CompletionHandle {
-    type Item = String;
+    type Item = LlamaResult<String>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.finished {
@@ -315,14 +390,12 @@ impl Iterator for CompletionHandle {
         let bytes = {
             let mut session = match session_handle.lock() {
                 Ok(session) => session,
-                Err(_) => {
-                    self.finished = true;
-                    return self.finish_pending();
-                }
+                Err(error) => return self.fail(error),
             };
             if session.last_batch_size == 0 {
-                self.finished = true;
-                return self.finish_pending();
+                return self.fail(LlamaError(
+                    "cannot continue completion without decoded prompt logits".to_string(),
+                ));
             }
 
             let logit_index = session.last_batch_size.saturating_sub(1) as i32;
@@ -333,19 +406,16 @@ impl Iterator for CompletionHandle {
             }
             let bytes = match session.model.token_to_raw_bytes(token, Special::Plaintext) {
                 Ok(bytes) => bytes,
-                Err(_) => {
-                    self.finished = true;
-                    return self.finish_pending();
-                }
+                Err(error) => return self.fail(llama_error("token conversion failed", error)),
             };
 
             let position = session.tokens.len() as i32;
             let mut batch = LlamaBatch::new(1, 1);
-            if batch.add(token, position, &[0], true).is_err()
-                || session.context.decode(&mut batch).is_err()
-            {
-                self.finished = true;
-                return self.finish_pending();
+            if let Err(error) = batch.add(token, position, &[0], true) {
+                return self.fail(llama_error("completion batch creation failed", error));
+            }
+            if let Err(error) = session.context.decode(&mut batch) {
+                return self.fail(llama_error("completion decode failed", error));
             }
             session.tokens.push(token);
             session.last_batch_size = 1;
@@ -354,7 +424,7 @@ impl Iterator for CompletionHandle {
 
         self.remaining -= 1;
         self.pending_utf8.extend_from_slice(&bytes);
-        Some(take_complete_utf8(&mut self.pending_utf8))
+        Some(Ok(take_complete_utf8(&mut self.pending_utf8)))
     }
 }
 
@@ -387,7 +457,11 @@ fn take_complete_utf8(buffer: &mut Vec<u8>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_compiled_cpu_engine_matches, take_complete_utf8};
+    use std::time::Duration;
+
+    use super::{
+        ensure_compiled_cpu_engine_matches, llama_abort_callback, take_complete_utf8, AbortSignal,
+    };
 
     #[test]
     fn application_and_llama_cpp_cpu_engines_match() {
@@ -408,5 +482,15 @@ mod tests {
         let mut bytes = vec![b'a', 0xff, b'b'];
         assert_eq!(take_complete_utf8(&mut bytes), "a�b");
         assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn expired_deadline_requests_inference_abort() {
+        assert!(AbortSignal::with_timeout(Duration::ZERO).is_aborted());
+    }
+
+    #[test]
+    fn missing_abort_callback_state_fails_closed() {
+        assert!(unsafe { llama_abort_callback(std::ptr::null_mut()) });
     }
 }

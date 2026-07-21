@@ -18,9 +18,11 @@ The Web UI writes user-facing settings to:
 state/ui-settings.json
 ```
 
-The file stores the selected profile, mode, task type, compression level, and
-light/dark theme. It is excluded from Git and copied behavior is local to each
-application folder.
+The file stores the selected profile, mode, task type, compression level,
+light/dark theme, CPU-engine preference, and automatic/manual generation and
+batch thread preferences. It is excluded from Git and its behavior is local to
+each application folder. The launcher validates manual values against detected
+CPU capabilities and logical processor count before passing them to the runtime.
 
 ## Current Local Model
 
@@ -53,16 +55,31 @@ text or compression output is stored there. Records are automatically separated
 when the CPU, CPU engine, model file, or tuning contract changes.
 
 After the model is available, missing or stale records are created from the
-visible initial-setup screen. The desktop app restarts automatically before it
-uses newly measured values. Once both the selected CPU engine and its thread
-record are valid, later launches skip diagnostics and open with the saved
-settings.
+visible initial-setup screen, which explains that the diagnostics may take a
+little time. Tuning measures a representative 128-token input batch and 12
+single-token decode steps across lower-thread and high-thread candidates for
+each CPU engine. It then measures 128, 256, and 512-token physical microbatches
+with a 512-token input and changes the default 512 only for a median gain of at
+least three percent. A faster non-default candidate must also produce exactly
+the same greedy output as 512 across three representative compression prompts,
+up to 192 generated tokens each; otherwise tuning keeps 512. The alternate
+engine probe saves its complete inference record during the same setup run. The
+desktop app restarts once before it uses newly measured values. Later launches
+skip diagnostics while the records remain valid.
 
 The AVX2/AVX-512 comparison is stored in
-`state/cpu-engine-selection-v1.json`. The record contains only its schema,
-package build ID, CPU identity, and selected engine. Five fixed built-in prompts
-are used for the comparison; user input and generated output are not written to
-disk. Temporary `state/cpu-engine-probe-*.json` files contain only elapsed time
-and are removed after a successful comparison. A new package build, a CPU
-change, or the UI's CPU optimization reset invalidates the selection and starts
-again from the safe engine.
+`state/cpu-engine-selection-v1.json`. The record contains its schema, package
+build ID, inference compatibility ID, CPU identity, and selected engine. Five
+fixed built-in prompts are used for the comparison. Their generated text does
+not need to match across engines; each result must preserve the case's required
+targets, conditions, numbers, and prohibitions. User input and generated output
+are not written to disk. Temporary `state/cpu-engine-probe-*.json` files contain
+only elapsed time and the aggregate quality result and are removed after a
+successful comparison. A CPU change, an inference-affecting source/configuration
+change, or the UI's CPU optimization reset invalidates the selection. Rebuilding
+the same inference implementation or changing only static UI assets keeps the
+compatible selection.
+
+Manual CPU-engine and thread preferences in `state/ui-settings.json` override
+these automatic records without deleting them. Returning both controls to
+automatic mode re-enables compatible saved tuning data.

@@ -17,7 +17,9 @@ use sha2::{Digest, Sha256};
 use crate::compression::verifier::preserves_requested_numbers;
 use crate::config::profile::ProfileDefinition;
 use crate::error::{CompressionError, Result};
-use crate::types::CompressionRequest;
+use crate::types::{
+    CompressionConstraints, CompressionLevel, CompressionRequest, RequestSource, RequestTarget,
+};
 
 use super::catalog::{
     ModelDefinition, ModelRegistry, PromptProfileRegistry, RuntimeDefinition, RuntimeLaunchMode,
@@ -44,8 +46,11 @@ use openai_compatible::{request_openai_completion, resolve_lmstudio_model_name};
 use output_parser::first_complete_json_object_end;
 use output_parser::{output_snippet, parse_compression_output};
 #[cfg(test)]
-use thread_tuning::automatic_runtime_thread_counts;
-use thread_tuning::{parse_runtime_threads, RuntimeThreadCounts, ThreadTuningStore};
+use thread_tuning::{automatic_runtime_thread_counts, RuntimeBatchSizes, RuntimeThreadCounts};
+use thread_tuning::{
+    available_runtime_threads, manual_runtime_thread_counts, parse_runtime_threads,
+    RuntimeInferenceConfig, ThreadTuningStore,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CompressionDraft {
@@ -84,6 +89,23 @@ pub struct ProfileModelStatus {
     pub destination: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProfileThreadStatus {
+    pub mode: String,
+    pub generation_threads: u32,
+    pub batch_threads: u32,
+    pub logical_batch_size: u32,
+    pub physical_batch_size: u32,
+    pub available_threads: u32,
+}
+
+#[cfg(feature = "embedded-llama")]
+const PHYSICAL_BATCH_QUALITY_INPUTS: [&str; 3] = [
+    "Next.js の POST /api/orders で、customerId が空のまま送られた時に 500 エラーになっています。入力検証を追加し、空の customerId の場合は HTTP 400 と INVALID_CUSTOMER のエラーコードを返すようにしてください。成功時のレスポンス形式、在庫引当処理、既存の監査ログは変更しないでください。テストでは正常系と customerId 空文字のケースを確認できるようにしてください。",
+    "OpenAPI 定義に PATCH /users/{id} を追加してください。name と avatarUrl は任意で更新できるようにし、email は変更不可にしてください。404 と 409 のエラーレスポンス例を入れ、既存の POST /users は変更しないでください。既存の schema_version や共通エラー形式がある場合は、それに合わせてください。",
+    "OpenAPI に PATCH /users/{id} を追加してほしいです。name と avaterUrl、正しくは avatarUrl は任意、email は変更しちゃだめです。404 と409のエラーレスポンス例を入れてください。既存の POST /users は変更しないでください。途中でごタップして変な空白や文字が入るかもしれませんが、email 変更不可と POST /users 維持は絶対に落とさないでください。",
+];
+
 impl RuntimeCompressionObservation {
     fn unobserved(final_draft: CompressionDraft) -> Self {
         Self {
@@ -114,6 +136,40 @@ impl RuntimeCompressionObservation {
 enum EmbeddedCompletion {
     RawModel(CompressionDraft),
     RuntimeFallback(CompressionDraft),
+}
+
+#[cfg(feature = "embedded-llama")]
+fn ensure_embedded_deadline(signal: &llama_cpp::AbortSignal, timeout_ms: u64) -> Result<()> {
+    if signal.is_aborted() {
+        Err(CompressionError::RuntimeTimeout(timeout_ms))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "embedded-llama")]
+fn prefer_embedded_timeout<T>(
+    result: Result<T>,
+    signal: &llama_cpp::AbortSignal,
+    timeout_ms: u64,
+) -> Result<T> {
+    if signal.is_aborted() {
+        Err(CompressionError::RuntimeTimeout(timeout_ms))
+    } else {
+        result
+    }
+}
+
+#[cfg(feature = "embedded-llama")]
+fn embedded_timeout_completion(
+    request: &CompressionRequest,
+    timeout_ms: u64,
+) -> Result<EmbeddedCompletion> {
+    if let Some(draft) = trusted_precompacted_fallback_draft(request) {
+        Ok(EmbeddedCompletion::RuntimeFallback(draft))
+    } else {
+        Err(CompressionError::RuntimeTimeout(timeout_ms))
+    }
 }
 
 pub trait RuntimeBackend {
@@ -438,57 +494,96 @@ impl EmbeddedModelManager {
     }
 }
 
-#[cfg(all(
-    feature = "embedded-llama-avx512",
-    any(target_arch = "x86", target_arch = "x86_64")
-))]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddedCpuEngine {
+    Compatible,
+    Avx2,
+    Avx512,
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[derive(Debug, Clone, Copy, Default)]
+struct EmbeddedCpuCapabilities {
+    sse42: bool,
+    avx2: bool,
+    fma: bool,
+    f16c: bool,
+    bmi2: bool,
+    avx512f: bool,
+    avx512cd: bool,
+    avx512bw: bool,
+    avx512dq: bool,
+    avx512vl: bool,
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn compiled_embedded_cpu_engine() -> EmbeddedCpuEngine {
+    if cfg!(feature = "embedded-llama-avx512") {
+        EmbeddedCpuEngine::Avx512
+    } else if cfg!(feature = "embedded-llama-avx2") {
+        EmbeddedCpuEngine::Avx2
+    } else {
+        EmbeddedCpuEngine::Compatible
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn embedded_cpu_engine_is_supported(
+    engine: EmbeddedCpuEngine,
+    capabilities: EmbeddedCpuCapabilities,
+) -> bool {
+    let compatible = capabilities.sse42;
+    let avx2 = compatible
+        && capabilities.avx2
+        && capabilities.fma
+        && capabilities.f16c
+        && capabilities.bmi2;
+    match engine {
+        EmbeddedCpuEngine::Compatible => compatible,
+        EmbeddedCpuEngine::Avx2 => avx2,
+        EmbeddedCpuEngine::Avx512 => {
+            avx2 && capabilities.avx512f
+                && capabilities.avx512cd
+                && capabilities.avx512bw
+                && capabilities.avx512dq
+                && capabilities.avx512vl
+        }
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn ensure_embedded_cpu_engine_is_supported() -> Result<()> {
-    if std::arch::is_x86_feature_detected!("avx2")
-        && std::arch::is_x86_feature_detected!("fma")
-        && std::arch::is_x86_feature_detected!("f16c")
-        && std::arch::is_x86_feature_detected!("avx512f")
-        && std::arch::is_x86_feature_detected!("avx512cd")
-        && std::arch::is_x86_feature_detected!("avx512bw")
-        && std::arch::is_x86_feature_detected!("avx512dq")
-        && std::arch::is_x86_feature_detected!("avx512vl")
-    {
+    let engine = compiled_embedded_cpu_engine();
+    let capabilities = EmbeddedCpuCapabilities {
+        sse42: std::arch::is_x86_feature_detected!("sse4.2"),
+        avx2: std::arch::is_x86_feature_detected!("avx2"),
+        fma: std::arch::is_x86_feature_detected!("fma"),
+        f16c: std::arch::is_x86_feature_detected!("f16c"),
+        bmi2: std::arch::is_x86_feature_detected!("bmi2"),
+        avx512f: std::arch::is_x86_feature_detected!("avx512f"),
+        avx512cd: std::arch::is_x86_feature_detected!("avx512cd"),
+        avx512bw: std::arch::is_x86_feature_detected!("avx512bw"),
+        avx512dq: std::arch::is_x86_feature_detected!("avx512dq"),
+        avx512vl: std::arch::is_x86_feature_detected!("avx512vl"),
+    };
+    if embedded_cpu_engine_is_supported(engine, capabilities) {
         return Ok(());
     }
 
-    Err(CompressionError::Runtime(
-        "this build requires AVX512F, AVX512CD, AVX512BW, AVX512DQ, and AVX512VL; use the AVX2 or compatible CPU engine".into(),
-    ))
+    let requirement = match engine {
+        EmbeddedCpuEngine::Compatible => "SSE4.2",
+        EmbeddedCpuEngine::Avx2 => "SSE4.2, AVX2, FMA, F16C, and BMI2",
+        EmbeddedCpuEngine::Avx512 => {
+            "SSE4.2, AVX2, FMA, F16C, BMI2, AVX512F, AVX512CD, AVX512BW, AVX512DQ, and AVX512VL"
+        }
+    };
+    Err(CompressionError::Runtime(format!(
+        "this build requires {requirement}; select a compatible CPU engine"
+    )))
 }
 
-#[cfg(all(
-    not(feature = "embedded-llama-avx512"),
-    feature = "embedded-llama-avx2",
-    any(target_arch = "x86", target_arch = "x86_64")
-))]
-fn ensure_embedded_cpu_engine_is_supported() -> Result<()> {
-    if std::arch::is_x86_feature_detected!("avx2")
-        && std::arch::is_x86_feature_detected!("fma")
-        && std::arch::is_x86_feature_detected!("f16c")
-    {
-        return Ok(());
-    }
-
-    Err(CompressionError::Runtime(
-        "this build requires AVX2, FMA, and F16C; use the compatible CPU engine".into(),
-    ))
-}
-
-#[cfg(not(all(
-    any(feature = "embedded-llama-avx2", feature = "embedded-llama-avx512"),
-    any(target_arch = "x86", target_arch = "x86_64"),
-    any(
-        feature = "embedded-llama-avx512",
-        all(
-            not(feature = "embedded-llama-avx512"),
-            feature = "embedded-llama-avx2"
-        )
-    )
-)))]
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 fn ensure_embedded_cpu_engine_is_supported() -> Result<()> {
     Ok(())
 }
@@ -595,6 +690,58 @@ impl ConfiguredRuntimeBackend {
         })
     }
 
+    pub fn profile_thread_status(
+        &self,
+        profile: &ProfileDefinition,
+    ) -> Result<ProfileThreadStatus> {
+        let (model, runtime) = self.resolve_model_and_runtime(profile)?;
+        let manual_threads = manual_runtime_thread_counts()?;
+        let fallback = thread_tuning::runtime_config_for_threads(
+            manual_threads.unwrap_or(parse_runtime_threads(runtime)?),
+        );
+
+        #[cfg(feature = "embedded-llama")]
+        let configuration = if manual_threads.is_some() {
+            fallback
+        } else {
+            match self.resolve_model_file_path(model, &runtime.id) {
+                Ok(model_path) if model_path.is_file() => {
+                    match self.thread_tuning.resolve(model, &model_path, runtime) {
+                        Ok(configuration) => configuration,
+                        Err(error) => {
+                            eprintln!("embedded thread status is unavailable: {error}");
+                            fallback
+                        }
+                    }
+                }
+                _ => fallback,
+            }
+        };
+        #[cfg(not(feature = "embedded-llama"))]
+        let configuration = {
+            let _ = model;
+            fallback
+        };
+
+        let mode = if manual_threads.is_some() {
+            "manual"
+        } else if runtime.threads.eq_ignore_ascii_case("auto") {
+            "auto"
+        } else {
+            "configured"
+        };
+        Ok(ProfileThreadStatus {
+            mode: mode.to_string(),
+            generation_threads: configuration.threads.generation,
+            batch_threads: configuration.threads.batch,
+            logical_batch_size: configuration.batch_sizes.logical,
+            physical_batch_size: configuration.batch_sizes.physical,
+            available_threads: u32::try_from(available_runtime_threads())
+                .unwrap_or(u32::MAX)
+                .max(1),
+        })
+    }
+
     pub fn warm_profile(&self, profile: &ProfileDefinition) -> Result<bool> {
         let (model, runtime) = self.resolve_model_and_runtime(profile)?;
         match (runtime.backend_kind.as_str(), &runtime.launch_mode) {
@@ -616,7 +763,7 @@ impl ConfiguredRuntimeBackend {
         match (runtime.backend_kind.as_str(), &runtime.launch_mode) {
             ("llama.cpp", RuntimeLaunchMode::Embedded) => {
                 self.require_model_file(model, &runtime.id)?;
-                self.tune_embedded_llama_threads(model, runtime, cancellation)
+                self.tune_embedded_llama_threads(profile, model, runtime, cancellation)
             }
             _ => Ok(false),
         }
@@ -850,27 +997,42 @@ impl ConfiguredRuntimeBackend {
     }
 
     #[cfg(feature = "embedded-llama")]
-    fn resolve_embedded_thread_counts(
+    fn resolve_embedded_runtime_configuration(
         &self,
         model: &ModelDefinition,
         model_path: &Path,
         runtime: &RuntimeDefinition,
-    ) -> Result<RuntimeThreadCounts> {
-        let threads = match self.thread_tuning.resolve(model, model_path, runtime) {
-            Ok(threads) => threads,
+    ) -> Result<RuntimeInferenceConfig> {
+        let configuration = match self.thread_tuning.resolve(model, model_path, runtime) {
+            Ok(configuration) => configuration,
             Err(error) => {
                 eprintln!("embedded thread tuning is unavailable: {error}");
-                parse_runtime_threads(runtime)?
+                thread_tuning::runtime_config_for_threads(parse_runtime_threads(runtime)?)
             }
         };
-        trace_runtime_value("embedded.generation_threads", threads.generation as usize);
-        trace_runtime_value("embedded.batch_threads", threads.batch as usize);
-        Ok(threads)
+        trace_runtime_value(
+            "embedded.generation_threads",
+            configuration.threads.generation as usize,
+        );
+        trace_runtime_value(
+            "embedded.batch_threads",
+            configuration.threads.batch as usize,
+        );
+        trace_runtime_value(
+            "embedded.logical_batch_size",
+            configuration.batch_sizes.logical as usize,
+        );
+        trace_runtime_value(
+            "embedded.physical_batch_size",
+            configuration.batch_sizes.physical as usize,
+        );
+        Ok(configuration)
     }
 
     #[cfg(feature = "embedded-llama")]
     fn tune_embedded_llama_threads(
         &self,
+        profile: &ProfileDefinition,
         model: &ModelDefinition,
         runtime: &RuntimeDefinition,
         cancellation: &AtomicBool,
@@ -878,15 +1040,45 @@ impl ConfiguredRuntimeBackend {
         let model_path = self.resolve_model_file_path(model, &runtime.id)?;
         let cache_key = embedded_model_cache_key(model, &model_path);
         let llama_model = self.embedded_models.load_or_get(&cache_key, &model_path)?;
-        self.thread_tuning
-            .tune(&llama_model, model, &model_path, runtime, || {
-                cancellation.load(Ordering::Relaxed)
+        let quality_prompts = self.physical_batch_quality_prompts(profile, model)?;
+        self.thread_tuning.tune(
+            &llama_model,
+            model,
+            &model_path,
+            runtime,
+            &quality_prompts,
+            || cancellation.load(Ordering::Relaxed),
+        )
+    }
+
+    #[cfg(feature = "embedded-llama")]
+    fn physical_batch_quality_prompts(
+        &self,
+        profile: &ProfileDefinition,
+        model: &ModelDefinition,
+    ) -> Result<Vec<Vec<u8>>> {
+        let compression_level = CompressionLevel::from_u8(2)?;
+        PHYSICAL_BATCH_QUALITY_INPUTS
+            .iter()
+            .map(|input_text| {
+                let request = CompressionRequest {
+                    input_text: (*input_text).to_string(),
+                    compression_level,
+                    profile: profile.id.clone(),
+                    constraints: CompressionConstraints::default(),
+                    target: RequestTarget::codex_default(),
+                    source: RequestSource::Desktop,
+                };
+                self.build_prompt(&request, profile, model)
+                    .map(String::into_bytes)
             })
+            .collect()
     }
 
     #[cfg(not(feature = "embedded-llama"))]
     fn tune_embedded_llama_threads(
         &self,
+        _profile: &ProfileDefinition,
         _model: &ModelDefinition,
         runtime: &RuntimeDefinition,
         _cancellation: &AtomicBool,
@@ -917,25 +1109,35 @@ impl ConfiguredRuntimeBackend {
         model: &ModelDefinition,
         runtime: &RuntimeDefinition,
     ) -> Result<bool> {
-        self.preload_embedded_llama_model(model, runtime)?;
+        let total_started_at = Instant::now();
+        let timeout_ms = runtime.timeout_ms;
+        let abort_signal = llama_cpp::AbortSignal::with_timeout(Duration::from_millis(timeout_ms));
+        prefer_embedded_timeout(
+            self.preload_embedded_llama_model(model, runtime),
+            &abort_signal,
+            timeout_ms,
+        )?;
         let prompt_parts = self.build_prompt_parts(request, profile, model)?;
         if prompt_parts.prefix.trim().is_empty() {
             return Ok(false);
         }
 
-        let total_started_at = Instant::now();
         let model_path = self.resolve_model_file_path(model, &runtime.id)?;
         let model_cache_key = embedded_model_cache_key(model, &model_path);
         let prompt_prefix = format_embedded_llama_prompt_prefix(&prompt_parts.prefix);
         let model_started_at = Instant::now();
-        let llama_model = self
-            .embedded_models
-            .load_or_get(&model_cache_key, &model_path)?;
+        let llama_model = prefer_embedded_timeout(
+            self.embedded_models
+                .load_or_get(&model_cache_key, &model_path),
+            &abort_signal,
+            timeout_ms,
+        )?;
         trace_runtime_timing(
             "embedded.prepare_model_load_or_cache",
             model_started_at.elapsed(),
         );
-        let threads = self.resolve_embedded_thread_counts(model, &model_path, runtime)?;
+        let configuration =
+            self.resolve_embedded_runtime_configuration(model, &model_path, runtime)?;
         let max_tokens = effective_max_output_tokens(request, model) as usize;
         let context_length = select_embedded_context_length(
             &llama_model,
@@ -945,8 +1147,13 @@ impl ConfiguredRuntimeBackend {
             model.context_length as usize,
         )?;
         trace_runtime_value("embedded.selected_context", context_length as usize);
-        let prompt_cache_key =
-            embedded_prompt_cache_key(model, &model_path, context_length, threads, &prompt_prefix);
+        let prompt_cache_key = embedded_prompt_cache_key(
+            model,
+            &model_path,
+            context_length,
+            configuration,
+            &prompt_prefix,
+        );
         if self
             .embedded_models
             .has_prepared_session(&prompt_cache_key)?
@@ -959,13 +1166,22 @@ impl ConfiguredRuntimeBackend {
         trace_runtime_value("embedded.prepare_prompt_cache_hit", 0);
         let session_started_at = Instant::now();
         let mut session = llama_model
-            .create_session(embedded_session_params(context_length, threads))
+            .create_session(embedded_session_params(context_length, configuration))
             .map_err(|error| {
                 CompressionError::Runtime(format!(
                     "failed to create prepared embedded llama.cpp session for '{}': {error}",
                     model.id
                 ))
             })?;
+        session
+            .set_abort_signal(Arc::clone(&abort_signal))
+            .map_err(|error| {
+                CompressionError::Runtime(format!(
+                    "failed to configure prepared embedded llama.cpp timeout for '{}': {error}",
+                    model.id
+                ))
+            })?;
+        ensure_embedded_deadline(&abort_signal, timeout_ms)?;
         trace_runtime_timing(
             "embedded.prepare_session_create",
             session_started_at.elapsed(),
@@ -973,22 +1189,75 @@ impl ConfiguredRuntimeBackend {
 
         trace_runtime_value("embedded.prepare_prompt_prefix_bytes", prompt_prefix.len());
         let feed_started_at = Instant::now();
-        session
-            .advance_context(prompt_prefix.as_bytes())
-            .map_err(|error| {
-                CompressionError::Runtime(format!(
+        prefer_embedded_timeout(
+            session
+                .advance_context(prompt_prefix.as_bytes())
+                .map_err(|error| {
+                    CompressionError::Runtime(format!(
                     "failed to prepare prompt prefix for embedded llama.cpp model '{}': {error}",
                     model.id
                 ))
-            })?;
+                }),
+            &abort_signal,
+            timeout_ms,
+        )?;
         trace_runtime_timing(
             "embedded.prepare_prompt_prefix_eval",
             feed_started_at.elapsed(),
         );
 
+        // Preserve a clean prefix session before exercising the one-token decode path.
+        // Both cold operations then finish before the first user compression.
+        let copy_started_at = Instant::now();
+        let clean_session = prefer_embedded_timeout(
+            session.deep_copy().map_err(|error| {
+                CompressionError::Runtime(format!(
+                    "failed to pre-copy prepared embedded prompt session for '{}': {error}",
+                    model.id
+                ))
+            }),
+            &abort_signal,
+            timeout_ms,
+        )?;
+        trace_runtime_timing(
+            "embedded.prepare_prompt_cold_copy",
+            copy_started_at.elapsed(),
+        );
+
+        let generation_started_at = Instant::now();
+        let mut warmup = session
+            .start_completing_with(
+                llama_cpp::standard_sampler::StandardSampler::new_greedy(),
+                1,
+            )
+            .map_err(|error| {
+                CompressionError::Runtime(format!(
+                    "failed to warm embedded llama.cpp generation for '{}': {error}",
+                    model.id
+                ))
+            })?;
+        if let Some(result) = warmup.next() {
+            prefer_embedded_timeout(
+                result.map_err(|error| {
+                    CompressionError::Runtime(format!(
+                        "failed to warm embedded llama.cpp generation for '{}': {error}",
+                        model.id
+                    ))
+                }),
+                &abort_signal,
+                timeout_ms,
+            )?;
+        }
+        drop(warmup);
+        ensure_embedded_deadline(&abort_signal, timeout_ms)?;
+        trace_runtime_timing(
+            "embedded.prepare_generation_warmup",
+            generation_started_at.elapsed(),
+        );
+
         let store_started_at = Instant::now();
         self.embedded_models
-            .store_prepared_session(prompt_cache_key, session)?;
+            .store_prepared_session(prompt_cache_key, clean_session)?;
         trace_runtime_timing("embedded.prepare_prompt_store", store_started_at.elapsed());
         trace_runtime_timing("embedded.prepare_total", total_started_at.elapsed());
         Ok(true)
@@ -1002,8 +1271,14 @@ impl ConfiguredRuntimeBackend {
         model: &ModelDefinition,
         runtime: &RuntimeDefinition,
     ) -> Result<bool> {
-        self.preload_embedded_llama_model(model, runtime)?;
         let total_started_at = Instant::now();
+        let timeout_ms = runtime.timeout_ms;
+        let abort_signal = llama_cpp::AbortSignal::with_timeout(Duration::from_millis(timeout_ms));
+        prefer_embedded_timeout(
+            self.preload_embedded_llama_model(model, runtime),
+            &abort_signal,
+            timeout_ms,
+        )?;
         let prompt_parts = self.build_prompt_parts(request, profile, model)?;
         let model_path = self.resolve_model_file_path(model, &runtime.id)?;
         let model_cache_key = embedded_model_cache_key(model, &model_path);
@@ -1021,14 +1296,18 @@ impl ConfiguredRuntimeBackend {
             )
         };
         let model_started_at = Instant::now();
-        let llama_model = self
-            .embedded_models
-            .load_or_get(&model_cache_key, &model_path)?;
+        let llama_model = prefer_embedded_timeout(
+            self.embedded_models
+                .load_or_get(&model_cache_key, &model_path),
+            &abort_signal,
+            timeout_ms,
+        )?;
         trace_runtime_timing(
             "embedded.prepare_input_model_load_or_cache",
             model_started_at.elapsed(),
         );
-        let threads = self.resolve_embedded_thread_counts(model, &model_path, runtime)?;
+        let configuration =
+            self.resolve_embedded_runtime_configuration(model, &model_path, runtime)?;
         let max_tokens = effective_max_output_tokens(request, model) as usize;
         let context_length = select_embedded_context_length(
             &llama_model,
@@ -1043,7 +1322,7 @@ impl ConfiguredRuntimeBackend {
                 model,
                 &model_path,
                 context_length,
-                threads,
+                configuration,
                 &embedded_prefix,
             )
         });
@@ -1051,7 +1330,7 @@ impl ConfiguredRuntimeBackend {
             model,
             &model_path,
             context_length,
-            threads,
+            configuration,
             &embedded_prefix,
             &embedded_suffix,
         );
@@ -1073,7 +1352,7 @@ impl ConfiguredRuntimeBackend {
                 session
             } else {
                 let mut session = llama_model
-                    .create_session(embedded_session_params(context_length, threads))
+                    .create_session(embedded_session_params(context_length, configuration))
                     .map_err(|error| {
                         CompressionError::Runtime(format!(
                             "failed to create prepared embedded llama.cpp session for '{}': {error}",
@@ -1081,20 +1360,30 @@ impl ConfiguredRuntimeBackend {
                         ))
                     })?;
                 session
-                    .advance_context(embedded_prefix.as_bytes())
+                    .set_abort_signal(Arc::clone(&abort_signal))
                     .map_err(|error| {
+                        CompressionError::Runtime(format!(
+                            "failed to configure prepared embedded llama.cpp timeout for '{}': {error}",
+                            model.id
+                        ))
+                    })?;
+                prefer_embedded_timeout(
+                    session.advance_context(embedded_prefix.as_bytes()).map_err(|error| {
                         CompressionError::Runtime(format!(
                             "failed to prepare prompt prefix for embedded llama.cpp model '{}': {error}",
                             model.id
                         ))
-                    })?;
+                    }),
+                    &abort_signal,
+                    timeout_ms,
+                )?;
                 self.embedded_models
                     .store_prepared_session_copy(prompt_cache_key.to_string(), &session)?;
                 session
             }
         } else {
             llama_model
-                .create_session(embedded_session_params(context_length, threads))
+                .create_session(embedded_session_params(context_length, configuration))
                 .map_err(|error| {
                     CompressionError::Runtime(format!(
                         "failed to create prepared embedded llama.cpp session for '{}': {error}",
@@ -1102,17 +1391,31 @@ impl ConfiguredRuntimeBackend {
                     ))
                 })?
         };
-
-        let feed_started_at = Instant::now();
         session
-            .advance_context(embedded_suffix.as_bytes())
+            .set_abort_signal(Arc::clone(&abort_signal))
             .map_err(|error| {
                 CompressionError::Runtime(format!(
-                    "failed to prepare input for embedded llama.cpp model '{}': {error}",
+                    "failed to configure prepared input timeout for '{}': {error}",
                     model.id
                 ))
             })?;
+        ensure_embedded_deadline(&abort_signal, timeout_ms)?;
+
+        let feed_started_at = Instant::now();
+        prefer_embedded_timeout(
+            session
+                .advance_context(embedded_suffix.as_bytes())
+                .map_err(|error| {
+                    CompressionError::Runtime(format!(
+                        "failed to prepare input for embedded llama.cpp model '{}': {error}",
+                        model.id
+                    ))
+                }),
+            &abort_signal,
+            timeout_ms,
+        )?;
         trace_runtime_timing("embedded.prepare_input_eval", feed_started_at.elapsed());
+        ensure_embedded_deadline(&abort_signal, timeout_ms)?;
         self.embedded_models
             .store_prepared_input_session(input_cache_key, session)?;
         trace_runtime_timing("embedded.prepare_input_total", total_started_at.elapsed());
@@ -1205,12 +1508,22 @@ impl ConfiguredRuntimeBackend {
         allow_prompt_cache: bool,
     ) -> Result<EmbeddedCompletion> {
         let total_started_at = Instant::now();
+        let timeout_ms = runtime.timeout_ms;
+        let abort_signal = llama_cpp::AbortSignal::with_timeout(Duration::from_millis(timeout_ms));
         let model_path = self.resolve_model_file_path(model, &runtime.id)?;
         let cache_key = embedded_model_cache_key(model, &model_path);
         let model_started_at = Instant::now();
-        let llama_model = self.embedded_models.load_or_get(&cache_key, &model_path)?;
+        let llama_model = match self.embedded_models.load_or_get(&cache_key, &model_path) {
+            Ok(model) if !abort_signal.is_aborted() => model,
+            Ok(_) => return embedded_timeout_completion(request, timeout_ms),
+            Err(_) if abort_signal.is_aborted() => {
+                return embedded_timeout_completion(request, timeout_ms)
+            }
+            Err(error) => return Err(error),
+        };
         trace_runtime_timing("embedded.model_load_or_cache", model_started_at.elapsed());
-        let threads = self.resolve_embedded_thread_counts(model, &model_path, runtime)?;
+        let configuration =
+            self.resolve_embedded_runtime_configuration(model, &model_path, runtime)?;
 
         let prompt_started_at = Instant::now();
         let use_prompt_cache = allow_prompt_cache && !prompt_parts.prefix.trim().is_empty();
@@ -1245,7 +1558,7 @@ impl ConfiguredRuntimeBackend {
                 model,
                 &model_path,
                 context_length,
-                threads,
+                configuration,
                 &embedded_prefix,
             )
         });
@@ -1253,7 +1566,7 @@ impl ConfiguredRuntimeBackend {
             model,
             &model_path,
             context_length,
-            threads,
+            configuration,
             &embedded_prefix,
             &embedded_suffix,
         );
@@ -1278,24 +1591,36 @@ impl ConfiguredRuntimeBackend {
             } else {
                 let session_started_at = Instant::now();
                 let mut session = llama_model
-                    .create_session(embedded_session_params(context_length, threads))
+                    .create_session(embedded_session_params(context_length, configuration))
                     .map_err(|error| {
                         CompressionError::Runtime(format!(
                             "failed to create embedded llama.cpp session for '{}': {error}",
                             model.id
                         ))
                     })?;
+                session
+                    .set_abort_signal(Arc::clone(&abort_signal))
+                    .map_err(|error| {
+                        CompressionError::Runtime(format!(
+                            "failed to configure embedded llama.cpp timeout for '{}': {error}",
+                            model.id
+                        ))
+                    })?;
                 trace_runtime_timing("embedded.session_create", session_started_at.elapsed());
 
                 let prefix_started_at = Instant::now();
-                session
-                    .advance_context(embedded_prefix.as_bytes())
-                    .map_err(|error| {
+                let prefix_result = session.advance_context(embedded_prefix.as_bytes()).map_err(
+                    |error| {
                         CompressionError::Runtime(format!(
                             "failed to feed prepared prompt prefix to embedded llama.cpp model '{}': {error}",
                             model.id
                         ))
-                    })?;
+                    },
+                );
+                if abort_signal.is_aborted() {
+                    return embedded_timeout_completion(request, timeout_ms);
+                }
+                prefix_result?;
                 prompt_prefix_eval_elapsed = prefix_started_at.elapsed();
                 trace_runtime_timing("embedded.prompt_prefix_eval", prompt_prefix_eval_elapsed);
                 self.embedded_models
@@ -1305,7 +1630,7 @@ impl ConfiguredRuntimeBackend {
         } else {
             let session_started_at = Instant::now();
             let session = llama_model
-                .create_session(embedded_session_params(context_length, threads))
+                .create_session(embedded_session_params(context_length, configuration))
                 .map_err(|error| {
                     CompressionError::Runtime(format!(
                         "failed to create embedded llama.cpp session for '{}': {error}",
@@ -1315,6 +1640,17 @@ impl ConfiguredRuntimeBackend {
             trace_runtime_timing("embedded.session_create", session_started_at.elapsed());
             (session, false)
         };
+        session
+            .set_abort_signal(Arc::clone(&abort_signal))
+            .map_err(|error| {
+                CompressionError::Runtime(format!(
+                    "failed to configure embedded llama.cpp timeout for '{}': {error}",
+                    model.id
+                ))
+            })?;
+        if abort_signal.is_aborted() {
+            return embedded_timeout_completion(request, timeout_ms);
+        }
         trace_runtime_value("embedded.prompt_cache_hit", usize::from(prompt_cache_hit));
         trace_runtime_value("embedded.input_cache_hit", usize::from(input_cache_hit));
 
@@ -1322,14 +1658,19 @@ impl ConfiguredRuntimeBackend {
             Duration::ZERO
         } else {
             let suffix_started_at = Instant::now();
-            session
-                .advance_context(embedded_suffix.as_bytes())
-                .map_err(|error| {
-                    CompressionError::Runtime(format!(
-                        "failed to feed prompt to embedded llama.cpp model '{}': {error}",
-                        model.id
-                    ))
-                })?;
+            let suffix_result =
+                session
+                    .advance_context(embedded_suffix.as_bytes())
+                    .map_err(|error| {
+                        CompressionError::Runtime(format!(
+                            "failed to feed prompt to embedded llama.cpp model '{}': {error}",
+                            model.id
+                        ))
+                    });
+            if abort_signal.is_aborted() {
+                return embedded_timeout_completion(request, timeout_ms);
+            }
+            suffix_result?;
             suffix_started_at.elapsed()
         };
         trace_runtime_timing("embedded.prompt_suffix_eval", suffix_elapsed);
@@ -1356,22 +1697,30 @@ impl ConfiguredRuntimeBackend {
             "embedded.completion_setup",
             completion_setup_started_at.elapsed(),
         );
-        let started_at = Instant::now();
-        let timeout = Duration::from_millis(runtime.timeout_ms);
+        let generation_started_at = Instant::now();
         let mut output = String::new();
         let mut generated_chunks = 0usize;
 
         for token in &mut completions {
-            if started_at.elapsed() >= timeout {
-                if let Some(draft) = trusted_precompacted_fallback_draft(request) {
-                    trace_runtime_timing("embedded.generation", started_at.elapsed());
-                    trace_runtime_value("embedded.generated_chunks", generated_chunks);
-                    trace_runtime_value("embedded.output_chars", output.chars().count());
-                    return Ok(EmbeddedCompletion::RuntimeFallback(draft));
-                }
-                return Err(CompressionError::RuntimeTimeout(runtime.timeout_ms));
+            if abort_signal.is_aborted() {
+                trace_runtime_timing("embedded.generation", generation_started_at.elapsed());
+                trace_runtime_value("embedded.generated_chunks", generated_chunks);
+                trace_runtime_value("embedded.output_chars", output.chars().count());
+                return embedded_timeout_completion(request, timeout_ms);
             }
 
+            let token = match token {
+                Ok(token) => token,
+                Err(_) if abort_signal.is_aborted() => {
+                    return embedded_timeout_completion(request, timeout_ms)
+                }
+                Err(error) => {
+                    return Err(CompressionError::Runtime(format!(
+                        "embedded llama.cpp generation failed for '{}': {error}",
+                        model.id
+                    )))
+                }
+            };
             generated_chunks += 1;
             output.push_str(&token);
             let completed_json = {
@@ -1384,7 +1733,10 @@ impl ConfiguredRuntimeBackend {
                 break;
             }
         }
-        trace_runtime_timing("embedded.generation", started_at.elapsed());
+        if abort_signal.is_aborted() {
+            return embedded_timeout_completion(request, timeout_ms);
+        }
+        trace_runtime_timing("embedded.generation", generation_started_at.elapsed());
         trace_runtime_value("embedded.generated_chunks", generated_chunks);
         trace_runtime_value("embedded.output_chars", output.chars().count());
 
@@ -1808,7 +2160,10 @@ fn validated_draft_or_fallback(
     draft: CompressionDraft,
 ) -> Result<CompressionDraft> {
     if let Err(error) = validate_compression_draft(request, &draft) {
-        if let Some(fallback) = trusted_precompacted_fallback_draft(request) {
+        if let Some(mut fallback) = trusted_precompacted_fallback_draft(request) {
+            restore_missing_required_constraints(request, &mut fallback);
+            restore_missing_required_terms(request, &mut fallback);
+            polish_model_output_for_request(request, &mut fallback);
             return Ok(fallback);
         }
         return Err(CompressionError::Runtime(format!(
@@ -1987,18 +2342,20 @@ fn embedded_prompt_cache_key(
     model: &ModelDefinition,
     model_path: &Path,
     context_length: u32,
-    threads: RuntimeThreadCounts,
+    configuration: RuntimeInferenceConfig,
     embedded_prompt_prefix: &str,
 ) -> String {
     let mut hasher = DefaultHasher::new();
     embedded_prompt_prefix.hash(&mut hasher);
     format!(
-        "{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}",
         model.id,
         model_path.display(),
         context_length,
-        threads.generation,
-        threads.batch,
+        configuration.threads.generation,
+        configuration.threads.batch,
+        configuration.batch_sizes.logical,
+        configuration.batch_sizes.physical,
         hasher.finish()
     )
 }
@@ -2007,7 +2364,7 @@ fn embedded_input_cache_key(
     model: &ModelDefinition,
     model_path: &Path,
     context_length: u32,
-    threads: RuntimeThreadCounts,
+    configuration: RuntimeInferenceConfig,
     embedded_prompt_prefix: &str,
     embedded_prompt_suffix: &str,
 ) -> String {
@@ -2021,24 +2378,28 @@ fn embedded_input_cache_key(
         write!(&mut digest_hex, "{byte:02x}").expect("writing to a String cannot fail");
     }
     format!(
-        "{}:{}:{}:{}:{}:input:{digest_hex}",
+        "{}:{}:{}:{}:{}:{}:{}:input:{digest_hex}",
         model.id,
         model_path.display(),
         context_length,
-        threads.generation,
-        threads.batch
+        configuration.threads.generation,
+        configuration.threads.batch,
+        configuration.batch_sizes.logical,
+        configuration.batch_sizes.physical
     )
 }
 
 #[cfg(feature = "embedded-llama")]
 fn embedded_session_params(
     context_length: u32,
-    threads: RuntimeThreadCounts,
+    configuration: RuntimeInferenceConfig,
 ) -> llama_cpp::SessionParams {
     llama_cpp::SessionParams {
         n_ctx: context_length,
-        n_threads: threads.generation,
-        n_threads_batch: threads.batch,
+        n_batch: configuration.batch_sizes.logical,
+        n_ubatch: configuration.batch_sizes.physical,
+        n_threads: configuration.threads.generation,
+        n_threads_batch: configuration.threads.batch,
     }
 }
 
@@ -2249,7 +2610,7 @@ fn preserves_constraint_clause_roles(input: &str, output: &str) -> bool {
                 })
             }) && trailing_constraint_actions(clause)
                 .iter()
-                .all(|action| contains_ascii_case_insensitive(output, action))
+                .all(|action| output_preserves_trailing_constraint_action(output, action))
         })
 }
 
@@ -2290,7 +2651,7 @@ fn preserves_verification_list_separation(clause: &str, output: &str) -> bool {
 }
 
 fn verification_list_anchors(clause: &str) -> Vec<String> {
-    if !contains_any_marker(clause, &["テスト", "確認", "検証", "test", "verify"]) {
+    if !contains_explicit_test_marker(clause) {
         return Vec::new();
     }
     let items: Vec<_> = clause
@@ -2370,6 +2731,7 @@ fn contains_output_negative_marker(clause: &str) -> bool {
             "なし",
             "不要",
             "禁止",
+            "非表示",
             "避け",
             "回避",
             "維持",
@@ -2476,6 +2838,9 @@ fn trailing_constraint_actions(clause: &str) -> Vec<String> {
                 .unwrap_or(fragment)
                 .trim_start_matches(['が', 'し', 'て'])
                 .trim();
+            if matches!(fragment, "ように" | "ようにし" | "ようにする" | "よう") {
+                continue;
+            }
             if fragment.chars().count() >= 2
                 && fragment.chars().count() <= 16
                 && !actions.iter().any(|existing| existing == fragment)
@@ -2497,10 +2862,70 @@ fn output_clause_preserves_constraint_action(output_clause: &str, requirement: &
     if contains_ascii_case_insensitive(output_clause, requirement) {
         return true;
     }
+    if requirement.contains("はみ出さ") {
+        return contains_any_marker(output_clause, &["はみ出さない", "収ま", "収め", "バー内"]);
+    }
+    if requirement.contains("混ざら") || requirement.contains("混ぜ") {
+        return contains_any_marker(
+            output_clause,
+            &["混ざらない", "混ぜない", "混在禁止", "データ混ざらない"],
+        );
+    }
+    if requirement.contains("出さ") {
+        return contains_any_marker(output_clause, &["出さない", "表示しない", "非表示"]);
+    }
+    if matches!(requirement, "消え" | "消さ") {
+        return contains_any_marker(
+            output_clause,
+            &["消えない", "消さない", "維持", "保持", "残す", "残して"],
+        );
+    }
     if matches!(requirement, "変え" | "変更") {
         return contains_any_marker(output_clause, &["変え", "変更", "維持", "保持"]);
     }
+    if requirement.contains("エラー") && requirement.contains("返") {
+        return contains_any_marker(output_clause, &["エラー返却", "エラーを返", "エラー返"]);
+    }
+    if requirement.contains("返") {
+        return contains_any_marker(output_clause, &["返却", "返す", "返し"]);
+    }
     false
+}
+
+fn output_preserves_trailing_constraint_action(output: &str, action: &str) -> bool {
+    if contains_ascii_case_insensitive(output, action) {
+        return true;
+    }
+    if action.contains("エラー") && action.contains("返") {
+        return contains_any_marker(output, &["エラー返却", "エラーを返", "エラー返"]);
+    }
+
+    let output = compact_constraint_action_text(output);
+    let action = compact_constraint_action_text(action);
+    !action.is_empty() && contains_ascii_case_insensitive(&output, &action)
+}
+
+fn compact_constraint_action_text(text: &str) -> String {
+    [
+        ("分かりやすい", ""),
+        ("わかりやすい", ""),
+        (" の ", ""),
+        (" の", ""),
+        ("の", ""),
+        (" を ", ""),
+        ("を", ""),
+        (" に ", ""),
+        ("に", ""),
+        ("してください", ""),
+        ("してほしい", ""),
+        ("テスト追加", "テスト追加"),
+    ]
+    .iter()
+    .fold(text.trim().to_string(), |compact, (from, to)| {
+        compact.replace(from, to)
+    })
+    .split_whitespace()
+    .collect::<String>()
 }
 
 pub(crate) fn normalized_verification_input(input: &str) -> String {
@@ -2569,6 +2994,7 @@ fn normalize_known_required_term_typos(input: &str, output: &str) -> String {
         ("PowerShell", "PawerShell", "PowerShell"),
         ("DataLoader", "DataLoder", "DataLoader"),
         ("LM Studio", "LMStduio", "LM Studio"),
+        ("LM Studio", "LMS Studio", "LM Studio"),
         ("clipboard", "clpboard", "clipboard"),
     ] {
         if (contains_ascii_case_insensitive(input, required_term)
@@ -2834,24 +3260,31 @@ fn restore_missing_required_constraints(
         return;
     }
 
+    let validation_input = normalized_verification_input(&request.input_text);
     let normalized =
-        normalize_required_constraint_terms(&request.input_text, draft.distilled_prompt.trim());
+        normalize_required_constraint_terms(&validation_input, draft.distilled_prompt.trim());
     if normalized != draft.distilled_prompt.trim() {
         draft.distilled_prompt = normalized;
     }
 
     let output = draft.distilled_prompt.trim();
-    if output.is_empty() || preserves_negative_constraints(&request.input_text, output) {
+    if output.is_empty() {
         return;
     }
 
-    let phrases = missing_constraint_restoration_phrases(&request.input_text, output);
+    let preserves_negatives = preserves_negative_constraints(&request.input_text, output);
+    let phrases = if preserves_negatives {
+        missing_nonnegative_constraint_restoration_phrases(&request.input_text, output)
+    } else {
+        missing_constraint_restoration_phrases(&request.input_text, output)
+    };
     if phrases.is_empty() {
         return;
     }
 
     let input_len = request.input_text.trim().chars().count();
     let mut restored = output.to_string();
+    let mut applied = false;
     for phrase in phrases {
         let mut candidate = append_restoration_phrase(&restored, &phrase);
         if candidate.chars().count() >= input_len {
@@ -2865,7 +3298,7 @@ fn restore_missing_required_constraints(
             candidate = append_restoration_phrase(&trimmed_output, &phrase);
         }
 
-        if !contains_required_technical_terms(&request.input_text, &candidate) {
+        if !contains_required_technical_terms(&validation_input, &candidate) {
             let mut candidate_draft = CompressionDraft {
                 distilled_prompt: candidate,
                 removed_content_summary: Vec::new(),
@@ -2875,16 +3308,21 @@ fn restore_missing_required_constraints(
         }
 
         if candidate.chars().count() >= input_len
-            || !contains_required_technical_terms(&request.input_text, &candidate)
+            || !contains_required_technical_terms(&validation_input, &candidate)
         {
             continue;
         }
 
         restored = candidate;
-        if preserves_negative_constraints(&request.input_text, &restored) {
+        applied = true;
+        if !preserves_negatives && preserves_negative_constraints(&request.input_text, &restored) {
             draft.distilled_prompt = restored;
             return;
         }
+    }
+
+    if preserves_negatives && applied {
+        draft.distilled_prompt = restored;
     }
 }
 
@@ -2917,6 +3355,44 @@ fn normalize_required_constraint_terms(input: &str, output: &str) -> String {
     if input.contains("変更しない") {
         normalized = normalized.replace("変更せず", "変更しない");
     }
+    if input.contains("保存しない") {
+        normalized = normalized.replace("保存せず", "保存しない");
+    }
+    if input.contains("任意") {
+        normalized = normalized.replace("更新可能", "任意");
+    }
+    if contains_any_marker(input, &["残してください", "残して", "残す"]) {
+        normalized = normalized
+            .replace("残してください", "残す")
+            .replace("残してほしい", "残す")
+            .replace("残して", "残す");
+    }
+    if contains_any_marker(input, &["いりません", "いらない", "不要"]) {
+        normalized = normalized.replace("いりません", "不要");
+    }
+    if input.contains("ウィンドウバー") {
+        normalized = normalized
+            .replace(
+                "スクロールしても固定表示",
+                "スクロール時もウィンドウバー固定",
+            )
+            .replace("スクロール時も固定表示", "スクロール時もウィンドウバー固定");
+    }
+    normalized = normalized
+        .replace("バー内に収まり", "はみ出さない")
+        .replace("バー内に収め", "はみ出さない")
+        .replace("データ混在禁止", "データ混ざらない")
+        .replace("検索じょうたい", "検索状態")
+        .replace("検索状態は残す", "検索状態維持")
+        .replace("検索状態は残", "検索状態維持")
+        .replace("触らず", "触らない")
+        .replace("やめてください", "やめる")
+        .replace("やめて", "やめる")
+        .replace("LMS Studio", "LM Studio")
+        .replace("空もじ列", "空文字列")
+        .replace("空もじ", "空文字")
+        .replace("テスと", "テスト")
+        .replace("UTF,BOM", "UTF-8 BOM");
     if input.contains("読み込まず") {
         for (from, to) in [
             ("読み込み拒否", "読み込まず"),
@@ -3525,6 +4001,11 @@ fn known_input_typo_replacements() -> &'static [(&'static str, &'static str)] {
         ("読みこまず", "読み込まず"),
         ("こえる", "超える"),
         ("変更しなで", "変更しないで"),
+        ("テスと", "テスト"),
+        ("空もじ列", "空文字列"),
+        ("空もじ", "空文字"),
+        ("いりません", "不要"),
+        ("LMS Studio", "LM Studio"),
     ]
 }
 
@@ -3846,6 +4327,58 @@ fn remove_polite_request_fillers(output: &str) -> String {
             ("を返してください", "返却"),
             ("をコピーしてください", "コピー"),
             ("を出してください", "出力"),
+            ("バー内に収まり", "はみ出さない"),
+            ("バー内に収め", "はみ出さない"),
+            ("データ混在禁止", "データ混ざらない"),
+            ("検索じょうたい", "検索状態"),
+            ("検索状態は残してください", "検索状態維持"),
+            ("検索状態は残してほしいです", "検索状態維持"),
+            ("検索状態は残してほしい", "検索状態維持"),
+            ("検索状態は残して", "検索状態維持"),
+            ("検索状態は残す", "検索状態維持"),
+            ("検索状態は残", "検索状態維持"),
+            ("触らず", "触らない"),
+            ("やめてください", "やめる"),
+            ("やめて", "やめる"),
+            ("残してください", "残す"),
+            ("残してほしいです", "残す"),
+            ("残してほしい", "残す"),
+            ("残して", "残す"),
+            (
+                "ユーザーが任意のローカルモデルを検証するために残すこと",
+                "任意ローカルモデル検証用に残す",
+            ),
+            ("ユーザーが任意モデルを試すために残す", "任意モデル用に残す"),
+            ("採用中の ", ""),
+            (
+                "が毎回依存関係を再インストールしていて遅い",
+                "の再インストール遅延",
+            ),
+            ("を使って npm のキャッシュを有効化して", "でnpmキャッシュ有効化"),
+            ("テストコマンド npm test と lint は変更しないで", "npm test/lint変更しない"),
+            (
+                "キャッシュが効かなかった場合でも CI が失敗しないようにし",
+                "キャッシュ無効でもCI失敗しない",
+            ),
+            (
+                "ログでキャッシュヒットの有無を確認できるようにして",
+                "ログでキャッシュヒット確認",
+            ),
+            (
+                "既存の useSearchParams による URL クエリ管理は維持し、ページ番号を変更しても検索条件と検索状態が消えないようにしてください",
+                "useSearchParams URL管理維持、ページ変更時も検索条件/状態維持",
+            ),
+            (
+                "ページ番号を変更しても検索条件と検索状態が消えないようにしてください",
+                "ページ変更時も検索条件/状態維持",
+            ),
+            (
+                "TypeScript の既存構造はなるべく活かし、大規模なリファクタリングや画面全体の作り直しは避けてください",
+                "TypeScript既存構造維持、大規模リファクタリング/画面作り直し回避",
+            ),
+            ("大規模なリファクタリング", "大規模リファクタリング"),
+            ("画面全体の作り直し", "画面作り直し"),
+            ("避けてください", "回避"),
             ("お願いいたします", ""),
             ("お願い致します", ""),
             ("お願いします", ""),
@@ -3896,7 +4429,11 @@ fn missing_constraint_restoration_phrases(input: &str, output: &str) -> Vec<Stri
             "しない",
         ),
         (&["ではなく", "でなく"], &["ではなく", "でなく"], "ではなく"),
-        (&["はみ出さない"], &["はみ出さない"], "はみ出さない"),
+        (
+            &["はみ出さない"],
+            &["はみ出さない", "収ま", "収め", "バー内"],
+            "はみ出さない",
+        ),
         (&["行わない"], &["行わない", "しない"], "行わない"),
         (
             &["止めず", "止めない"],
@@ -3928,12 +4465,20 @@ fn missing_constraint_restoration_phrases(input: &str, output: &str) -> Vec<Stri
         (&["再推論せず"], &["再推論せず"], "再推論せず"),
         (&["戻さない"], &["戻さない"], "戻さない"),
         (&["参照しない"], &["参照しない"], "参照しない"),
-        (&["混ぜない"], &["混ぜない"], "混ぜない"),
+        (
+            &["混ぜない", "混ざらない"],
+            &["混ぜない", "混ざらない", "混在禁止", "共有しない"],
+            "混在禁止",
+        ),
         (&["取りすぎない"], &["取りすぎない"], "取りすぎない"),
         (&["押さなくても"], &["押さなくても"], "押さなくても"),
         (&["クリア"], &["クリア"], "クリア"),
         (&["隠れない"], &["隠れない"], "隠れない"),
-        (&["出さない"], &["出さない"], "出さない"),
+        (
+            &["出さない"],
+            &["出さない", "表示しない", "非表示"],
+            "出さない",
+        ),
         (&["見せない"], &["見せない"], "見せない"),
         (&["依存せず"], &["依存せず"], "依存せず"),
         (&["保存せず"], &["保存せず"], "保存せず"),
@@ -3983,7 +4528,8 @@ fn missing_constraint_restoration_phrases(input: &str, output: &str) -> Vec<Stri
 
     let mut phrases = Vec::new();
     for (input_markers, output_markers, fallback_marker) in RULES {
-        if !contains_any_marker(input, input_markers) || contains_any_marker(output, output_markers)
+        if !constraint_marker_matches_input(input, input_markers)
+            || contains_any_marker(output, output_markers)
         {
             continue;
         }
@@ -3997,10 +4543,18 @@ fn missing_constraint_restoration_phrases(input: &str, output: &str) -> Vec<Stri
         }) {
             continue;
         }
-        let phrase = source_clause
-            .map(compact_constraint_clause)
-            .filter(|phrase| !phrase.trim().is_empty())
-            .unwrap_or_else(|| (*fallback_marker).to_string());
+        let phrase = if input_markers
+            .iter()
+            .any(|marker| matches!(*marker, "のみ" | "だけ"))
+            && source_clause.is_some_and(|clause| clause.contains("本題"))
+        {
+            "本題のみ".to_string()
+        } else {
+            source_clause
+                .map(compact_constraint_clause)
+                .filter(|phrase| !phrase.trim().is_empty())
+                .unwrap_or_else(|| (*fallback_marker).to_string())
+        };
 
         let phrase = if contains_any_marker(&phrase, output_markers) {
             phrase
@@ -4031,7 +4585,97 @@ fn missing_constraint_restoration_phrases(input: &str, output: &str) -> Vec<Stri
         }
     }
 
+    for phrase in missing_retention_constraint_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+
+    for phrase in missing_focus_scope_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+
     phrases
+}
+
+fn missing_nonnegative_constraint_restoration_phrases(input: &str, output: &str) -> Vec<String> {
+    let mut phrases = missing_retention_constraint_restoration_phrases(input, output);
+    for phrase in missing_focus_scope_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    phrases
+}
+
+fn missing_focus_scope_restoration_phrases(input: &str, output: &str) -> Vec<String> {
+    if required_constraint_clauses(input)
+        .into_iter()
+        .any(|clause| clause.contains("本題") && contains_any_marker(clause, &["だけ", "のみ"]))
+        && !contains_any_marker(output, &["本題のみ", "本題だけ"])
+    {
+        vec!["本題のみ".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn missing_retention_constraint_restoration_phrases(input: &str, output: &str) -> Vec<String> {
+    required_constraint_clauses(input)
+        .into_iter()
+        .filter(|clause| contains_any_marker(clause, &["残す", "残して"]))
+        .filter(|clause| !retention_constraint_satisfied(clause, output))
+        .filter_map(retention_constraint_restoration_phrase)
+        .fold(Vec::new(), |mut phrases, phrase| {
+            if !phrases.iter().any(|existing| existing == &phrase) {
+                phrases.push(phrase);
+            }
+            phrases
+        })
+}
+
+fn retention_constraint_satisfied(clause: &str, output: &str) -> bool {
+    if !contains_any_marker(output, &["残す", "残して", "維持", "保持"]) {
+        return false;
+    }
+    if clause.contains("任意") && !output.contains("任意") {
+        return false;
+    }
+    if clause.contains("ローカルモデル")
+        && !contains_any_marker(output, &["ローカルモデル", "任意モデル"])
+    {
+        return false;
+    }
+    required_technical_terms(clause)
+        .into_iter()
+        .all(|term| contains_ascii_case_insensitive(output, &term))
+}
+
+fn retention_constraint_restoration_phrase(clause: &str) -> Option<String> {
+    let segment = clause
+        .split(['、', ','])
+        .map(str::trim)
+        .find(|segment| contains_any_marker(segment, &["残す", "残して"]))?;
+    let mut phrase = compact_constraint_clause(segment);
+    for (from, to) in [
+        (
+            "任意ローカルモデル検証用に残すこと",
+            "任意ローカルモデル検証用に残す",
+        ),
+        ("任意モデル用に残すこと", "任意モデル用に残す"),
+        ("残すこと", "残す"),
+        ("してください", ""),
+    ] {
+        phrase = phrase.replace(from, to);
+    }
+    let phrase = phrase
+        .trim()
+        .trim_end_matches(['。', '！', '？', '、', ','])
+        .trim()
+        .to_string();
+    (!phrase.is_empty()).then_some(phrase)
 }
 
 fn missing_list_constraint_restoration_phrases(input: &str, output: &str) -> Vec<String> {
@@ -4348,6 +4992,8 @@ fn verification_restoration_phrase(clause: &str) -> String {
         ("テストも", "テスト"),
         ("正常系と", "正常系/"),
         ("正常系、", "正常系/"),
+        (" のケース", "ケース"),
+        ("のケース", "ケース"),
         ("のケースを確認できるようにしてください", "テスト確認"),
         ("のケースを確認できるように", "テスト確認"),
         ("ケースを確認できるようにしてください", "ケース確認"),
@@ -4807,13 +5453,19 @@ fn japanese_preserve_terms(input: &str) -> Vec<String> {
         "メール通知",
         "アプリ内通知",
         "個人情報",
+        "依存関係キャッシュ",
+        "ロックファイル",
+        "監視ログ",
+        "無効",
         "圧縮完了",
         "圧縮結果",
         "結果欄",
+        "アイコン",
         "メトリクス",
         "最小化",
         "最大化",
         "閉じる",
+        "ウィンドウバー",
         "トークン",
         "文字数",
         "圧縮レベル",
@@ -5069,9 +5721,16 @@ fn compact_shared_predicate_target(target: &str) -> String {
     [
         ("既存の", ""),
         ("成功時の", "成功"),
+        ("成功した時の", "成功"),
         (" の ", ""),
         (" の", ""),
         ("の採番", "採番"),
+        ("エラーコード", "エラー"),
+        ("処理", ""),
+        ("オプション", ""),
+        ("の表示", "表示"),
+        ("テストコマンド", "テスト"),
+        ("レスポンスフィールド名", "レスポンス名"),
     ]
     .iter()
     .fold(target.trim().to_string(), |compact, (from, to)| {
@@ -5241,6 +5900,15 @@ fn referenced_item_count(clause: &str) -> Option<usize> {
 
 fn compact_constraint_clause(clause: &str) -> String {
     let mut compact = trim_constraint_discourse_prefix(clause).trim().to_string();
+    if let Some(list) = parse_shared_predicate_list(&compact) {
+        let targets = list
+            .targets
+            .iter()
+            .map(|target| compact_shared_predicate_target(target))
+            .collect::<Vec<_>>()
+            .join("/");
+        return format!("{targets}{}", list.predicate);
+    }
     for (from, to) in [
         ("変更しないでください", "変更しない"),
         ("変えないでください", "変えない"),
@@ -5252,6 +5920,59 @@ fn compact_constraint_clause(clause: &str) -> String {
         ("していただきたいです", ""),
         ("してほしいです", ""),
         ("をお願いします", ""),
+        ("成功時のレスポンス形式", "成功レスポンス形式"),
+        ("既存の監査ログ", "監査ログ"),
+        ("既存の schema.graphql", "schema.graphql"),
+        ("レスポンスフィールド名", "レスポンス名"),
+        (
+            "ページ番号を変更しても検索条件と検索状態が消えないようにしてください",
+            "ページ変更時も検索条件/状態維持",
+        ),
+        (
+            "検索条件と検索状態が消えないようにしてください",
+            "検索条件/状態維持",
+        ),
+        ("検索条件と検索状態が消えないように", "検索条件/状態維持"),
+        (
+            "大規模なリファクタリングや画面全体の作り直しは避けてください",
+            "大規模リファクタリング/画面作り直し回避",
+        ),
+        ("大規模なリファクタリング", "大規模リファクタリング"),
+        ("画面全体の作り直し", "画面作り直し"),
+        ("避けてください", "回避"),
+        ("データが混ざらないようにしてください", "データ混ざらない"),
+        ("データが混ざらないように", "データ混ざらない"),
+        (
+            "ユーザーが任意のローカルモデルを検証するために残すこと",
+            "任意ローカルモデル検証用に残す",
+        ),
+        (
+            "ユーザーが任意のローカルモデルを検証するために残す",
+            "任意ローカルモデル検証用に残す",
+        ),
+        (
+            "任意のローカルモデルを検証するために残すこと",
+            "任意ローカルモデル検証用に残す",
+        ),
+        (
+            "任意のローカルモデルを検証するために残す",
+            "任意ローカルモデル検証用に残す",
+        ),
+        (
+            "ユーザーが任意モデルを試すために残してください",
+            "任意モデル用に残す",
+        ),
+        ("ユーザーが任意モデルを試すために残す", "任意モデル用に残す"),
+        ("ことを明記してください", ""),
+        ("ことを明記", ""),
+        ("を明記してください", ""),
+        ("を明記", ""),
+        ("本題だけ圧縮できるか見たいです", "本題のみ"),
+        ("本題だけ圧縮", "本題のみ"),
+        ("本題だけ", "本題のみ"),
+        ("作り直しは今回はいりません", "作り直し不要"),
+        ("作り直しは今回は不要です", "作り直し不要"),
+        ("今回はいりません", "不要"),
     ] {
         compact = compact.replace(from, to);
     }
@@ -5310,6 +6031,7 @@ fn required_constraint_clauses(input: &str) -> Vec<&str> {
         "戻さない",
         "参照しない",
         "混ぜない",
+        "混ざらない",
         "取りすぎない",
         "押さなくても",
         "クリア",
@@ -5555,7 +6277,10 @@ fn preserves_negative_constraints(input: &str, output: &str) -> bool {
             ],
         ),
         (&["ではなく", "でなく"], &["ではなく", "でなく"]),
-        (&["はみ出さない"], &["はみ出さない"]),
+        (
+            &["はみ出さない"],
+            &["はみ出さない", "収ま", "収め", "バー内"],
+        ),
         (&["行わない"], &["行わない", "しない"]),
         (&["書き換えず"], &["書き換えず", "書き換えない"]),
         (
@@ -5595,12 +6320,15 @@ fn preserves_negative_constraints(input: &str, output: &str) -> bool {
         (&["再推論せず"], &["再推論せず"]),
         (&["戻さない"], &["戻さない"]),
         (&["参照しない"], &["参照しない"]),
-        (&["混ぜない"], &["混ぜない"]),
+        (
+            &["混ぜない", "混ざらない"],
+            &["混ぜない", "混ざらない", "混在禁止", "共有しない"],
+        ),
         (&["取りすぎない"], &["取りすぎない"]),
         (&["押さなくても"], &["押さなくても"]),
         (&["クリア"], &["クリア"]),
         (&["隠れない"], &["隠れない"]),
-        (&["出さない"], &["出さない"]),
+        (&["出さない"], &["出さない", "表示しない", "非表示"]),
         (&["見せない"], &["見せない"]),
         (&["失わない"], &["失わない", "残す", "保持"]),
         (&["依存せず"], &["依存せず"]),
@@ -5631,9 +6359,24 @@ fn preserves_negative_constraints(input: &str, output: &str) -> bool {
         && NEGATION_RULES
             .iter()
             .all(|(input_markers, output_markers)| {
-                !input_markers.iter().any(|marker| input.contains(marker))
+                !constraint_marker_matches_input(&input, input_markers)
                     || output_markers.iter().any(|marker| output.contains(marker))
             })
+}
+
+fn constraint_marker_matches_input(input: &str, markers: &[&str]) -> bool {
+    if !contains_any_marker(input, markers) {
+        return false;
+    }
+    if !markers
+        .iter()
+        .any(|marker| matches!(*marker, "ない" | "出さない"))
+    {
+        return true;
+    }
+    input_clauses(input)
+        .into_iter()
+        .any(|clause| contains_any_marker(clause, markers) && !clause.contains("はみ出さない"))
 }
 
 fn contains_ascii_case_insensitive(text: &str, term: &str) -> bool {

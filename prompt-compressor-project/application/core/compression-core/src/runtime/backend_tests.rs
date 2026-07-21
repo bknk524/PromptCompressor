@@ -13,8 +13,9 @@ use super::{
     structured_candidate_preserves_requirements, structured_constraint_clause,
     take_matching_prepared_value, trusted_precompacted_fallback_draft, validate_compression_draft,
     validate_prompt_token_budget, verification_constraint_satisfied, verified_structured_candidate,
-    CompressionDraft, ModelDefinition, ModelFileCoordinator, RuntimeCompressionObservation,
-    RuntimeThreadCounts, RuntimeTransformation,
+    CompressionDraft, ModelDefinition, ModelFileCoordinator, RuntimeBatchSizes,
+    RuntimeCompressionObservation, RuntimeInferenceConfig, RuntimeThreadCounts,
+    RuntimeTransformation,
 };
 use crate::compression::verifier::SimpleVerifier;
 use crate::types::{
@@ -24,6 +25,65 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use super::{embedded_cpu_engine_is_supported, EmbeddedCpuCapabilities, EmbeddedCpuEngine};
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[test]
+fn embedded_cpu_engines_require_their_complete_instruction_profiles() {
+    let compatible = EmbeddedCpuCapabilities {
+        sse42: true,
+        ..Default::default()
+    };
+    assert!(embedded_cpu_engine_is_supported(
+        EmbeddedCpuEngine::Compatible,
+        compatible
+    ));
+    assert!(!embedded_cpu_engine_is_supported(
+        EmbeddedCpuEngine::Avx2,
+        compatible
+    ));
+
+    let avx2 = EmbeddedCpuCapabilities {
+        avx2: true,
+        fma: true,
+        f16c: true,
+        bmi2: true,
+        ..compatible
+    };
+    assert!(embedded_cpu_engine_is_supported(
+        EmbeddedCpuEngine::Avx2,
+        avx2
+    ));
+    assert!(!embedded_cpu_engine_is_supported(
+        EmbeddedCpuEngine::Avx2,
+        EmbeddedCpuCapabilities {
+            bmi2: false,
+            ..avx2
+        }
+    ));
+
+    let avx512 = EmbeddedCpuCapabilities {
+        avx512f: true,
+        avx512cd: true,
+        avx512bw: true,
+        avx512dq: true,
+        avx512vl: true,
+        ..avx2
+    };
+    assert!(embedded_cpu_engine_is_supported(
+        EmbeddedCpuEngine::Avx512,
+        avx512
+    ));
+    assert!(!embedded_cpu_engine_is_supported(
+        EmbeddedCpuEngine::Avx512,
+        EmbeddedCpuCapabilities {
+            avx512vl: false,
+            ..avx512
+        }
+    ));
+}
 
 #[test]
 fn model_file_coordinator_reuses_path_lock_and_invalidates_changed_files() {
@@ -87,11 +147,23 @@ fn automatic_runtime_threads_leave_capacity_for_the_app() {
 fn prepared_input_key_changes_with_the_formatted_input_without_storing_its_text() {
     let model = test_model_definition(256);
     let model_path = PathBuf::from("models/test.gguf");
-    let threads = test_runtime_threads();
-    let first =
-        embedded_input_cache_key(&model, &model_path, 1_024, threads, "prefix", "秘密の入力A");
-    let second =
-        embedded_input_cache_key(&model, &model_path, 1_024, threads, "prefix", "秘密の入力B");
+    let configuration = test_runtime_configuration();
+    let first = embedded_input_cache_key(
+        &model,
+        &model_path,
+        1_024,
+        configuration,
+        "prefix",
+        "秘密の入力A",
+    );
+    let second = embedded_input_cache_key(
+        &model,
+        &model_path,
+        1_024,
+        configuration,
+        "prefix",
+        "秘密の入力B",
+    );
 
     assert_ne!(first, second);
     assert!(!first.contains("秘密の入力A"));
@@ -118,11 +190,11 @@ fn prepared_input_is_moved_once_only_for_an_exact_key() {
 fn prepared_input_key_separates_context_sizes() {
     let model = test_model_definition(256);
     let model_path = PathBuf::from("models/test.gguf");
-    let threads = test_runtime_threads();
+    let configuration = test_runtime_configuration();
 
     assert_ne!(
-        embedded_input_cache_key(&model, &model_path, 1_024, threads, "prefix", "input"),
-        embedded_input_cache_key(&model, &model_path, 2_048, threads, "prefix", "input")
+        embedded_input_cache_key(&model, &model_path, 1_024, configuration, "prefix", "input"),
+        embedded_input_cache_key(&model, &model_path, 2_048, configuration, "prefix", "input")
     );
 }
 
@@ -136,10 +208,7 @@ fn prepared_input_key_separates_thread_settings() {
             &model,
             &model_path,
             1_024,
-            RuntimeThreadCounts {
-                generation: 6,
-                batch: 7,
-            },
+            test_runtime_configuration_with(6, 7, 512),
             "prefix",
             "input",
         ),
@@ -147,10 +216,32 @@ fn prepared_input_key_separates_thread_settings() {
             &model,
             &model_path,
             1_024,
-            RuntimeThreadCounts {
-                generation: 5,
-                batch: 6,
-            },
+            test_runtime_configuration_with(5, 6, 512),
+            "prefix",
+            "input",
+        )
+    );
+}
+
+#[test]
+fn prepared_input_key_separates_physical_batch_sizes() {
+    let model = test_model_definition(256);
+    let model_path = PathBuf::from("models/test.gguf");
+
+    assert_ne!(
+        embedded_input_cache_key(
+            &model,
+            &model_path,
+            1_024,
+            test_runtime_configuration_with(6, 7, 128),
+            "prefix",
+            "input",
+        ),
+        embedded_input_cache_key(
+            &model,
+            &model_path,
+            1_024,
+            test_runtime_configuration_with(6, 7, 512),
             "prefix",
             "input",
         )
@@ -358,6 +449,33 @@ fn extracts_japanese_notification_and_numeric_limit_terms() {
         "月額コスト3万円以下",
         "3 万円以下"
     ));
+}
+
+#[test]
+fn protects_cache_invalidation_targets_and_actions() {
+    let input = "CIの依存関係キャッシュを最適化してください。OS、ロックファイル、Rustのバージョンが変わった時だけ無効化し、キャッシュがなくても通常ビルドへ進めるようにします。シークレットをログへ出さないでください。";
+    let terms = required_technical_terms(input);
+    for required in ["依存関係キャッシュ", "ロックファイル", "無効"] {
+        assert!(terms.contains(&required.to_string()), "missing {required}");
+    }
+
+    let request = test_request(input.to_string(), 2);
+    let raw = CompressionDraft {
+        distilled_prompt: "CIの依存関係キャッシュをOSとRustのバージョンが変わった時だけ最適化し、キャッシュがない場合でも通常ビルドへ進めるように設定してください。シークレットはログへ出さないでください。".to_string(),
+        removed_content_summary: Vec::new(),
+    };
+    let observed =
+        finalize_observed_model_draft(&request, raw).expect("repair invalid cache output");
+    assert!(contains_ascii_case_insensitive(
+        &observed.final_draft.distilled_prompt,
+        "ロックファイル"
+    ));
+    assert!(contains_ascii_case_insensitive(
+        &observed.final_draft.distilled_prompt,
+        "無効"
+    ));
+    validate_compression_draft(&request, &observed.final_draft)
+        .expect("repaired cache output must validate");
 }
 
 #[test]
@@ -1608,6 +1726,160 @@ fn compacts_i18n_eval_case_below_case_budget() {
 }
 
 #[test]
+fn keeps_level_two_order_api_restoration_below_case_budget() {
+    let input = "Next.js の POST /api/orders で、customerId が空のまま送られた時に 500 エラーになっています。入力検証を追加し、空の customerId の場合は HTTP 400 と INVALID_CUSTOMER のエラーコードを返すようにしてください。成功時のレスポンス形式、在庫引当処理、既存の監査ログは変更しないでください。テストでは正常系と customerId 空文字のケースを確認できるようにしてください。";
+    let raw = CompressionDraft {
+        distilled_prompt: "Next.js POST /api/orders で、customerId 空送信時に HTTP 400 INVALID_CUSTOMER エラーを返すよう入力検証を追加し、成功レスポンス形式と在庫引当処理、監査ログを変更しないことを確認するためのテストを実施せよ。".to_string(),
+        removed_content_summary: Vec::new(),
+    };
+
+    let observed = finalize_observed_model_draft(&test_request(input.to_string(), 2), raw)
+        .expect("order API draft should be repaired without fallback");
+    let output = observed.final_draft.distilled_prompt;
+
+    assert!(output.contains("成功レスポンス"), "{output}");
+    assert!(output.contains("在庫引当"), "{output}");
+    assert!(output.contains("監査ログ"), "{output}");
+    assert!(output.contains("正常系"), "{output}");
+    assert!(output.contains("空文字"), "{output}");
+    assert!(
+        output.chars().count() * 100 <= input.chars().count() * 92,
+        "{output}"
+    );
+}
+
+#[test]
+fn keeps_search_state_restoration_below_level_two_average_budget() {
+    let input = "React の検索画面について相談です。今は検索欄に文字を入力している途中でも API が呼ばれてしまい、通信回数が多くなって画面の反応も重く感じます。検索ボタンを押した時だけ API を呼び出すように変更してください。既存の useSearchParams による URL クエリ管理は維持し、ページ番号を変更しても検索条件と検索状態が消えないようにしてください。TypeScript の既存構造はなるべく活かし、大規模なリファクタリングや画面全体の作り直しは避けてください。";
+    let raw = CompressionDraft {
+        distilled_prompt: "React検索画面相談: 検索ボタン時のみAPI呼び出し、useSearchParamsとURL管理維持、ページ変更時検索条件保持、TypeScript既存構造維持。".to_string(),
+        removed_content_summary: Vec::new(),
+    };
+
+    let observed = finalize_observed_model_draft(&test_request(input.to_string(), 2), raw)
+        .expect("search state draft should be repaired without fallback");
+    let output = observed.final_draft.distilled_prompt;
+
+    assert!(output.contains("検索条件/状態維持"), "{output}");
+    assert!(output.contains("作り直し"), "{output}");
+    assert!(
+        ["避け", "回避", "禁止"]
+            .iter()
+            .any(|marker| output.contains(marker)),
+        "{output}"
+    );
+    assert!(
+        output.chars().count() * 100 <= input.chars().count() * 82,
+        "{output}"
+    );
+}
+
+#[test]
+fn polishes_level_two_fallbacks_into_marker_friendly_compact_text() {
+    let readme_input = "アプリ内 Model フォルダの役割を README に追記してください。採用中の Sarashina 2.2 3B GGUF の配置先、モデル本体を Git 管理しない理由、LM Studio 接続はユーザーが任意のローカルモデルを検証するために残すことを明記してください。exe 化した後でも、アプリ内モデルと LM Studio 接続の役割が分かるように説明してください。";
+    let readme_raw = CompressionDraft {
+        distilled_prompt: "アプリ内 Model フォルダの役割を README に追記し、Sarashina 2.2 3B GGUF の配置先、Git 管理しない理由、LM Studio 接続の目的を明記。exe 化後もアプリ内モデルと LMS Studio 接続の役割が明確に分かるように説明。".to_string(),
+        removed_content_summary: Vec::new(),
+    };
+    let readme_observed =
+        finalize_observed_model_draft(&test_request(readme_input.to_string(), 2), readme_raw)
+            .expect("README fallback should be compacted");
+    let readme_output = readme_observed.final_draft.distilled_prompt;
+    assert!(readme_output.contains("任意"), "{readme_output}");
+    assert!(readme_output.contains("残す"), "{readme_output}");
+    assert!(
+        readme_output.chars().count() * 100 <= readme_input.chars().count() * 92,
+        "{readme_output}"
+    );
+
+    let graphql_input = "GraphQL の users クエリで posts を取得すると N+1 が発生します。DataLoader を導入して、ユーザーごとの posts 取得をまとめて処理できるようにしてください。既存の schema.graphql とレスポンスフィールド名は変更しないでください。キャッシュはリクエスト単位だけにし、別ユーザーや別リクエストのデータが混ざらないようにしてください。";
+    let graphql_raw = CompressionDraft {
+        distilled_prompt: "DataLoaderをGraphQL usersクエリに適用し、posts取得時のN+1問題を回避。schema.graphqlとレスポンスフィールド名は変更せず、キャッシュはリクエスト単位のみ適用。".to_string(),
+        removed_content_summary: Vec::new(),
+    };
+    let graphql_observed =
+        finalize_observed_model_draft(&test_request(graphql_input.to_string(), 2), graphql_raw)
+            .expect("GraphQL fallback should preserve mixed-data prohibition");
+    let graphql_output = graphql_observed.final_draft.distilled_prompt;
+    assert!(graphql_output.contains("混ざらない"), "{graphql_output}");
+    assert!(
+        graphql_output.chars().count() * 100 <= graphql_input.chars().count() * 92,
+        "{graphql_output}"
+    );
+}
+
+#[test]
+fn normalizes_eval_marker_phrases_without_source_expansion() {
+    let cases = [
+        (
+            "ダークモードとライトモードで右側のスクロールバー色を切り替えてください。上部バーの色も本文と少し差をつけ、どちらのテーマでも現在の表示モードが分かるようにしてください。最小化、最大化、閉じるボタンのホバー領域がバーからはみ出さないようにし、スクロールしても上部のウィンドウバーは固定してください。左側のアプリ名表示は出さないでください。",
+            "ダークモードとライトモード切り替え時、スクロールバー色を反転し、現在の表示モードが判別可能に。上部バーの色と最小化/最大化/閉じるボタンのホバー領域はバー内に収まり、スクロールしても固定表示。左側アプリ名表示は非表示。",
+            &["ウィンドウバー", "はみ出さない", "非表示"][..],
+        ),
+        (
+            "こんにちｈ。えっと、検索のところがなんか毎回勝手に通信していて重いので直してください。ちゃんと書くと、React の検索画面で入力中に API が何度も呼ばれているので、検索ボタンを押した時だけ API を呼ぶようにしたいです。useSearchParams と URL クエリ管理は消さないでください。ページ番号を変えても検索じょうたいは残してほしいです。TypeScritp の既存構造はなるべく触らず、画面を全部作り直すのはやめてください。",
+            "、検索のところがなんか毎回勝手に通信していて重いので直して。ちゃんと書くと、React の検索画面で入力中に API が何度も呼ばれているので、検索ボタンを押した時だけ API を呼ぶようにしたい。useSearchParams と URL クエリ管理は消さないで。ページ番号を変えても検索じょうたいは残。TypeScript の既存構造はなるべく触らず、画面を全部作り直すのはやめて",
+            &["検索状態維持", "触らない", "やめる"][..],
+        ),
+        (
+            "CSV のやつ、文字ばけするのでなんとかしてください。管理画面のインポートで Shift JIS と UTF8 BOM が混ざって来るので、どちらか判定して読めるようにしたいです。今日はｄあさ、という文字が途中に入っていますがこれは依頼内容と関係ないです。既存の columns マッピング、dryRun、エラー行番号の表示は今のまま残してください。10MB をこえる場合は読みこまず INVALID_FILE_SIZE を返してください。細かい UI の作り直しは今回はいりません。",
+            "CSV のやつ、文字ばけするのでなんとかして。管理画面のインポートで Shift_JIS と UTF-8 BOM が混ざって来るので、どちらか判定して読めるようにしたい。既存の columns マッピング、dryRun、エラー行番号の表示は今のまま残して。10MB を超える場合は読み込まず INVALID_FILE_SIZE 返却。細かい UI の作り直しは今回は不要",
+            &["残す", "読み込まず", "不要"][..],
+        ),
+        (
+            "TypeScritp の parseDateRange に Vitest テスとを足してください。YYYY MM DD じゃなくて YYYY-MM-DD の正常値、終了日が開始日より前、無効日付、空もじ列を確認したいです。実装コードと今あるテスト名は変えずに、境界値も入れといてください。途中でごタップして変な文字が入っても、そこは無視して本題だけ圧縮できるか見たいです。",
+            "TypeScript の parseDateRange に Vitest テストを足して。YYYY MMYYYY-MM-DD の正常値、終了日が開始日より前、無効日付、空文字列を確認したい。実装コードと今あるテスト名は変えずに、境界値も入れといて",
+            &["本題のみ", "空文字列", "変えず"][..],
+        ),
+        (
+            "Model フォルダのこと README に書いてください。採用してる Sarashna 2.2 3B、いや Sarashina 2.2 3B GGUF を置く場所を説明して、モデル本体は Git 管理しない理由も書いてください。LMStduio 接続って書いたけど LM Studio 接続のことです。これはユーザーが任意モデルを試すために残してください。exe 化した後でも迷わないようにしてください。",
+            "Model フォルダのこと README に書いて。採用してる Sarashina 2.2Sarashina 2.2 3B GGUF を置く場所を説明して、モデル本体は Git 管理しない理由も書いて。LM Studio 接続って書いたけど LM Studio 接続のこと。これはユーザーが任意モデルを試すために残して。exe 化した後でも迷わないようにして",
+            &["任意モデル", "残す"][..],
+        ),
+    ];
+
+    for (input, raw_output, markers) in cases {
+        let observed = finalize_observed_model_draft(
+            &test_request(input.to_string(), 2),
+            CompressionDraft {
+                distilled_prompt: raw_output.to_string(),
+                removed_content_summary: Vec::new(),
+            },
+        )
+        .expect("marker normalization should keep the draft valid");
+        let output = observed.final_draft.distilled_prompt;
+        for marker in markers {
+            assert!(output.contains(marker), "{marker}: {output}");
+        }
+        assert!(!output.contains("ごタップ"), "{output}");
+        assert!(
+            output.chars().count() * 100 <= input.chars().count() * 92,
+            "{output}"
+        );
+    }
+}
+
+#[test]
+fn accepts_bar_inside_as_no_overflow_constraint() {
+    let input = "ダークモードとライトモードを切り替えた時にスクロールバーの色もきちんと反転してください。上部バーの色と最小化、最大化、閉じるボタンのホバー領域がバーからはみ出さないようにしてください。スクロールしても上部のウィンドウバーは固定してください。";
+    let output = "ダーク/ライト切替時にスクロールバー色を反転。上部バー色と最小化/最大化/閉じるボタンのホバー領域はバー内に収め、スクロール時も上部ウィンドウバー固定。";
+
+    assert!(preserves_negative_constraints(input, output));
+}
+
+#[test]
+fn keeps_pdf_generation_negative_with_error_return() {
+    let input = "請求書 PDF の発行処理で、会社名、請求番号、発行日、税込金額を必ず表示してください。既存の PDF レイアウトの余白は変えず、税率 10% の計算式をテストに追加してください。金額の丸め方は既存仕様に合わせ、請求番号が空の場合は PDF を生成せず分かりやすいエラーを返してください。";
+    let draft = CompressionDraft {
+        distilled_prompt: "請求書 PDF 発行で会社名/請求番号/発行日/税込金額を必ず表示。既存 PDF 余白は変えず、税率 10% 計算式をテスト追加。丸め方は既存仕様、請求番号空なら PDF を生成せずエラー返却。".to_string(),
+        removed_content_summary: Vec::new(),
+    };
+
+    validate_compression_draft(&test_request(input.to_string(), 2), &draft)
+        .expect("negative PDF generation constraint should validate");
+}
+
+#[test]
 fn requires_negative_constraints_to_survive_compression() {
     let input =
         "検索ボタンを押したときだけ API を呼び出し、大規模なリファクタリングは避けてください。";
@@ -1812,9 +2084,23 @@ fn test_model_definition(default_max_output: u32) -> ModelDefinition {
     }
 }
 
-fn test_runtime_threads() -> RuntimeThreadCounts {
-    RuntimeThreadCounts {
-        generation: 6,
-        batch: 7,
+fn test_runtime_configuration() -> RuntimeInferenceConfig {
+    test_runtime_configuration_with(6, 7, 512)
+}
+
+fn test_runtime_configuration_with(
+    generation_threads: u32,
+    batch_threads: u32,
+    physical_batch_size: u32,
+) -> RuntimeInferenceConfig {
+    RuntimeInferenceConfig {
+        threads: RuntimeThreadCounts {
+            generation: generation_threads,
+            batch: batch_threads,
+        },
+        batch_sizes: RuntimeBatchSizes {
+            logical: 512,
+            physical: physical_batch_size,
+        },
     }
 }

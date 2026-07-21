@@ -9,6 +9,7 @@ default = ["embedded-llama-avx2"]
 embedded-llama-compatible = ["prompt-compressor-local-ui/embedded-llama-compatible"]
 embedded-llama-avx2 = ["prompt-compressor-local-ui/embedded-llama-avx2"]
 embedded-llama-avx512 = ["prompt-compressor-local-ui/embedded-llama-avx512"]
+cpu-profile-strict = ["prompt-compressor-local-ui/cpu-profile-strict"]
 
 [dependencies]
 anyhow.workspace = true

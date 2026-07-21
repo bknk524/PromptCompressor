@@ -11,7 +11,10 @@ use std::thread::JoinHandle;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use prompt_compressor_local_ui::{prepare_embedded_web_app, EmbeddedWebApp, LocalAppResponse};
+use prompt_compressor_local_ui::{
+    prepare_embedded_web_app, runtime_quality_missing_requirements, runtime_quality_probe_cases,
+    EmbeddedWebApp, LocalAppResponse, RuntimeQualityProbeCase,
+};
 use tao::{
     dpi::{LogicalSize, PhysicalSize},
     event::{Event, WindowEvent},
@@ -51,6 +54,9 @@ struct Args {
 
     #[arg(long, hide = true)]
     cpu_engine_speed_probe: bool,
+
+    #[arg(long, hide = true)]
+    cpu_engine_support_probe: bool,
 
     #[arg(long, hide = true, value_name = "PID")]
     restart_after_pid: Option<u32>,
@@ -116,12 +122,15 @@ enum WindowControl {
 }
 
 fn main() {
+    let args = Args::parse();
+    let background_probe =
+        args.package_smoke_test || args.cpu_engine_speed_probe || args.cpu_engine_support_probe;
     if let Err(error) = ensure_cpu_engine_is_supported() {
-        show_startup_error(&error);
+        if !background_probe {
+            show_startup_error(&error);
+        }
         std::process::exit(1);
     }
-    let args = Args::parse();
-    let background_probe = args.package_smoke_test || args.cpu_engine_speed_probe;
     if let Err(error) = run(args) {
         if !background_probe {
             show_startup_error(&error);
@@ -195,6 +204,14 @@ fn ensure_dispatched_engine_matches_build() -> Result<()> {
             "CPU推論エンジンのバージョンが一致しません。パッケージを更新してください。"
         );
     }
+    if let Some(expected_compatibility_id) =
+        std::env::var_os("TRIMPROMPT_INFERENCE_COMPATIBILITY_ID")
+    {
+        anyhow::ensure!(
+            expected_compatibility_id == compiled_inference_compatibility_id(),
+            "CPU推論エンジンの推論構成が一致しません。パッケージを更新してください。"
+        );
+    }
     Ok(())
 }
 
@@ -212,12 +229,19 @@ fn compiled_build_id() -> &'static str {
     option_env!("TRIMPROMPT_BUILD_ID").unwrap_or("development")
 }
 
+fn compiled_inference_compatibility_id() -> &'static str {
+    option_env!("TRIMPROMPT_INFERENCE_COMPATIBILITY_ID").unwrap_or("development")
+}
+
 fn run(args: Args) -> Result<()> {
     if let Some(process_id) = args.restart_after_pid {
         wait_for_process_exit(process_id)?;
     }
     if args.cpu_engine_speed_probe {
         return run_cpu_engine_speed_probe(args.settings_dir);
+    }
+    if args.cpu_engine_support_probe {
+        return Ok(());
     }
     if args.package_smoke_test {
         return run_packaged_local_model_smoke_test(args.settings_dir);
@@ -330,9 +354,7 @@ fn acquire_single_instance() -> Result<Option<SingleInstanceGuard>> {
 }
 
 const PACKAGED_SMOKE_RESULT_FILE: &str = "package-smoke-result.json";
-const CPU_ENGINE_PROBE_SCHEMA_VERSION: u32 = 1;
-const PACKAGED_SMOKE_INPUT: &str = "React の検索画面で、検索ボタンを押したときだけ API を呼ぶようにしてください。既存の useSearchParams による URL クエリ管理は維持し、大規模なリファクタリングは避けてください。";
-
+const CPU_ENGINE_PROBE_SCHEMA_VERSION: u32 = 4;
 fn run_packaged_local_model_smoke_test(settings_dir: Option<PathBuf>) -> Result<()> {
     let app = prepare_embedded_web_app(settings_dir)?;
     let application_root = app
@@ -348,7 +370,22 @@ fn run_packaged_local_model_smoke_test(settings_dir: Option<PathBuf>) -> Result<
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let request_body = packaged_smoke_request_body()?;
+    let first_case = *runtime_quality_probe_cases()
+        .first()
+        .context("packaged quality probe cases are empty")?;
+    let request_body = packaged_smoke_request_body(first_case.input_text)?;
+    let startup_prepare_response =
+        app.handle_request("POST", "/api/prepare-compression", &request_body);
+    anyhow::ensure!(
+        startup_prepare_response.status == 200,
+        "packaged startup prepare smoke test returned HTTP {}",
+        startup_prepare_response.status
+    );
+    let startup_prepare_result: serde_json::Value =
+        serde_json::from_slice(&startup_prepare_response.body)
+            .context("startup prepare smoke test response was not valid JSON")?;
+    validate_packaged_smoke_prepare_result(&startup_prepare_result)?;
+
     let prepare_response = app.handle_request("POST", "/api/prepare-input", &request_body);
     anyhow::ensure!(
         prepare_response.status == 200,
@@ -359,27 +396,54 @@ fn run_packaged_local_model_smoke_test(settings_dir: Option<PathBuf>) -> Result<
         .context("input prepare smoke test response was not valid JSON")?;
     validate_packaged_smoke_prepare_result(&prepare_result)?;
 
-    let response = app.handle_request("POST", "/api/compress", &request_body);
-    if response.status != 200 {
-        fs::write(&result_path, &response.body)
-            .with_context(|| format!("failed to write {}", result_path.display()))?;
-        anyhow::bail!(
-            "packaged local model smoke test returned HTTP {}",
-            response.status
-        );
+    let mut first_result = None;
+    for case in runtime_quality_probe_cases() {
+        let request_body = packaged_smoke_request_body(case.input_text)?;
+        let response = app.handle_request("POST", "/api/compress", &request_body);
+        if response.status != 200 {
+            fs::write(&result_path, &response.body)
+                .with_context(|| format!("failed to write {}", result_path.display()))?;
+            anyhow::bail!(
+                "packaged local model smoke test '{}' returned HTTP {}",
+                case.id,
+                response.status
+            );
+        }
+
+        let result: serde_json::Value = serde_json::from_slice(&response.body)
+            .context("smoke test response was not valid JSON")?;
+        if let Err(error) = validate_packaged_smoke_result(&result, *case) {
+            let diagnostic = serde_json::json!({
+                "error": format!("{error:#}"),
+                "case_id": case.id,
+                "result": result
+            });
+            fs::write(&result_path, serde_json::to_vec(&diagnostic)?)
+                .with_context(|| format!("failed to write {}", result_path.display()))?;
+            return Err(error);
+        }
+        first_result.get_or_insert(result);
     }
 
-    let mut result: serde_json::Value =
-        serde_json::from_slice(&response.body).context("smoke test response was not valid JSON")?;
+    let mut result = first_result.context("packaged quality probe returned no results")?;
     if let Some(object) = result.as_object_mut() {
         object.insert(
             "cpu_engine".to_string(),
             serde_json::Value::String(compiled_cpu_engine().to_string()),
         );
+        object.insert(
+            "inference_compatibility_id".to_string(),
+            serde_json::Value::String(compiled_inference_compatibility_id().to_string()),
+        );
+        object.insert("quality_passed".to_string(), serde_json::Value::Bool(true));
+        object.insert(
+            "quality_case_count".to_string(),
+            serde_json::Value::from(runtime_quality_probe_cases().len() as u64),
+        );
     }
     fs::write(&result_path, serde_json::to_vec(&result)?)
         .with_context(|| format!("failed to write {}", result_path.display()))?;
-    validate_packaged_smoke_result(&result)
+    Ok(())
 }
 
 fn run_cpu_engine_speed_probe(settings_dir: Option<PathBuf>) -> Result<()> {
@@ -397,14 +461,17 @@ fn run_cpu_engine_speed_probe(settings_dir: Option<PathBuf>) -> Result<()> {
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let elapsed_micros = app
-        .benchmark_default_cpu_engine()?
+    let benchmark = app
+        .tune_and_benchmark_default_cpu_engine()?
         .context("CPU engine benchmark was not available")?;
     let result = serde_json::json!({
         "schema_version": CPU_ENGINE_PROBE_SCHEMA_VERSION,
         "build_id": compiled_build_id(),
+        "inference_compatibility_id": compiled_inference_compatibility_id(),
         "cpu_engine": compiled_cpu_engine(),
-        "elapsed_micros": elapsed_micros
+        "elapsed_micros": benchmark.elapsed_micros,
+        "quality_passed": benchmark.quality_passed,
+        "quality_case_count": benchmark.quality_case_count
     });
     fs::write(&result_path, serde_json::to_vec(&result)?)
         .with_context(|| format!("failed to write {}", result_path.display()))
@@ -413,14 +480,14 @@ fn run_cpu_engine_speed_probe(settings_dir: Option<PathBuf>) -> Result<()> {
 fn validate_packaged_smoke_prepare_result(result: &serde_json::Value) -> Result<()> {
     anyhow::ensure!(
         result.get("prepared").and_then(serde_json::Value::as_bool) == Some(true),
-        "packaged input prepare smoke test did not prepare model state"
+        "packaged prepare smoke test did not prepare model state"
     );
     Ok(())
 }
 
-fn packaged_smoke_request_body() -> Result<Vec<u8>> {
+fn packaged_smoke_request_body(input_text: &str) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&serde_json::json!({
-        "input_text": PACKAGED_SMOKE_INPUT,
+        "input_text": input_text,
         "profile": "internal_llm",
         "task_type": "coding",
         "compression_mode": "codex_optimized",
@@ -435,7 +502,10 @@ fn packaged_smoke_request_body() -> Result<Vec<u8>> {
     }))?)
 }
 
-fn validate_packaged_smoke_result(result: &serde_json::Value) -> Result<()> {
+fn validate_packaged_smoke_result(
+    result: &serde_json::Value,
+    case: RuntimeQualityProbeCase,
+) -> Result<()> {
     anyhow::ensure!(
         result.get("profile").and_then(serde_json::Value::as_str) == Some("internal_llm"),
         "packaged local model smoke test used an unexpected profile"
@@ -443,10 +513,6 @@ fn validate_packaged_smoke_result(result: &serde_json::Value) -> Result<()> {
     anyhow::ensure!(
         result.get("runtime").and_then(serde_json::Value::as_str) == Some("llama_cpp_embedded"),
         "packaged local model smoke test used an unexpected runtime"
-    );
-    anyhow::ensure!(
-        result.get("cpu_engine").and_then(serde_json::Value::as_str) == Some(compiled_cpu_engine()),
-        "packaged local model smoke test used an unexpected CPU engine"
     );
     anyhow::ensure!(
         result
@@ -474,6 +540,21 @@ fn validate_packaged_smoke_result(result: &serde_json::Value) -> Result<()> {
     anyhow::ensure!(
         output_characters < input_characters,
         "packaged local model smoke test did not reduce character count"
+    );
+    let output = result
+        .get("distilled_prompt")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let should_send_original = result
+        .get("should_send_original")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let missing = runtime_quality_missing_requirements(case, output, should_send_original);
+    anyhow::ensure!(
+        missing.is_empty(),
+        "packaged local model smoke test '{}' missed requirements: {}",
+        case.id,
+        missing.join(", ")
     );
     Ok(())
 }
@@ -1630,18 +1711,19 @@ mod tests {
             "runtime": "llama_cpp_embedded",
             "cpu_engine": compiled_cpu_engine(),
             "should_send_original": false,
-            "distilled_prompt": "検索ボタン押下時のみAPIを呼ぶ。",
+            "distilled_prompt": "React・TypeScript検索フォーム: 検索ボタン押下時のみAPIを呼ぶ。空なら通信せずエラー表示。キーボード操作とテストを維持し、変更ファイルと確認結果を示す。",
             "metrics": {
-                "input_characters": 100,
-                "output_characters": 20
+                "input_characters": 250,
+                "output_characters": 80
             }
         })
     }
 
     #[test]
     fn packaged_smoke_request_uses_the_embedded_profile_and_level_two() {
+        let case = runtime_quality_probe_cases()[0];
         let body: serde_json::Value = serde_json::from_slice(
-            &packaged_smoke_request_body().expect("serialize smoke request"),
+            &packaged_smoke_request_body(case.input_text).expect("serialize smoke request"),
         )
         .expect("parse smoke request");
 
@@ -1649,20 +1731,25 @@ mod tests {
         assert_eq!(body["compression_level"], 2);
         assert_eq!(body["task_type"], "coding");
         assert_eq!(body["compression_mode"], "codex_optimized");
-        assert_eq!(body["input_text"], PACKAGED_SMOKE_INPUT);
+        assert_eq!(body["input_text"], case.input_text);
     }
 
     #[test]
     fn packaged_smoke_validation_requires_real_compression() {
-        assert!(validate_packaged_smoke_result(&valid_smoke_result()).is_ok());
+        let case = runtime_quality_probe_cases()[0];
+        assert!(validate_packaged_smoke_result(&valid_smoke_result(), case).is_ok());
 
         let mut fallback = valid_smoke_result();
         fallback["should_send_original"] = serde_json::Value::Bool(true);
-        assert!(validate_packaged_smoke_result(&fallback).is_err());
+        assert!(validate_packaged_smoke_result(&fallback, case).is_err());
 
         let mut unchanged = valid_smoke_result();
-        unchanged["metrics"]["output_characters"] = serde_json::json!(100);
-        assert!(validate_packaged_smoke_result(&unchanged).is_err());
+        unchanged["metrics"]["output_characters"] = serde_json::json!(250);
+        assert!(validate_packaged_smoke_result(&unchanged, case).is_err());
+
+        let mut incomplete = valid_smoke_result();
+        incomplete["distilled_prompt"] = serde_json::json!("検索ボタン押下時のみAPIを呼ぶ。");
+        assert!(validate_packaged_smoke_result(&incomplete, case).is_err());
     }
 
     #[test]

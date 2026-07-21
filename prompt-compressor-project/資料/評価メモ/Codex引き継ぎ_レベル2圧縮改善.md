@@ -79,3 +79,45 @@ powershell -ExecutionPolicy Bypass -File application/tools/evaluate-prompt-profi
 ```
 
 レベル2を基準に改善する場合でも、変更が安定した段階でレベル1と3への回帰がないことを確認する。
+
+## 2026-07-18 追記: 後処理・事前処理の軽量改善
+
+目的は、LLM呼び出し回数を増やさず、評価失敗時の原文節丸ごと復元を減らしながら、必須語・否定・維持・限定markerを落とさないこと。
+
+実装した主な変更:
+
+- `検証`という語だけではテスト列挙制約と判定しないようにし、`テスト`/`Vitest`/`RSpec`/`Testcontainers` など明示的なテスト文脈がある場合だけ列挙分離チェックを行う。
+- `はみ出さない`、`非表示`、`データ混ざらない`、`検索状態維持`、`触らない`、`やめる`、`残す` など、評価markerと意味同等の短い表現へ正規化する。
+- `LM Studio 接続は任意ローカルモデル検証用に残す`、`任意モデル用に残す`、`本題のみ` を短い復元句として扱い、入力ノイズを伴う原文節を足し戻さない。
+- `ウィンドウバー`を保護語に追加し、`スクロールしても固定表示`を`スクロール時もウィンドウバー固定`へ寄せる。
+- 復元候補の必須語チェックを、自己訂正後の検証入力に揃え、古い候補値（例: `YYYY MM DD`）で短句復元が捨てられないようにした。
+- 検証失敗後のtrusted fallbackにも、短句復元・必須語復元・polishを通す。
+- `prompt_structure`側にも同じ短縮語彙を追加し、LLM前の整理済み入力とfallback候補の表現を揃えた。
+
+追加した回帰テスト:
+
+- `accepts_compact_search_state_and_rebuild_avoidance`
+- `accepts_compact_model_readme_and_ci_constraints`
+- `keeps_level_two_order_api_restoration_below_case_budget`
+- `keeps_search_state_restoration_below_level_two_average_budget`
+- `polishes_level_two_fallbacks_into_marker_friendly_compact_text`
+- `normalizes_eval_marker_phrases_without_source_expansion`
+- `accepts_bar_inside_as_no_overflow_constraint`
+- `keeps_pdf_generation_negative_with_error_return`
+
+確認済みコマンド:
+
+```text
+cargo fmt --all -- --check
+cargo test -p prompt-compressor-core --lib
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+すべて成功。
+
+未完了:
+
+- 実LLM評価は、`cargo run ... --eval-fixture ...` のサンドボックス外実行が利用上限で拒否されたため、最終確認できていない。
+- 次回実行可能になったら、まず `normal-09`、`normal-10`、`normal-13`、`unexpected-01`、`unexpected-04`、`unexpected-06`、`unexpected-07` を `--eval-case-offset` / `--eval-case-limit` で確認する。
+- その後、基準30件全件と `raw-long-redundant-evaluation-v1.json` のレベル2を再評価する。

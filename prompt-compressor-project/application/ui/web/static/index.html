@@ -124,12 +124,50 @@
                 </div>
                 <span class="level-help" id="levelHelp">要件を保ちながらバランスよく圧縮</span>
               </fieldset>
-              <div class="settings-action">
-                <span>CPU最適化</span>
-                <button class="secondary" id="runtimeTuningResetButton" type="button">
-                  再調整
-                </button>
-              </div>
+              <details class="runtime-details" id="runtimeDetails">
+                <summary>詳細設定</summary>
+                <div class="runtime-details-body">
+                  <label>
+                    CPU命令セット
+                    <select id="cpuEngineSelect">
+                      <option value="auto">自動（推奨）</option>
+                      <option value="compatible">SSE4.2 互換</option>
+                      <option value="avx2">AVX2</option>
+                      <option value="avx512">AVX-512</option>
+                    </select>
+                  </label>
+                  <label>
+                    スレッド設定
+                    <select id="threadModeSelect">
+                      <option value="auto">自動（実測値）</option>
+                      <option value="manual">手動</option>
+                    </select>
+                  </label>
+                  <div class="thread-inputs" id="manualThreadInputs" hidden>
+                    <label>
+                      生成
+                      <input id="generationThreadsInput" type="number" min="1" step="1" />
+                    </label>
+                    <label>
+                      入力評価
+                      <input id="batchThreadsInput" type="number" min="1" step="1" />
+                    </label>
+                  </div>
+                  <div class="runtime-current" aria-live="polite">
+                    <span>現在</span>
+                    <strong id="runtimeCurrentValue">取得中</strong>
+                  </div>
+                  <div class="settings-action">
+                    <span>自動最適化</span>
+                    <button class="secondary" id="runtimeTuningResetButton" type="button">
+                      再調整
+                    </button>
+                  </div>
+                  <button id="runtimeApplyButton" type="button" disabled>
+                    再起動して適用
+                  </button>
+                </div>
+              </details>
             </div>
           </div>
         </div>

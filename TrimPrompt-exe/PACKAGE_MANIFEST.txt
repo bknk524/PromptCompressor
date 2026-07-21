@@ -1,11 +1,13 @@
 ﻿TrimPrompt desktop package
 
-Generated: 2026-07-18 14:15:43
-Build ID: 20260718051419-1da1a4d42d94
+Generated: 2026-07-22 03:29:03
+Build ID: 20260721182739-066395371331
+Inference compatibility ID: a7026363d1cd242f7cc3e1d392786761058407f2c39689722098c791882cc09f
 Executable: TrimPrompt.exe
 Default profile: internal_llm
 Model: downloaded from Hugging Face on first launch to application/local/models/sarashina2.2-3b-instruct-v0.1/sarashina2.2-3b-instruct-v0.1-Q4_K_S.gguf
 Runtime: llama_cpp_embedded (embedded in executable); CPU dispatch selects AVX-512, AVX2, or compatible engine at startup
+CPU builds: Rust and llama.cpp use matching SSE4.2, AVX2, or AVX-512 instruction profiles
 Desktop transport: WebView2 custom protocol (no HTTP server, no localhost port)
 Update behavior: application/local and application/config/user are preserved by -Clean
 

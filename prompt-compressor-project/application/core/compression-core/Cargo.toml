@@ -10,6 +10,7 @@ embedded-llama = ["dep:llama_cpp", "dep:llama_cpp_sys"]
 embedded-llama-compatible = ["embedded-llama"]
 embedded-llama-avx2 = ["embedded-llama-compatible", "llama_cpp_sys/avx2"]
 embedded-llama-avx512 = ["embedded-llama-compatible", "llama_cpp_sys/avx512"]
+cpu-profile-strict = []
 
 [dependencies]
 hf-hub.workspace = true

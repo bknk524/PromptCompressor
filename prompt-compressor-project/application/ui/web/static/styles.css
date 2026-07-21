@@ -556,6 +556,8 @@ h1 {
   background: var(--panel);
   box-shadow: var(--menu-shadow);
   overflow: hidden;
+  max-height: calc(100vh - 58px);
+  overflow-y: auto;
 }
 
 .settings-menu[hidden] {
@@ -653,11 +655,13 @@ label {
 }
 
 select,
+input[type="number"],
 textarea {
   width: 100%;
 }
 
-select {
+select,
+input[type="number"] {
   min-height: 36px;
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -667,11 +671,13 @@ select {
   transition: border-color 120ms ease, box-shadow 120ms ease;
 }
 
-select:hover {
+select:hover,
+input[type="number"]:hover {
   border-color: var(--border-strong);
 }
 
 select:focus,
+input[type="number"]:focus,
 textarea:focus,
 button:focus-visible {
   outline: 2px solid var(--focus);
@@ -797,6 +803,75 @@ button.secondary:hover {
   color: var(--muted);
   font-size: 13px;
   font-weight: 500;
+}
+
+.runtime-details {
+  min-width: 0;
+  border-top: 1px solid var(--border);
+  padding-top: 2px;
+}
+
+.runtime-details summary {
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  list-style: none;
+}
+
+.runtime-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.runtime-details summary::after {
+  color: var(--muted);
+  content: "⌄";
+  font-size: 16px;
+  line-height: 1;
+  transform-origin: center;
+  transition: transform 120ms ease;
+}
+
+.runtime-details[open] summary::after {
+  transform: rotate(180deg);
+}
+
+.runtime-details-body {
+  display: grid;
+  gap: 12px;
+  padding: 8px 0 2px;
+}
+
+.thread-inputs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.thread-inputs[hidden] {
+  display: none;
+}
+
+.runtime-current {
+  display: grid;
+  gap: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.runtime-current strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.45;
+}
+
+#runtimeApplyButton {
+  width: 100%;
 }
 
 .section-head {

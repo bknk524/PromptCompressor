@@ -524,6 +524,47 @@ mod tests {
     }
 
     #[test]
+    fn accepts_compact_search_state_and_rebuild_avoidance() {
+        let request = test_request(
+            "React の検索画面について相談です。今は検索欄に文字を入力している途中でも API が呼ばれてしまい、通信回数が多くなって画面の反応も重く感じます。検索ボタンを押した時だけ API を呼び出すように変更してください。既存の useSearchParams による URL クエリ管理は維持し、ページ番号を変更しても検索条件と検索状態が消えないようにしてください。TypeScript の既存構造はなるべく活かし、大規模なリファクタリングや画面全体の作り直しは避けてください。",
+        );
+        let output = "React の検索画面について相談。検索ボタンを押した時だけ API を呼び出すように変更して。既存の useSearchParams による URL クエリ管理は維持し。ページ変更時も検索条件/状態維持。TypeScript の既存構造はなるべく活かし、大規模リファクタリング/画面作り直し回避";
+
+        let summary = SimpleVerifier.verify(&request, output);
+
+        assert!(
+            !summary.should_send_original,
+            "{:?}",
+            summary.fallback_reason
+        );
+    }
+
+    #[test]
+    fn accepts_compact_model_readme_and_ci_constraints() {
+        let readme_request = test_request(
+            "アプリ内 Model フォルダの役割を README に追記してください。採用中の Sarashina 2.2 3B GGUF の配置先、モデル本体を Git 管理しない理由、LM Studio 接続はユーザーが任意のローカルモデルを検証するために残すことを明記してください。exe 化した後でも、アプリ内モデルと LM Studio 接続の役割が分かるように説明してください。",
+        );
+        let readme_output = "アプリ内 Model フォルダの役割を README に追記して。Sarashina 2.2 3B GGUF の配置先、モデル本体を Git 管理しない理由、LM Studio 接続は任意ローカルモデル検証用に残すを明記して。exe 化した後でも、アプリ内モデルと LM Studio 接続の役割が分かるように説明して";
+        let readme_summary = SimpleVerifier.verify(&readme_request, readme_output);
+        assert!(
+            !readme_summary.should_send_original,
+            "{:?}",
+            readme_summary.fallback_reason
+        );
+
+        let ci_request = test_request(
+            "GitHub Actions の Node.js CI が毎回依存関係を再インストールしていて遅いです。actions/cache を使って npm のキャッシュを有効化してください。ただし package-lock.json をキーに含め、テストコマンド npm test と lint は変更しないでください。キャッシュが効かなかった場合でも CI が失敗しないようにし、ログでキャッシュヒットの有無を確認できるようにしてください。",
+        );
+        let ci_output = "GitHub Actions の Node.js CI の再インストール遅延。actions/cache でnpmキャッシュ有効化。ただし package-lock.json をキーに含め、npm test/lint変更しない。キャッシュ無効でもCI失敗しない。ログでキャッシュヒット確認";
+        let ci_summary = SimpleVerifier.verify(&ci_request, ci_output);
+        assert!(
+            !ci_summary.should_send_original,
+            "{:?}",
+            ci_summary.fallback_reason
+        );
+    }
+
+    #[test]
     fn verifies_fenced_code_blocks_only_when_the_block_survives() {
         let input = "次のコードを保ったまま短くしてください。\n```rust\nfn main() {}\n```";
         let request = test_request(input);

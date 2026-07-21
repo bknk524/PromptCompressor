@@ -50,16 +50,137 @@ const MAX_CLIPBOARD_CHARS: usize = 100_000;
 const HTTP_WORKER_COUNT: usize = 4;
 const HTTP_QUEUE_CAPACITY: usize = 16;
 const INSTALL_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
-const CPU_ENGINE_SELECTION_SCHEMA_VERSION: u32 = 1;
+const CPU_ENGINE_SELECTION_SCHEMA_VERSION: u32 = 4;
 const CPU_ENGINE_MINIMUM_GAIN_PERCENT: u64 = 3;
 const CPU_ENGINE_SELECTION_FILE: &str = "cpu-engine-selection-v1.json";
-const CPU_ENGINE_PIPELINE_PROBE_INPUTS: [&str; 5] = [
-    "ReactとTypeScriptで検索フォームを修正してください。検索ボタンを押した時だけAPIを呼び、入力が空なら通信せずエラーを表示します。既存のキーボード操作とテストは維持し、変更したファイルと確認結果も示してください。",
-    "ユーザー登録APIに入力検証を追加してください。メールアドレスの形式とパスワード12文字以上を確認し、不正ならHTTP 400を返します。失敗時はデータベースへ書き込まず、正常系と異常系のテストを追加してください。",
-    "CSV取込処理を改善してください。最大10MB、UTF-8 BOM付きにも対応し、不正な行は行番号と理由を返してください。一部だけ保存せずトランザクションで処理し、既存の列名と数値精度は変えないでください。",
-    "CIの依存関係キャッシュを最適化してください。OS、ロックファイル、Rustのバージョンが変わった時だけ無効化し、キャッシュがなくても通常ビルドへ進めるようにします。シークレットをログへ出さないでください。",
-    "監視ログの集計を追加してください。5分単位でエラー件数と95パーセンタイルの応答時間を計算し、個人情報は保存前に除去します。処理が30秒を超えた場合は中断し、元データを削除しないでください。",
+const CPU_ENGINE_MODE_ENV: &str = "TRIMPROMPT_CPU_ENGINE_MODE";
+const INFERENCE_COMPATIBILITY_ID_ENV: &str = "TRIMPROMPT_INFERENCE_COMPATIBILITY_ID";
+
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeQualityProbeCase {
+    pub id: &'static str,
+    pub input_text: &'static str,
+    required_marker_groups: &'static [&'static [&'static str]],
+    semantic_requirements: &'static [RuntimeQualitySemanticRequirement],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimeQualitySemanticRequirement {
+    label: &'static str,
+    alternatives: &'static [&'static [&'static str]],
+}
+
+const RUNTIME_QUALITY_PROBE_CASES: [RuntimeQualityProbeCase; 5] = [
+    RuntimeQualityProbeCase {
+        id: "search-form",
+        input_text: "ReactとTypeScriptで検索フォームを修正してください。検索ボタンを押した時だけAPIを呼び、入力が空なら通信せずエラーを表示します。既存のキーボード操作とテストは維持し、変更したファイルと確認結果も示してください。",
+        required_marker_groups: &[
+            &["React"], &["TypeScript"], &["検索ボタン"], &["API"], &["空"],
+            &["通信"], &["エラー"], &["キーボード"], &["テスト"], &["変更"], &["確認"],
+        ],
+        semantic_requirements: &[],
+    },
+    RuntimeQualityProbeCase {
+        id: "registration-api",
+        input_text: "ユーザー登録APIに入力検証を追加してください。メールアドレスの形式とパスワード12文字以上を確認し、不正ならHTTP 400を返します。失敗時はデータベースへ書き込まず、正常系と異常系のテストを追加してください。",
+        required_marker_groups: &[
+            &["ユーザー登録"], &["API"], &["メールアドレス"], &["パスワード"],
+            &["12"], &["HTTP400"], &["データベース"], &["書き込", "保存"],
+            &["正常"], &["異常"], &["テスト"],
+        ],
+        semantic_requirements: &[],
+    },
+    RuntimeQualityProbeCase {
+        id: "csv-import",
+        input_text: "CSV取込処理を改善してください。最大10MB、UTF-8 BOM付きにも対応し、不正な行は行番号と理由を返してください。一部だけ保存せずトランザクションで処理し、既存の列名と数値精度は変えないでください。",
+        required_marker_groups: &[
+            &["CSV"], &["10MB"], &["UTF-8BOM"], &["不正"], &["行番号"], &["理由"],
+            &["一部"], &["保存"], &["トランザクション"], &["列名"], &["数値精度"],
+        ],
+        semantic_requirements: &[],
+    },
+    RuntimeQualityProbeCase {
+        id: "ci-cache",
+        input_text: "CIの依存関係キャッシュを最適化してください。OS、ロックファイル、Rustのバージョンが変わった時だけ無効化し、キャッシュがなくても通常ビルドへ進めるようにします。シークレットをログへ出さないでください。",
+        required_marker_groups: &[
+            &["CI"], &["依存関係"], &["キャッシュ"], &["OS"], &["ロックファイル"],
+            &["Rust"], &["バージョン"], &["無効"], &["ビルド"], &["シークレット"], &["ログ"],
+        ],
+        semantic_requirements: &[],
+    },
+    RuntimeQualityProbeCase {
+        id: "monitoring-log",
+        input_text: "監視ログの集計を追加してください。5分単位でエラー件数と95パーセンタイルの応答時間を計算し、個人情報は保存前に除去します。処理が30秒を超えた場合は中断し、元データを削除しないでください。",
+        required_marker_groups: &[
+            &["5分"], &["エラー"], &["95", "P95"], &["応答時間"],
+            &["個人情報"], &["除去", "匿名化", "マスキング"], &["30秒"], &["中断"],
+            &["元データ"], &["削除しない", "残す", "維持"],
+        ],
+        semantic_requirements: &[
+            RuntimeQualitySemanticRequirement {
+                label: "監視ログ集計",
+                alternatives: &[&["監視ログ"], &["エラー", "応答時間", "集計"]],
+            },
+            RuntimeQualitySemanticRequirement {
+                label: "保存前の個人情報除去",
+                alternatives: &[
+                    &["保存", "除去"],
+                    &["保存", "匿名化"],
+                    &["保存", "マスキング"],
+                    &["除去済み"],
+                    &["匿名化済み"],
+                    &["マスキング済み"],
+                ],
+            },
+        ],
+    },
 ];
+
+pub fn runtime_quality_probe_cases() -> &'static [RuntimeQualityProbeCase] {
+    &RUNTIME_QUALITY_PROBE_CASES
+}
+
+pub fn runtime_quality_missing_requirements(
+    case: RuntimeQualityProbeCase,
+    output: &str,
+    should_send_original: bool,
+) -> Vec<String> {
+    if should_send_original || output.trim().is_empty() {
+        return vec!["compressed output".to_string()];
+    }
+    let normalized_output = normalize_quality_text(output);
+    let mut missing: Vec<String> = case
+        .required_marker_groups
+        .iter()
+        .filter(|group| {
+            !group.iter().any(|marker| {
+                let normalized_marker = normalize_quality_text(marker);
+                normalized_output.contains(&normalized_marker)
+            })
+        })
+        .map(|group| group.join("/"))
+        .collect();
+    missing.extend(
+        case.semantic_requirements
+            .iter()
+            .filter(|requirement| {
+                !requirement.alternatives.iter().any(|alternative| {
+                    alternative
+                        .iter()
+                        .all(|marker| normalized_output.contains(&normalize_quality_text(marker)))
+                })
+            })
+            .map(|requirement| requirement.label.to_string()),
+    );
+    missing
+}
+
+fn normalize_quality_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
 static SETTINGS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -134,7 +255,9 @@ impl EmbeddedWebApp {
         start_default_profile_warmup(self.state.clone());
     }
 
-    pub fn benchmark_default_cpu_engine(&self) -> Result<Option<u64>> {
+    pub fn tune_and_benchmark_default_cpu_engine(
+        &self,
+    ) -> Result<Option<CpuEngineBenchmarkResult>> {
         let profile_id = self
             .state
             .registry
@@ -142,12 +265,27 @@ impl EmbeddedWebApp {
             .context("default profile is not configured")?;
         let profile = self.state.registry.resolve(profile_id)?;
         let cancellation = AtomicBool::new(false);
+        self.state
+            .backend
+            .tune_profile_threads(profile, &cancellation)?;
+        anyhow::ensure!(
+            !self.state.backend.profile_thread_tuning_required(profile)?,
+            "CPU engine thread tuning did not produce a saved configuration"
+        );
         benchmark_cpu_engine_pipeline(profile, &self.state, &cancellation)
     }
 
     pub fn handle_request(&self, method: &str, path: &str, body: &[u8]) -> LocalAppResponse {
         route_application_request(method, path, body, &self.state)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CpuEngineBenchmarkResult {
+    pub elapsed_micros: u64,
+    pub quality_passed: bool,
+    pub quality_case_count: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -202,8 +340,11 @@ impl InferenceGate {
 struct CpuEngineProbeResult {
     schema_version: u32,
     build_id: String,
+    inference_compatibility_id: String,
     cpu_engine: String,
     elapsed_micros: u64,
+    quality_passed: bool,
+    quality_case_count: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -211,8 +352,23 @@ struct CpuEngineProbeResult {
 struct PersistedCpuEngineSelection {
     schema_version: u32,
     build_id: String,
+    inference_compatibility_id: String,
     cpu_key: String,
     cpu_engine: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CpuInstructionCapabilities {
+    sse42: bool,
+    avx2: bool,
+    fma: bool,
+    f16c: bool,
+    bmi2: bool,
+    avx512f: bool,
+    avx512cd: bool,
+    avx512bw: bool,
+    avx512dq: bool,
+    avx512vl: bool,
 }
 
 #[derive(Clone, Default)]
@@ -390,6 +546,14 @@ struct UiSettings {
     level: Option<u8>,
     #[serde(default)]
     theme: Option<String>,
+    #[serde(default)]
+    cpu_engine: Option<String>,
+    #[serde(default)]
+    thread_mode: Option<String>,
+    #[serde(default)]
+    generation_threads: Option<u32>,
+    #[serde(default)]
+    batch_threads: Option<u32>,
     #[serde(flatten)]
     extra: BTreeMap<String, serde_json::Value>,
 }
@@ -403,6 +567,10 @@ impl Default for UiSettings {
             task: None,
             level: None,
             theme: None,
+            cpu_engine: None,
+            thread_mode: None,
+            generation_threads: None,
+            batch_threads: None,
             extra: BTreeMap::new(),
         }
     }
@@ -417,6 +585,12 @@ impl UiSettings {
         self.level = self.level.map(|level| level.clamp(1, 3));
         self.theme = normalize_optional_text(self.theme)
             .filter(|theme| matches!(theme.as_str(), "light" | "dark"));
+        self.cpu_engine = normalize_optional_text(self.cpu_engine)
+            .filter(|engine| matches!(engine.as_str(), "auto" | "compatible" | "avx2" | "avx512"));
+        self.thread_mode = normalize_optional_text(self.thread_mode)
+            .filter(|mode| matches!(mode.as_str(), "auto" | "manual"));
+        self.generation_threads = self.generation_threads.filter(|threads| *threads > 0);
+        self.batch_threads = self.batch_threads.filter(|threads| *threads > 0);
         self
     }
 }
@@ -1067,6 +1241,14 @@ fn route_application_request(
                 }),
             ),
         },
+        ("POST", "/api/runtime-configuration") => {
+            match runtime_configuration_from_body(body, state) {
+                Ok(value) => json_response(200, &value),
+                Err(error) => {
+                    json_response(400, &serde_json::json!({ "error": error.to_string() }))
+                }
+            }
+        }
         ("POST", "/api/clipboard") => match copy_to_clipboard_from_body(body) {
             Ok(value) => json_response(200, &value),
             Err(error) => json_response(
@@ -1119,6 +1301,7 @@ fn request_body_limit(path: &str) -> usize {
         | "/api/model-status"
         | "/api/model-install"
         | "/api/model-cancel"
+        | "/api/runtime-configuration"
         | "/api/runtime-setup-status"
         | "/api/tune-runtime"
         | "/api/tune-runtime-reset" => MAX_SETTINGS_BODY_BYTES,
@@ -1181,12 +1364,86 @@ fn save_settings_from_body(body: &[u8], state: &AppState) -> Result<serde_json::
         ("mode", settings.mode.as_deref()),
         ("task", settings.task.as_deref()),
         ("theme", settings.theme.as_deref()),
+        ("cpu_engine", settings.cpu_engine.as_deref()),
+        ("thread_mode", settings.thread_mode.as_deref()),
     ] {
         if let Some(value) = value {
             validate_text_field(field, value, MAX_PROFILE_CHARS, true)?;
         }
     }
+    validate_runtime_preferences(&settings)?;
     state.ui_settings.save(settings)
+}
+
+fn validate_runtime_preferences(settings: &UiSettings) -> Result<()> {
+    let capabilities = detect_cpu_instruction_capabilities();
+    let cpu_engine = settings.cpu_engine.as_deref().unwrap_or("auto");
+    anyhow::ensure!(
+        matches!(cpu_engine, "auto" | "compatible" | "avx2" | "avx512"),
+        "unsupported CPU engine setting"
+    );
+    anyhow::ensure!(
+        cpu_engine_supported(capabilities, cpu_engine),
+        "selected CPU engine is not supported by this processor"
+    );
+
+    let thread_mode = settings.thread_mode.as_deref().unwrap_or("auto");
+    anyhow::ensure!(
+        matches!(thread_mode, "auto" | "manual"),
+        "unsupported thread setting"
+    );
+    if thread_mode == "manual" {
+        let maximum = u32::try_from(
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1),
+        )
+        .unwrap_or(u32::MAX)
+        .max(1);
+        for (name, value) in [
+            ("generation", settings.generation_threads),
+            ("batch", settings.batch_threads),
+        ] {
+            let value = value.with_context(|| format!("manual {name} thread count is missing"))?;
+            anyhow::ensure!(
+                (1..=maximum).contains(&value),
+                "manual {name} thread count must be between 1 and {maximum}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn runtime_configuration_from_body(body: &[u8], state: &AppState) -> Result<serde_json::Value> {
+    let payload: ModelProfilePayload =
+        serde_json::from_slice(body).context("invalid JSON runtime configuration request")?;
+    validate_text_field("profile", &payload.profile, MAX_PROFILE_CHARS, false)?;
+    let profile = state.registry.resolve(&payload.profile)?;
+    let threads = state.backend.profile_thread_status(profile)?;
+    let capabilities = detect_cpu_instruction_capabilities();
+    let current_cpu_engine = current_cpu_engine();
+    let current_cpu_mode = if std::env::var(CPU_ENGINE_MODE_ENV).as_deref() == Ok("manual") {
+        "manual"
+    } else {
+        "auto"
+    };
+
+    Ok(serde_json::json!({
+        "current_cpu_engine": current_cpu_engine,
+        "current_cpu_mode": current_cpu_mode,
+        "current_thread_mode": threads.mode,
+        "generation_threads": threads.generation_threads,
+        "batch_threads": threads.batch_threads,
+        "logical_batch_size": threads.logical_batch_size,
+        "physical_batch_size": threads.physical_batch_size,
+        "available_threads": threads.available_threads,
+        "cpu_engines": [
+            { "id": "auto", "supported": true },
+            { "id": "compatible", "supported": cpu_engine_supported(capabilities, "compatible") },
+            { "id": "avx2", "supported": cpu_engine_supported(capabilities, "avx2") },
+            { "id": "avx512", "supported": cpu_engine_supported(capabilities, "avx512") }
+        ]
+    }))
 }
 
 fn copy_to_clipboard_from_body(body: &[u8]) -> Result<serde_json::Value> {
@@ -1526,7 +1783,14 @@ fn tune_cpu_engine_for_next_launch(
     profile: &prompt_compressor_core::ProfileDefinition,
     state: &AppState,
 ) -> Result<bool> {
+    if std::env::var(CPU_ENGINE_MODE_ENV).as_deref() == Ok("manual") {
+        return Ok(false);
+    }
     let build_id = match std::env::var("TRIMPROMPT_EXPECTED_BUILD_ID") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => return Ok(false),
+    };
+    let inference_compatibility_id = match std::env::var(INFERENCE_COMPATIBILITY_ID_ENV) {
         Ok(value) if !value.trim().is_empty() => value,
         _ => return Ok(false),
     };
@@ -1540,43 +1804,74 @@ fn tune_cpu_engine_for_next_launch(
     };
     let selection_path = cpu_engine_selection_path(&state.application_root);
     let cpu_key = current_cpu_key();
-    if valid_cpu_engine_selection(&selection_path, &build_id, &cpu_key) {
+    if valid_cpu_engine_selection(&selection_path, &inference_compatibility_id, &cpu_key) {
         return Ok(false);
     }
 
-    let current_elapsed =
-        benchmark_cpu_engine_pipeline(profile, state, &state.runtime_tuning_cancellation)?
-            .context("current CPU engine benchmark was cancelled")?;
-    if state.runtime_tuning_cancellation.load(Ordering::Relaxed) {
-        return Ok(false);
-    }
+    let selected = match (|| -> Result<&'static str> {
+        let current_elapsed =
+            benchmark_cpu_engine_pipeline(profile, state, &state.runtime_tuning_cancellation)?
+                .context("current CPU engine benchmark was cancelled")?;
+        if state.runtime_tuning_cancellation.load(Ordering::Relaxed) {
+            anyhow::bail!("CPU engine benchmark was cancelled");
+        }
 
-    let alternate_engine = if current_engine == "avx2" {
-        "avx512"
-    } else {
-        "avx2"
+        let alternate_engine = if current_engine == "avx2" {
+            "avx512"
+        } else {
+            "avx2"
+        };
+        let alternate_elapsed = run_external_cpu_engine_probe(
+            &state.application_root,
+            alternate_engine,
+            &build_id,
+            &inference_compatibility_id,
+            &state.runtime_tuning_cancellation,
+        )?
+        .context("alternate CPU engine benchmark was cancelled")?;
+        if state.runtime_tuning_cancellation.load(Ordering::Relaxed) {
+            anyhow::bail!("CPU engine benchmark was cancelled");
+        }
+
+        let (avx2_elapsed, avx512_elapsed) = if current_engine == "avx2" {
+            (current_elapsed, alternate_elapsed)
+        } else {
+            (alternate_elapsed, current_elapsed)
+        };
+        Ok(select_benchmarked_cpu_engine(avx2_elapsed, avx512_elapsed))
+    })() {
+        Ok(selected) => selected,
+        Err(error) => {
+            if state.runtime_tuning_cancellation.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+            // 診断失敗を次回起動へ持ち越さず、今回安全に動いた版を固定する。
+            eprintln!("CPU engine comparison failed; keeping {current_engine}: {error:#}");
+            current_engine
+        }
     };
-    let alternate_elapsed = run_external_cpu_engine_probe(
-        &state.application_root,
-        alternate_engine,
+    persist_cpu_engine_selection(
+        &selection_path,
         &build_id,
-        &state.runtime_tuning_cancellation,
-    )?
-    .context("alternate CPU engine benchmark was cancelled")?;
-    if state.runtime_tuning_cancellation.load(Ordering::Relaxed) {
-        return Ok(false);
-    }
+        &inference_compatibility_id,
+        &cpu_key,
+        selected,
+    )?;
+    Ok(true)
+}
 
-    let (avx2_elapsed, avx512_elapsed) = if current_engine == "avx2" {
-        (current_elapsed, alternate_elapsed)
-    } else {
-        (alternate_elapsed, current_elapsed)
-    };
-    let selected = select_benchmarked_cpu_engine(avx2_elapsed, avx512_elapsed);
+fn persist_cpu_engine_selection(
+    selection_path: &Path,
+    build_id: &str,
+    inference_compatibility_id: &str,
+    cpu_key: &str,
+    selected: &str,
+) -> Result<()> {
     let record = PersistedCpuEngineSelection {
         schema_version: CPU_ENGINE_SELECTION_SCHEMA_VERSION,
-        build_id,
-        cpu_key,
+        build_id: build_id.to_string(),
+        inference_compatibility_id: inference_compatibility_id.to_string(),
+        cpu_key: cpu_key.to_string(),
         cpu_engine: selected.to_string(),
     };
     let bytes =
@@ -1585,28 +1880,38 @@ fn tune_cpu_engine_for_next_launch(
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    atomic_write_file(&selection_path, &bytes)?;
-    Ok(true)
+    atomic_write_file(selection_path, &bytes)?;
+    Ok(())
 }
 
 fn benchmark_cpu_engine_pipeline(
     profile: &ProfileDefinition,
     state: &AppState,
     cancellation: &AtomicBool,
-) -> Result<Option<u64>> {
+) -> Result<Option<CpuEngineBenchmarkResult>> {
     anyhow::ensure!(
         state.backend.warm_profile(profile)?,
         "CPU engine benchmark requires an embedded model"
     );
+    let warmup_request = CompressionRequest {
+        input_text: String::new(),
+        compression_level: CompressionLevel::from_u8(2)?,
+        profile: profile.id.clone(),
+        constraints: CompressionConstraints::default(),
+        target: RequestTarget::codex_default(),
+        source: RequestSource::Desktop,
+    };
+    state.service.prepare(warmup_request)?;
 
     let mut total_elapsed = Duration::ZERO;
-    for input_text in CPU_ENGINE_PIPELINE_PROBE_INPUTS {
+    let mut quality_passed = true;
+    for case in runtime_quality_probe_cases() {
         if cancellation.load(Ordering::Relaxed) {
             return Ok(None);
         }
 
         let request = CompressionRequest {
-            input_text: input_text.to_string(),
+            input_text: case.input_text.to_string(),
             compression_level: CompressionLevel::from_u8(2)?,
             profile: profile.id.clone(),
             constraints: CompressionConstraints::default(),
@@ -1620,24 +1925,47 @@ fn benchmark_cpu_engine_pipeline(
             observed.runtime_observation.is_some(),
             "CPU engine benchmark inference did not complete"
         );
-        anyhow::ensure!(
-            !observed.result.distilled_prompt.trim().is_empty(),
-            "CPU engine benchmark returned an empty result"
+        let missing = runtime_quality_missing_requirements(
+            *case,
+            &observed.result.distilled_prompt,
+            observed.result.should_send_original,
         );
+        if !missing.is_empty() {
+            quality_passed = false;
+            eprintln!(
+                "CPU engine quality probe '{}' missed requirements: {}",
+                case.id,
+                missing.join(", ")
+            );
+        }
         total_elapsed += started_at.elapsed();
     }
 
     let average_micros = total_elapsed.as_micros()
-        / u128::try_from(CPU_ENGINE_PIPELINE_PROBE_INPUTS.len()).unwrap_or(1);
-    Ok(Some(average_micros.max(1).min(u128::from(u64::MAX)) as u64))
+        / u128::try_from(runtime_quality_probe_cases().len()).unwrap_or(1);
+    Ok(Some(CpuEngineBenchmarkResult {
+        elapsed_micros: average_micros.max(1).min(u128::from(u64::MAX)) as u64,
+        quality_passed,
+        quality_case_count: runtime_quality_probe_cases().len() as u32,
+    }))
 }
 
-fn select_benchmarked_cpu_engine(avx2_elapsed: u64, avx512_elapsed: u64) -> &'static str {
-    let avx512_limit = u128::from(avx2_elapsed) * u128::from(100 - CPU_ENGINE_MINIMUM_GAIN_PERCENT);
-    if u128::from(avx512_elapsed) * 100 <= avx512_limit {
+fn select_benchmarked_cpu_engine(
+    avx2: CpuEngineBenchmarkResult,
+    avx512: CpuEngineBenchmarkResult,
+) -> &'static str {
+    if avx512.quality_passed && !avx2.quality_passed {
         "avx512"
-    } else {
+    } else if !avx512.quality_passed {
         "avx2"
+    } else {
+        let avx512_limit =
+            u128::from(avx2.elapsed_micros) * u128::from(100 - CPU_ENGINE_MINIMUM_GAIN_PERCENT);
+        if u128::from(avx512.elapsed_micros) * 100 <= avx512_limit {
+            "avx512"
+        } else {
+            "avx2"
+        }
     }
 }
 
@@ -1645,8 +1973,9 @@ fn run_external_cpu_engine_probe(
     application_root: &Path,
     engine: &str,
     build_id: &str,
+    inference_compatibility_id: &str,
     cancellation: &AtomicBool,
-) -> Result<Option<u64>> {
+) -> Result<Option<CpuEngineBenchmarkResult>> {
     let engine_root = fs::canonicalize(application_root.join("runtime").join("cpu"))
         .context("CPU engine directory is unavailable")?;
     let executable = fs::canonicalize(engine_root.join(format!("TrimPrompt-{engine}.exe")))
@@ -1670,6 +1999,7 @@ fn run_external_cpu_engine_probe(
         .current_dir(package_root)
         .env("TRIMPROMPT_CPU_ENGINE", engine)
         .env("TRIMPROMPT_EXPECTED_BUILD_ID", build_id)
+        .env(INFERENCE_COMPATIBILITY_ID_ENV, inference_compatibility_id)
         .spawn()
         .with_context(|| format!("failed to start {}", executable.display()))?;
 
@@ -1697,14 +2027,24 @@ fn run_external_cpu_engine_probe(
     anyhow::ensure!(
         result.schema_version == CPU_ENGINE_SELECTION_SCHEMA_VERSION
             && result.build_id == build_id
+            && result.inference_compatibility_id == inference_compatibility_id
             && result.cpu_engine == engine
-            && result.elapsed_micros > 0,
+            && result.elapsed_micros > 0
+            && result.quality_case_count == runtime_quality_probe_cases().len() as u32,
         "CPU engine probe result does not match the running package"
     );
-    Ok(Some(result.elapsed_micros))
+    Ok(Some(CpuEngineBenchmarkResult {
+        elapsed_micros: result.elapsed_micros,
+        quality_passed: result.quality_passed,
+        quality_case_count: result.quality_case_count,
+    }))
 }
 
-fn valid_cpu_engine_selection(path: &Path, build_id: &str, cpu_key: &str) -> bool {
+fn valid_cpu_engine_selection(
+    path: &Path,
+    inference_compatibility_id: &str,
+    cpu_key: &str,
+) -> bool {
     let Ok(bytes) = fs::read(path) else {
         return false;
     };
@@ -1712,16 +2052,19 @@ fn valid_cpu_engine_selection(path: &Path, build_id: &str, cpu_key: &str) -> boo
         return false;
     };
     record.schema_version == CPU_ENGINE_SELECTION_SCHEMA_VERSION
-        && record.build_id == build_id
+        && record.inference_compatibility_id == inference_compatibility_id
         && record.cpu_key == cpu_key
         && matches!(record.cpu_engine.as_str(), "avx2" | "avx512")
 }
 
 fn cpu_engine_tuning_required(application_root: &Path) -> bool {
-    let Ok(build_id) = std::env::var("TRIMPROMPT_EXPECTED_BUILD_ID") else {
+    if std::env::var(CPU_ENGINE_MODE_ENV).as_deref() == Ok("manual") {
+        return false;
+    }
+    let Ok(inference_compatibility_id) = std::env::var(INFERENCE_COMPATIBILITY_ID_ENV) else {
         return false;
     };
-    if build_id.trim().is_empty() || !cpu_supports_avx512_engine() {
+    if inference_compatibility_id.trim().is_empty() || !cpu_supports_avx512_engine() {
         return false;
     }
     if !matches!(
@@ -1733,7 +2076,7 @@ fn cpu_engine_tuning_required(application_root: &Path) -> bool {
 
     !valid_cpu_engine_selection(
         &cpu_engine_selection_path(application_root),
-        &build_id,
+        &inference_compatibility_id,
         &current_cpu_key(),
     )
 }
@@ -1754,14 +2097,7 @@ fn cpu_engine_probe_path(application_root: &Path, engine: &str) -> PathBuf {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn cpu_supports_avx512_engine() -> bool {
-    std::arch::is_x86_feature_detected!("avx2")
-        && std::arch::is_x86_feature_detected!("fma")
-        && std::arch::is_x86_feature_detected!("f16c")
-        && std::arch::is_x86_feature_detected!("avx512f")
-        && std::arch::is_x86_feature_detected!("avx512cd")
-        && std::arch::is_x86_feature_detected!("avx512bw")
-        && std::arch::is_x86_feature_detected!("avx512dq")
-        && std::arch::is_x86_feature_detected!("avx512vl")
+    cpu_engine_supported(detect_cpu_instruction_capabilities(), "avx512")
 }
 
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
@@ -1769,22 +2105,76 @@ fn cpu_supports_avx512_engine() -> bool {
     false
 }
 
+fn cpu_engine_supported(capabilities: CpuInstructionCapabilities, engine: &str) -> bool {
+    let compatible = capabilities.sse42;
+    let avx2 = compatible
+        && capabilities.avx2
+        && capabilities.fma
+        && capabilities.f16c
+        && capabilities.bmi2;
+    match engine {
+        "auto" => true,
+        "compatible" => compatible,
+        "avx2" => avx2,
+        "avx512" => {
+            avx2 && capabilities.avx512f
+                && capabilities.avx512cd
+                && capabilities.avx512bw
+                && capabilities.avx512dq
+                && capabilities.avx512vl
+        }
+        _ => false,
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn detect_cpu_instruction_capabilities() -> CpuInstructionCapabilities {
+    CpuInstructionCapabilities {
+        sse42: std::arch::is_x86_feature_detected!("sse4.2"),
+        avx2: std::arch::is_x86_feature_detected!("avx2"),
+        fma: std::arch::is_x86_feature_detected!("fma"),
+        f16c: std::arch::is_x86_feature_detected!("f16c"),
+        bmi2: std::arch::is_x86_feature_detected!("bmi2"),
+        avx512f: std::arch::is_x86_feature_detected!("avx512f"),
+        avx512cd: std::arch::is_x86_feature_detected!("avx512cd"),
+        avx512bw: std::arch::is_x86_feature_detected!("avx512bw"),
+        avx512dq: std::arch::is_x86_feature_detected!("avx512dq"),
+        avx512vl: std::arch::is_x86_feature_detected!("avx512vl"),
+    }
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+fn detect_cpu_instruction_capabilities() -> CpuInstructionCapabilities {
+    CpuInstructionCapabilities::default()
+}
+
+fn current_cpu_engine() -> &'static str {
+    match std::env::var("TRIMPROMPT_CPU_ENGINE").as_deref() {
+        Ok("compatible") => "compatible",
+        Ok("avx2") => "avx2",
+        Ok("avx512") => "avx512",
+        _ if cfg!(feature = "embedded-llama-avx512") => "avx512",
+        _ if cfg!(feature = "embedded-llama-avx2") => "avx2",
+        _ => "compatible",
+    }
+}
+
 fn current_cpu_key() -> String {
     let processor = std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_else(|_| "unknown".to_string());
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    return format!(
-        "{processor}|avx2={}|fma={}|f16c={}|avx512f={}|avx512cd={}|avx512bw={}|avx512dq={}|avx512vl={}",
-        u8::from(std::arch::is_x86_feature_detected!("avx2")),
-        u8::from(std::arch::is_x86_feature_detected!("fma")),
-        u8::from(std::arch::is_x86_feature_detected!("f16c")),
-        u8::from(std::arch::is_x86_feature_detected!("avx512f")),
-        u8::from(std::arch::is_x86_feature_detected!("avx512cd")),
-        u8::from(std::arch::is_x86_feature_detected!("avx512bw")),
-        u8::from(std::arch::is_x86_feature_detected!("avx512dq")),
-        u8::from(std::arch::is_x86_feature_detected!("avx512vl")),
-    );
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    processor
+    let capabilities = detect_cpu_instruction_capabilities();
+    format!(
+        "{processor}|sse42={}|avx2={}|fma={}|f16c={}|bmi2={}|avx512f={}|avx512cd={}|avx512bw={}|avx512dq={}|avx512vl={}",
+        u8::from(capabilities.sse42),
+        u8::from(capabilities.avx2),
+        u8::from(capabilities.fma),
+        u8::from(capabilities.f16c),
+        u8::from(capabilities.bmi2),
+        u8::from(capabilities.avx512f),
+        u8::from(capabilities.avx512cd),
+        u8::from(capabilities.avx512bw),
+        u8::from(capabilities.avx512dq),
+        u8::from(capabilities.avx512vl),
+    )
 }
 
 fn reset_runtime_tuning_from_body(body: &[u8], state: &AppState) -> Result<serde_json::Value> {
@@ -2255,6 +2645,14 @@ mod tests {
             .collect()
     }
 
+    fn benchmark_result(elapsed_micros: u64, quality_passed: bool) -> CpuEngineBenchmarkResult {
+        CpuEngineBenchmarkResult {
+            elapsed_micros,
+            quality_passed,
+            quality_case_count: runtime_quality_probe_cases().len() as u32,
+        }
+    }
+
     #[test]
     fn accepts_only_loopback_bind_hosts() {
         assert!(is_loopback_host("localhost"));
@@ -2465,7 +2863,8 @@ mod tests {
             request_body_limit("/api/prepare-input"),
             MAX_REQUEST_BODY_BYTES
         );
-        assert!(APP_JS.contains("inputPrepareDelayMs = 1200"));
+        assert!(APP_JS.contains("inputPrepareDelayMs = 450"));
+        assert!(APP_JS.contains("pastedInputPrepareDelayMs = 50"));
         assert!(APP_JS.contains("promptInput.addEventListener(\"input\""));
         assert!(APP_JS.contains("fetch(\"/api/prepare-input\""));
         assert!(APP_JS.contains("await inputPreparePromise"));
@@ -2493,13 +2892,180 @@ mod tests {
         assert!(INDEX_HTML.contains("id=\"runtimeTuningResetButton\""));
         assert!(INDEX_HTML.contains("id=\"runtimeSetupScreen\""));
         assert!(INDEX_HTML.contains("初期設定中") || APP_JS.contains("初期設定中"));
+        assert!(APP_JS.contains("完了まで少し時間がかかります"));
+    }
+
+    #[test]
+    fn advanced_runtime_settings_expose_safe_manual_controls_and_current_values() {
+        assert_eq!(
+            request_body_limit("/api/runtime-configuration"),
+            MAX_SETTINGS_BODY_BYTES
+        );
+        for control in [
+            "runtimeDetails",
+            "cpuEngineSelect",
+            "threadModeSelect",
+            "generationThreadsInput",
+            "batchThreadsInput",
+            "runtimeCurrentValue",
+            "runtimeApplyButton",
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!("id=\"{control}\"")),
+                "missing advanced runtime control {control}"
+            );
+        }
+        assert!(APP_JS.contains("fetch(\"/api/runtime-configuration\""));
+        assert!(APP_JS.contains("option.disabled = availability ? !availability.supported"));
+        assert!(APP_JS.contains("postDesktopMessage(\"app:restart\")"));
+        assert!(APP_JS.contains("runtimeConfiguration?.available_threads"));
+        assert!(APP_JS.contains("runtimeConfiguration.logical_batch_size"));
+        assert!(APP_JS.contains("runtimeConfiguration.physical_batch_size"));
+        assert!(STYLES_CSS.contains(".runtime-details"));
+        assert!(STYLES_CSS.contains(".thread-inputs[hidden]"));
+    }
+
+    #[test]
+    fn cpu_engine_support_requires_every_instruction_used_by_each_binary() {
+        let avx2 = CpuInstructionCapabilities {
+            sse42: true,
+            avx2: true,
+            fma: true,
+            f16c: true,
+            bmi2: true,
+            ..Default::default()
+        };
+        assert!(cpu_engine_supported(avx2, "compatible"));
+        assert!(cpu_engine_supported(avx2, "avx2"));
+        assert!(!cpu_engine_supported(avx2, "avx512"));
+
+        let avx512 = CpuInstructionCapabilities {
+            avx512f: true,
+            avx512cd: true,
+            avx512bw: true,
+            avx512dq: true,
+            avx512vl: true,
+            ..avx2
+        };
+        assert!(cpu_engine_supported(avx512, "avx512"));
+        assert!(!cpu_engine_supported(
+            CpuInstructionCapabilities {
+                bmi2: false,
+                ..avx512
+            },
+            "avx2"
+        ));
+        assert!(!cpu_engine_supported(avx512, "unknown"));
+    }
+
+    #[test]
+    fn runtime_settings_reject_incomplete_or_excessive_manual_threads() {
+        assert!(validate_runtime_preferences(&UiSettings {
+            cpu_engine: Some("auto".into()),
+            thread_mode: Some("auto".into()),
+            ..UiSettings::default()
+        })
+        .is_ok());
+        assert!(validate_runtime_preferences(&UiSettings {
+            cpu_engine: Some("auto".into()),
+            thread_mode: Some("manual".into()),
+            generation_threads: Some(1),
+            batch_threads: None,
+            ..UiSettings::default()
+        })
+        .is_err());
+        assert!(validate_runtime_preferences(&UiSettings {
+            cpu_engine: Some("auto".into()),
+            thread_mode: Some("manual".into()),
+            generation_threads: Some(u32::MAX),
+            batch_threads: Some(1),
+            ..UiSettings::default()
+        })
+        .is_err());
     }
 
     #[test]
     fn avx512_requires_a_measurable_gain_over_avx2() {
-        assert_eq!(select_benchmarked_cpu_engine(1_000, 970), "avx512");
-        assert_eq!(select_benchmarked_cpu_engine(1_000, 971), "avx2");
-        assert_eq!(select_benchmarked_cpu_engine(1_000, 1_000), "avx2");
+        assert_eq!(
+            select_benchmarked_cpu_engine(
+                benchmark_result(1_000, true),
+                benchmark_result(970, true)
+            ),
+            "avx512"
+        );
+        assert_eq!(
+            select_benchmarked_cpu_engine(
+                benchmark_result(1_000, true),
+                benchmark_result(971, true)
+            ),
+            "avx2"
+        );
+        assert_eq!(
+            select_benchmarked_cpu_engine(
+                benchmark_result(1_000, true),
+                benchmark_result(900, false)
+            ),
+            "avx2"
+        );
+        assert_eq!(
+            select_benchmarked_cpu_engine(
+                benchmark_result(1_000, false),
+                benchmark_result(1_100, true)
+            ),
+            "avx512"
+        );
+    }
+
+    #[test]
+    fn cpu_engine_probe_uses_five_representative_inputs() {
+        assert_eq!(runtime_quality_probe_cases().len(), 5);
+    }
+
+    #[test]
+    fn cpu_engine_quality_checks_requirements_instead_of_text_identity() {
+        let case = runtime_quality_probe_cases()[1];
+        let concise_output = "ユーザー登録API: メールアドレス形式とパスワード12文字以上を検証。不正時はHTTP 400とし、データベースへ書き込まない。正常・異常テストを追加。";
+        assert_ne!(concise_output, case.input_text);
+        assert!(runtime_quality_missing_requirements(case, concise_output, false).is_empty());
+
+        let incomplete = concise_output.replace("HTTP 400", "エラー");
+        assert!(!runtime_quality_missing_requirements(case, &incomplete, false).is_empty());
+        assert!(!runtime_quality_missing_requirements(case, concise_output, true).is_empty());
+
+        let monitoring_case = runtime_quality_probe_cases()[4];
+        let paraphrased_monitoring = "5分単位の個人情報除去済みエラー件数と95パーセンタイル応答時間を集計。30秒超過時は中断し、元データを削除しない。";
+        assert!(runtime_quality_missing_requirements(
+            monitoring_case,
+            paraphrased_monitoring,
+            false
+        )
+        .is_empty());
+        let unordered_privacy =
+            paraphrased_monitoring.replace("個人情報除去済み", "個人情報を扱う");
+        assert!(
+            !runtime_quality_missing_requirements(monitoring_case, &unordered_privacy, false)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn persisted_cpu_engine_selection_completes_the_setup_gate() {
+        let directory = TestDirectory::new("cpu-engine-selection");
+        let selection_path = directory.path().join(CPU_ENGINE_SELECTION_FILE);
+
+        persist_cpu_engine_selection(&selection_path, "build-1", "inference-1", "cpu-1", "avx2")
+            .expect("persist CPU engine selection");
+
+        assert!(valid_cpu_engine_selection(
+            &selection_path,
+            "inference-1",
+            "cpu-1"
+        ));
+        assert!(!valid_cpu_engine_selection(
+            &selection_path,
+            "inference-2",
+            "cpu-1"
+        ));
     }
 
     #[test]
@@ -2610,6 +3176,23 @@ mod tests {
         assert!(INDEX_HTML.contains("推定トークン"));
         assert!(!INDEX_HTML.contains("トークン（推定）"));
         assert!(!INDEX_HTML.contains("モデル、圧縮モード、表示"));
+    }
+
+    #[test]
+    fn displayed_compression_time_covers_button_to_output_elapsed_time() {
+        assert!(APP_JS.contains("const compressionStartedAt = performance.now();"));
+        assert!(APP_JS.contains("renderResult(payload, compressionStartedAt);"));
+        assert!(APP_JS.contains("promptOutput.value = result.distilled_prompt || \"\";"));
+        assert!(APP_JS.contains("performance.now() - startedAt"));
+        assert!(APP_JS.contains("formatLatencySeconds(displayedElapsedMs)"));
+        assert!(APP_JS.contains("return `${seconds.toFixed(1)}s`;"));
+    }
+
+    #[test]
+    fn compression_error_remains_visible_after_result_cleanup() {
+        assert!(APP_JS.contains(
+            "clearResultLists();\n    promptOutput.value = String(error.message || error);"
+        ));
     }
 
     #[test]
