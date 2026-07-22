@@ -981,7 +981,7 @@ function renderResult(result, startedAt) {
   compressionLatency.textContent = formatLatencySeconds(displayedElapsedMs);
   resultNotice.hidden = !result.should_send_original;
   resultNoticeDetail.textContent = result.should_send_original
-    ? fallbackNoticeDetail(result.fallback_reason)
+    ? fallbackNoticeDetail(result)
     : "";
   copyButton.textContent = result.should_send_original ? "原文をコピー" : "コピー";
 }
@@ -1107,14 +1107,78 @@ function buildCompletionMessage(result, copied) {
 
 function buildFallbackMessage(result) {
   const metrics = result.metrics || {};
-  return `圧縮結果を安全に採用できなかったため原文を保持しました。自動コピーは行っていません。（文字数 ${formatComparison(metrics.input_characters, metrics.output_characters)}）`;
+  const reason = fallbackReasonText(result.fallback_reason, result, 260);
+  return `圧縮結果を安全に採用できなかったため原文を保持しました。${reason} 自動コピーは行っていません。（文字数 ${formatComparison(metrics.input_characters, metrics.output_characters)}）`;
 }
 
-function fallbackNoticeDetail(reason) {
-  if (typeof reason === "string" && reason.includes("model context")) {
-    return "入力がモデルの文脈長を超えています。内容を分割して再実行してください。自動コピーは行っていません。";
+function fallbackNoticeDetail(resultOrReason) {
+  const result = typeof resultOrReason === "object" && resultOrReason !== null
+    ? resultOrReason
+    : null;
+  const reason = result ? result.fallback_reason : resultOrReason;
+  const reasonText = fallbackReasonText(reason, result, 420);
+  if (reasonText) {
+    return `${reasonText} 自動コピーは行っていません。`;
   }
-  return "要件保持を安全に確認できませんでした。内容を見直して再実行してください。自動コピーは行っていません。";
+  return "理由: 圧縮結果で保持必須の要件を特定できませんでした。ファイル名、エラー表記、数値、否定・禁止・維持条件の欠落がないか確認してください。自動コピーは行っていません。";
+}
+
+function fallbackReasonText(reason, result = null, maxLength = 360) {
+  if (typeof reason === "string" && reason.includes("model context")) {
+    return "理由: 入力がモデルの文脈長を超えています。内容を分割して再実行してください。";
+  }
+  let rawReason = typeof reason === "string" ? reason.trim() : "";
+  if (!rawReason) {
+    rawReason = fallbackReasonFromRiskFlags(result) || fallbackReasonFromRemovedSummary(result);
+  }
+  if (!rawReason) {
+    return "";
+  }
+  const readable = localizeFallbackReason(rawReason);
+  const prefixed = readable.startsWith("原文返し理由:") || readable.startsWith("理由:")
+    ? readable
+    : `理由: ${readable}`;
+  return truncateNoticeText(prefixed, maxLength);
+}
+
+function fallbackReasonFromRiskFlags(result) {
+  const riskFlags = Array.isArray(result?.risk_flags) ? result.risk_flags : [];
+  const risk = riskFlags.find((item) => typeof item?.message === "string" && item.message.trim());
+  return risk ? risk.message.trim() : "";
+}
+
+function fallbackReasonFromRemovedSummary(result) {
+  const summaries = Array.isArray(result?.removed_content_summary)
+    ? result.removed_content_summary
+    : [];
+  const summary = summaries.find((item) => typeof item === "string" && item.trim());
+  return summary ? summary.trim() : "";
+}
+
+function localizeFallbackReason(reason) {
+  return reason
+    .replace(
+      /local runtime omitted a required prohibition or negative constraint;\s*invalid draft starts with:/i,
+      "否定・禁止・維持条件が圧縮候補で不足しました。候補冒頭:"
+    )
+    .replace(
+      /runtime error:\s*runtime error:\s*/i,
+      ""
+    )
+    .replace(/^verification_failed:\s*/i, "要件保持を確認できませんでした: ")
+    .replaceAll("preserve_code_blocks", "コードブロック")
+    .replaceAll("preserve_file_names", "ファイル名")
+    .replaceAll("preserve_error_messages", "エラー表記")
+    .replaceAll("preserve_numbers", "数値")
+    .replaceAll("preserve_negations", "否定・禁止・維持条件")
+    .replaceAll("empty_distilled_prompt", "圧縮結果が空でした");
+}
+
+function truncateNoticeText(text, maxLength) {
+  if (text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
 function summarizeText(text) {

@@ -97,7 +97,7 @@ where
                 Err(error) => {
                     application_fallback_applied = true;
                     runtime_fallback_reason = Some(format!(
-                        "Profile '{}' failed: {error}; original prompt returned without retry.",
+                        "原文返し理由: 圧縮ランタイムが失敗しました（profile: '{}', error: {error}）。再推論せず原文を返しました。",
                         requested_profile.id
                     ));
                     original_prompt_draft(&request)
@@ -115,8 +115,7 @@ where
             verification.risk_flags.push(RiskFlag {
                 code: "RUNTIME_FALLBACK".to_string(),
                 severity: RiskSeverity::High,
-                message: "Runtime backend failed; sending the original prompt is safer."
-                    .to_string(),
+                message: "圧縮ランタイムが失敗したため、原文返しを選択しました。".to_string(),
             });
         }
         if verification.should_send_original
@@ -229,9 +228,7 @@ fn trace_service_timing(stage: &str, elapsed: Duration) {
 fn original_prompt_draft(request: &CompressionRequest) -> CompressionDraft {
     CompressionDraft {
         distilled_prompt: request.input_text.trim().to_string(),
-        removed_content_summary: vec![
-            "Runtime backend failed; returned the original prompt.".to_string()
-        ],
+        removed_content_summary: vec!["圧縮ランタイムが失敗したため原文を返しました。".to_string()],
     }
 }
 
@@ -239,7 +236,7 @@ fn verification_fallback_draft(request: &CompressionRequest) -> CompressionDraft
     CompressionDraft {
         distilled_prompt: request.input_text.trim().to_string(),
         removed_content_summary: vec![
-            "Output verification failed; returned the original prompt.".to_string()
+            "圧縮結果の要件保持を確認できなかったため原文を返しました。".to_string()
         ],
     }
 }
@@ -278,6 +275,10 @@ mod tests {
             "テスト用の依頼を短くしてください。"
         );
         assert!(result.should_send_original);
+        assert!(result
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("圧縮ランタイムが失敗")));
         assert!(result
             .risk_flags
             .iter()
@@ -320,6 +321,10 @@ mod tests {
 
         assert_eq!(result.distilled_prompt, request.input_text);
         assert!(result.should_send_original);
+        assert!(result
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("原文返し理由")));
         assert!(result
             .risk_flags
             .iter()

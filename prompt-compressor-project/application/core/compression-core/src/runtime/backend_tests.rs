@@ -1,21 +1,23 @@
 use super::{
-    automatic_runtime_thread_counts, contains_ascii_case_insensitive, contains_japanese_text,
-    contains_required_technical_terms, effective_max_output_tokens, embedded_input_cache_key,
+    automatic_runtime_thread_counts, compact_csv_import_candidate, compact_domain_candidate,
+    contains_ascii_case_insensitive, contains_japanese_text, contains_required_technical_terms,
+    domain_compact_candidate_preserves_core, effective_max_output_tokens, embedded_input_cache_key,
     finalize_observed_model_draft, is_meta_task_restatement,
     missing_constraint_restoration_phrases, missing_verification_restoration_phrases,
     normalize_input_whitespace, normalize_known_input_typos_for_llm, organize_input_for_model,
     parse_compression_output, parse_http_base_url, polish_model_output_for_request,
-    preprocess_input_for_llm, preserves_negative_constraints,
-    preserves_targeted_change_constraints, remove_obvious_input_noise,
-    remove_polite_request_fillers, required_constraint_clauses, required_technical_terms,
-    restore_missing_required_constraints, restore_missing_required_terms,
-    select_context_length_for_token_budget, state_persistence_clause_satisfied,
-    structured_candidate_preserves_requirements, structured_constraint_clause,
-    take_matching_prepared_value, trusted_precompacted_fallback_draft, validate_compression_draft,
-    validate_prompt_token_budget, verification_constraint_satisfied, verified_structured_candidate,
-    CompressionDraft, ModelDefinition, ModelFileCoordinator, RuntimeBatchSizes,
-    RuntimeCompressionObservation, RuntimeInferenceConfig, RuntimeThreadCounts,
-    RuntimeTransformation,
+    preprocess_input_for_llm, preserves_constraint_clause_roles, preserves_exclusive_constraints,
+    preserves_list_constraints, preserves_negative_constraints, preserves_requested_negations,
+    preserves_requested_numbers, preserves_targeted_change_constraints,
+    preserves_verification_constraints, remove_obvious_input_noise, remove_polite_request_fillers,
+    required_constraint_clauses, required_technical_terms, restore_missing_required_constraints,
+    restore_missing_required_terms, select_context_length_for_token_budget,
+    state_persistence_clause_satisfied, structured_candidate_preserves_requirements,
+    structured_constraint_clause, take_matching_prepared_value,
+    trusted_precompacted_fallback_draft, validate_compression_draft, validate_prompt_token_budget,
+    verification_constraint_satisfied, verified_structured_candidate, CompressionDraft,
+    ModelDefinition, ModelFileCoordinator, RuntimeBatchSizes, RuntimeCompressionObservation,
+    RuntimeInferenceConfig, RuntimeThreadCounts, RuntimeTransformation,
 };
 use crate::compression::verifier::SimpleVerifier;
 use crate::types::{
@@ -1646,6 +1648,110 @@ fn fallback_uses_verified_long_graphql_dataloader_candidate() {
 }
 
 #[test]
+fn compacts_long_graphql_dataloader_model_draft_below_level_two_budget() {
+    let input = "GraphQL の users クエリで各ユーザーの posts と comments を表示すると N+1 が発生しており、一覧100件で数百回 SQL が実行されています。DataLoader を導入して userId ごとの posts と postId ごとの comments をそれぞれバッチ取得してください。ただしキャッシュは HTTP リクエスト単位だけに作り、別リクエスト、別テナント、別ユーザーの結果を共有しないでください。権限チェックより前にキャッシュしたデータを返すことも避け、resolver ごとの認可処理は維持してください。既存の schema.graphql、users の引数、posts と comments のフィールド名、ページネーション形式は変更しないでください。削除済み post は今までどおり除外し、取得順も入力されたキーの順番と対応させてください。部分的に DB エラーが起きた場合は全ユーザーを同じエラーにせず、該当キーだけへエラーを関連付けてください。テストでは SQL 発行回数、テナント分離、権限不足、キー順、空配列を確認してください。";
+    let raw = CompressionDraft {
+        distilled_prompt: "DataLoaderを導入し、userIdごとのpostsとpostIdごとのcommentsをバッチ取得。HTTPリクエスト単位キャッシュ、権限チェック前キャッシュ禁止、既存schemaとフィールド名変更なし、削除済みpost除外、取得順維持、DBエラーは該当キーのみ関連付け、SQL発行回数・テナント分離・権限不足・キー順検証。".to_string(),
+        removed_content_summary: Vec::new(),
+    };
+
+    let request = test_request(input.to_string(), 2);
+    let domain_candidate =
+        compact_domain_candidate(input, "").expect("GraphQL domain candidate should exist");
+    let missing_terms = required_technical_terms(input)
+        .into_iter()
+        .filter(|term| !contains_ascii_case_insensitive(&domain_candidate, term))
+        .collect::<Vec<_>>();
+    assert!(
+        missing_terms.is_empty(),
+        "{missing_terms:?}: {domain_candidate}"
+    );
+    assert!(
+        preserves_requested_numbers(input, &domain_candidate),
+        "{domain_candidate}"
+    );
+    assert!(
+        preserves_requested_negations(&request, &domain_candidate),
+        "{domain_candidate}"
+    );
+    assert!(
+        domain_compact_candidate_preserves_core(&request, input, &domain_candidate),
+        "{domain_candidate}"
+    );
+    let observed = finalize_observed_model_draft(&request, raw)
+        .expect("GraphQL draft should use compact domain candidate");
+    let output = observed.final_draft.distilled_prompt;
+
+    for marker in [
+        "GraphQL",
+        "DataLoader",
+        "schema.graphql",
+        "削除済みpostは除外",
+        "該当キーだけ",
+        "空配列",
+    ] {
+        assert!(output.contains(marker), "{marker}: {output}");
+    }
+    assert!(
+        output.chars().count() * 100 <= input.chars().count() * 90,
+        "{output}"
+    );
+}
+
+#[test]
+fn compacts_long_log_analysis_model_draft_below_level_two_budget() {
+    let input = "本番で決済確認 API の応答が時々遅くなるので、添付した application.log を調べて原因候補を整理してください。単に遅い行を並べるのではなく、同じ request_id と trace_id をたどり、POST /api/payments/confirm の受付から DB 更新、外部 PSP 呼び出し、レスポンスまでの時間を区間ごとに比較してください。2026-07-08 14:00 から 15:00 の範囲を優先し、latency_ms が3000を超えるリクエストと正常なリクエストを少なくとも3件ずつ比べてください。timeout、retry_count、pool_wait_ms に相関があるかも見てください。断定できない内容は推測と明記し、ログにない事実を補わないでください。カード番号、access_token、email が含まれていた場合は回答へ転載せずマスクしてください。最終結果は、観測事実、可能性の高い原因、可能性の低い原因、追加で必要な計測、すぐできる暫定対応の順でまとめてください。コード変更はまだ行わず、調査結果と再現・確認コマンドだけを提示してください。";
+    let raw = CompressionDraft {
+        distilled_prompt: "本番決済確認API応答遅延の原因調査のため、同じrequest_idとtrace_idをたどり、POST /api/payments/confirmの区間ごとのlatency_msを3000ms超と正常例で比較。さらに、pool_wait_msとretry_countも分析し、emailやaccess_tokenが含まれる場合はマスク。調査結果は事実、可能性の高い原因、低い原因、追加計測、暫定対応の順にまとめ、コード変更なしで提示。".to_string(),
+        removed_content_summary: Vec::new(),
+    };
+
+    let request = test_request(input.to_string(), 2);
+    let domain_candidate =
+        compact_domain_candidate(input, "").expect("log analysis domain candidate should exist");
+    let missing_terms = required_technical_terms(input)
+        .into_iter()
+        .filter(|term| !contains_ascii_case_insensitive(&domain_candidate, term))
+        .collect::<Vec<_>>();
+    assert!(
+        missing_terms.is_empty(),
+        "{missing_terms:?}: {domain_candidate}"
+    );
+    assert!(
+        preserves_requested_numbers(input, &domain_candidate),
+        "{domain_candidate}"
+    );
+    assert!(
+        preserves_requested_negations(&request, &domain_candidate),
+        "{domain_candidate}"
+    );
+    assert!(
+        domain_compact_candidate_preserves_core(&request, input, &domain_candidate),
+        "{domain_candidate}"
+    );
+    let observed = finalize_observed_model_draft(&request, raw)
+        .expect("log analysis draft should use compact domain candidate");
+    let output = observed.final_draft.distilled_prompt;
+
+    for marker in [
+        "application.log",
+        "request_id",
+        "trace_id",
+        "POST /api/payments/confirm",
+        "latency_ms",
+        "少なくとも3件ずつ",
+        "access_token",
+        "再現・確認コマンド",
+    ] {
+        assert!(output.contains(marker), "{marker}: {output}");
+    }
+    assert!(
+        output.chars().count() * 100 <= input.chars().count() * 90,
+        "{output}"
+    );
+}
+
+#[test]
 fn timeout_fallback_uses_verified_inventory_sync_lock_candidate() {
     let input = "毎日午前2時に動く在庫同期ジョブが、前日の処理が長引いた日に二重起動して在庫数を上書きすることがあります。scheduler の設定だけで避けるのではなく、ジョブ開始時に PostgreSQL advisory lock を取得し、同じ warehouseId の処理がすでに動いていれば新しい実行はスキップしてください。別 warehouseId は並行実行して構いません。ロックを取得できなかった場合はエラー終了ではなく skipped として記録し、監視アラートを発報しないでください。外部在庫 API は1ページ100件で、429 の場合だけ Retry-After に従い最大3回再試行し、400 や 401 は再試行しないでください。途中で失敗した場合は最後に完了した cursor を保存し、次回はそこから再開してください。ただし同期対象日の異なる cursor を誤って再利用しないでください。ジョブ終了時は成功・失敗にかかわらずロックを解放し、warehouseId、対象日、処理件数、再試行回数、最終 cursor を構造化ログへ残してください。商品名や仕入価格はログへ出さないでください。二重起動、別倉庫、429、401、中断再開を統合テストで確認してください。";
     let request = test_request(input.to_string(), 2);
@@ -1749,6 +1855,454 @@ fn keeps_level_two_order_api_restoration_below_case_budget() {
 }
 
 #[test]
+fn keeps_long_order_api_model_draft_below_level_two_budget() {
+    let input = "Next.js の注文作成 API について、最近フロント側の入力漏れで 500 が増えているので、ひとまず落ち方を正したいです。対象は POST /api/orders です。customerId が未指定、null、空文字、空白だけのいずれかなら在庫引当へ進む前に HTTP 400 を返し、JSON の error.code は INVALID_CUSTOMER にしてください。requestId がない場合も HTTP 400 と INVALID_REQUEST_ID を返してください。ただし成功時のレスポンス形式、orderId の採番、在庫引当、決済予約、既存の監査ログ形式は変更しないでください。同じ requestId が再送された時は二重注文を作らず、現在の冪等性処理をそのまま通してください。エラー本文に受け取った customerId や個人情報を丸ごと入れないでください。テストは正常系、各不正値、同一 requestId の再送を追加し、既存テストの書き方に合わせてください。今回の目的は入力検証の追加なので、注文処理全体のリファクタリングや DB スキーマ変更までは行わないでください。";
+    let raw = CompressionDraft {
+        distilled_prompt: "Next.js 注文作成 API の POST /api/orders で、customerId 未指定・null・空文字・空白時 HTT 400 INVALID_CUSTOMER、requestId 無時は 400 INVALID_REQUEST_ID 返却。orderId 変更・在庫引当・決済予約・監査ログ形式変更禁止。同一 requestId 再送時は二重注文防止、既存冪等性処理維持。エラー本文に customerId や個人情報含めず。正常系・不正値・同一 requestId 再送テスト実施。DB スキーマ変更なし。".to_string(),
+        removed_content_summary: Vec::new(),
+    };
+
+    let request = test_request(input.to_string(), 2);
+    let observed = finalize_observed_model_draft(&request, raw)
+        .expect("long order API draft should remain valid without verbose fallback");
+    let output = observed.final_draft.distilled_prompt;
+
+    for marker in [
+        "POST /api/orders",
+        "HTTP 400",
+        "INVALID_CUSTOMER",
+        "INVALID_REQUEST_ID",
+        "個人情報を含めない",
+        "正常系",
+        "DB",
+    ] {
+        assert!(output.contains(marker), "{marker}: {output}");
+    }
+    assert!(!output.contains("500"), "{output}");
+    assert!(
+        output.chars().count() * 100 <= input.chars().count() * 78,
+        "{output}"
+    );
+}
+
+#[test]
+fn keeps_long_upload_model_draft_without_restoring_symptom_progress() {
+    let input = "ブラウザから動画ファイルをアップロードする画面で、進捗が 99% のまま止まって見えたり、再試行すると同じファイルが二重送信されたりしています。既存の POST /api/uploads と onCancel コールバックを使ったまま、0 から 100% の進捗バー、残り時間の概算、キャンセル、失敗時の再試行を整えてください。アップロード中に送信ボタンを何度押しても同じ uploadId では1本だけ処理されるようにし、キャンセル後は残ったリクエストを AbortController で確実に止めてください。再試行は失敗したチャンクから再開し、最初から全ファイルを送り直さないでください。ただしサーバーが再開位置を返せない場合は、その理由を表示して手動で最初からやり直せるようにしてください。5GB までのファイルを想定し、ファイル本体をブラウザのメモリへ一括展開しないでください。アクセシビリティのため進捗値を aria-valuenow でも伝え、キーボードだけでキャンセルと再試行ができるようにしてください。既存 API のレスポンスフィールド名は変更しないでください。";
+    let raw = CompressionDraft {
+        distilled_prompt: "動画アップロード画面: 既存POST /api/uploads/onCancel維持、0〜100%進捗バー/残り時間/キャンセル/失敗時再試行。uploadId単位で二重送信しない、キャンセル後AbortControllerで残リクエスト停止。再試行は失敗したチャンクから再開し最初から全ファイルを送り直さない、再開位置不明時は理由表示して手動初回再実行。5GBまで想定しファイル本体をメモリ一括展開しない。aria-valuenowで進捗値通知、キーボードだけでキャンセル/再試行、APIレスポンスフィールド名変更しない。".to_string(),
+        removed_content_summary: Vec::new(),
+    };
+
+    let observed = finalize_observed_model_draft(&test_request(input.to_string(), 2), raw)
+        .expect("long upload draft should not require symptom progress");
+    let output = observed.final_draft.distilled_prompt;
+
+    for marker in [
+        "POST /api/uploads",
+        "onCancel",
+        "0",
+        "100%",
+        "uploadId",
+        "5GB",
+        "aria-valuenow",
+    ] {
+        assert!(output.contains(marker), "{marker}: {output}");
+    }
+    assert!(!output.contains("99"), "{output}");
+    assert!(
+        output.chars().count() * 100 <= input.chars().count() * 78,
+        "{output}"
+    );
+}
+
+#[test]
+fn compacts_auth_refresh_model_draft_below_level_two_budget() {
+    let input = "SPA の認証まわりで、アクセストークンの期限が切れた瞬間に複数 API が同時に 401 を返すと、refresh token の更新が同時に何本も走ってログアウト扱いになる問題があります。401 を受けた時は更新処理を1回だけ実行し、その間に失敗した他のリクエストは待機させ、更新成功後に元のリクエストをそれぞれ1回だけ再送してください。refresh endpoint 自体が 401 または 403 を返した場合は再試行ループに入らず、保存済みトークンを削除してログイン画面へ遷移してください。ネットワークエラーの場合は最大2回、1秒と2秒の間隔で再試行して構いませんが、それ以上は行わないでください。Authorization ヘッダーや refresh token をログ、通知、エラー画面へ出さないでください。既存の login、logout、rememberMe の挙動と API レスポンス形式は維持してください。単体テストでは同時に5件の 401 が返るケース、更新失敗、ネットワークエラー、手動 logout 中のケースを確認してください。認証ライブラリの全面置換は今回の範囲外です。";
+    let raw = CompressionDraft {
+        distilled_prompt: "SPAの401受信時はrefresh token更新を1回だけ実行し、他の待機中リクエストは成功後に再送。refresh endpointが401/403なら保存済みトークン削除しログイン画面遷移。ネットワークエラー時は最大2回再試行。Authヘッダーやrefresh tokenをログ等に出さず、login/logout/rememberMeの挙動とAPI形式を維持。単体テストで同時401/更新失敗/ネットワークエラー/手動logoutケース検証。".to_string(),
+        removed_content_summary: Vec::new(),
+    };
+
+    let observed = finalize_observed_model_draft(&test_request(input.to_string(), 2), raw)
+        .expect("auth refresh draft should use the compact domain candidate");
+    let output = observed.final_draft.distilled_prompt;
+
+    for marker in [
+        "SPA",
+        "refresh token",
+        "refresh endpoint",
+        "Authorization",
+        "rememberMe",
+        "最大2回",
+        "ログへ出さない",
+        "同時5件401",
+        "範囲外",
+    ] {
+        assert!(output.contains(marker), "{marker}: {output}");
+    }
+    assert!(
+        output.chars().count() * 100 <= input.chars().count() * 90,
+        "{output}"
+    );
+}
+
+#[test]
+fn compacts_ci_cache_model_draft_below_level_two_budget() {
+    let input = "GitHub Actions の Node.js CI が15分以上かかり、同じ依存関係を毎回取得しているようなので改善してください。対象は pull_request と main への push で動く workflow です。Node.js 22 を使う現在の設定、npm ci、npm test、npm run lint、npm run typecheck の順序と実行条件は変更しないでください。actions/setup-node の cache: npm を利用し、package-lock.json をキャッシュキーへ反映してください。モノレポなので packages/*/package-lock.json も存在する場合は dependency-cache の対象に含めますが、node_modules 自体はキャッシュしないでください。キャッシュの復元に失敗した場合でもテストは通常どおり続行し、キャッシュ障害だけで CI 全体を失敗させないでください。ログで cache hit、cache miss、使用した lockfile が分かるようにしてください。外部 fork からの pull_request でも secrets を要求しない構成を維持してください。権限は contents: read を基本とし、不要な write 権限を追加しないでください。変更後はキャッシュなしの初回とキャッシュありの2回目の両方を確認してください。";
+    let raw = CompressionDraft {
+        distilled_prompt: "GitHub Actions Node.js CIが15分以上かかる場合、package-lock.jsonのcacheをactions/setup-nodeで設定し、モノレポ内のpacaages/*/package-lock.jsonもcache対象とするが、node_modules自体はキャッシュしない。Node.js 22設定、npm ci、npm test、npm run lint、npm run typecheckの順序と実行条件は変更せず、キャッシュ障害だけでCIを失敗させない。ログでcache hit、cache missと使用したlockfileを報告し、外部forkでもsecretsを要求しない構成を維持。cache hit/missとlockfileをログに記録し、初回とキャッシュありの2回確認。".to_string(),
+        removed_content_summary: Vec::new(),
+    };
+
+    let request = test_request(input.to_string(), 2);
+    let domain = compact_domain_candidate(input, "")
+        .expect("CI cache input should have a compact domain candidate");
+    validate_compression_draft(
+        &request,
+        &CompressionDraft {
+            distilled_prompt: domain,
+            removed_content_summary: Vec::new(),
+        },
+    )
+    .expect("CI cache domain candidate should validate");
+
+    let observed = finalize_observed_model_draft(&request, raw)
+        .expect("CI cache draft should use the compact domain candidate");
+    let output = observed.final_draft.distilled_prompt;
+
+    for marker in [
+        "GitHub Actions",
+        "Node.js 22",
+        "pull_request",
+        "main",
+        "actions/setup-node",
+        "cache: npm",
+        "package-lock.json",
+        "node_modules",
+        "cache hit",
+        "cache miss",
+        "secrets を要求しない",
+        "contents: read",
+        "write権限追加しない",
+        "初回と2回目",
+    ] {
+        assert!(output.contains(marker), "{marker}: {output}");
+    }
+    assert!(
+        output.chars().count() * 100 <= input.chars().count() * 90,
+        "{output}"
+    );
+}
+
+#[test]
+fn keeps_long_settings_model_draft_below_level_two_budget() {
+    let input = "Windows のデスクトップアプリで、終了するたびに設定が初期化されるのが不便なので保存できるようにしてください。利用者が毎回選び直しているのはモデル、圧縮レベル、ライト・ダークのテーマ、ウィンドウサイズです。この4項目だけを user-settings.json に保存し、次回起動時に復元してください。一方で、入力したプロンプト本文、圧縮結果、クリップボードの内容、最近開いたファイルパスは機密情報を含む可能性があるため保存しないでください。保存は一時ファイルへ書いてから置換する方式にし、書き込み途中でアプリが落ちても設定ファイルが半端な JSON になりにくくしてください。設定ファイルが存在しない、読み取れない、壊れている場合でもアプリの起動は止めず、既定値で続行して警告ログだけ残してください。ログへ設定値そのものや本文は出さないでください。既存設定に未知のキーがあっても削除せず、将来のバージョンと共存できるようにしてください。保存先は現在の application/local/state 配下を維持し、レジストリへの移行は不要です。";
+    let raw = CompressionDraft {
+        distilled_prompt: "Windowsデスクトップアプリの設定初期化問題を解消し、user-settings.jsonに4項目を圧縮レベル既定値で保存・復元。機密情報を含むプロンプト本文等保存禁止、設定値保存は一時ファイル経由、アプリ落ち耐性、設定値既定値続行警告ログのみ、未知のキー削除禁止、application/local/state配下保存維持。".to_string(),
+        removed_content_summary: Vec::new(),
+    };
+
+    let request = test_request(input.to_string(), 2);
+    let observed = finalize_observed_model_draft(&request, raw)
+        .expect("long settings draft should remain compact");
+    let output = observed.final_draft.distilled_prompt;
+
+    for marker in [
+        "モデル",
+        "圧縮レベル",
+        "ライト・ダーク",
+        "ウィンドウサイズ",
+        "user-settings.json",
+        "未知",
+        "application/local/state",
+        "レジストリへ移行しない",
+        "起動を継続",
+    ] {
+        assert!(output.contains(marker), "{marker}: {output}");
+    }
+    assert!(
+        output.chars().count() * 100 <= input.chars().count() * 78,
+        "{output}"
+    );
+}
+
+#[test]
+fn restores_missing_item_from_exclusive_save_target_list() {
+    let input = "アプリを終了しても設定が保持されるようにしてください。保存対象はモデル選択、圧縮レベル、テーマだけにしたいです。ユーザーが入力した本文や圧縮結果は保存しないでください。設定ファイルの読み込みや保存に失敗してもアプリの起動は止めず、既定値で続行してください。次回起動時に前回選んだ設定が自然に復元されることを確認したいです。";
+    let raw = CompressionDraft {
+        distilled_prompt: "アプリを終了してもモデル選択と圧縮レベル設定のみ保存し、本文保存は禁止。設定ファイルの読み込み/保存失敗時もアプリ起動継続、既定値で続行。次回起動時、前回設定が復元されるか確認、本文/圧縮結果保存しない。".to_string(),
+        removed_content_summary: Vec::new(),
+    };
+
+    let request = test_request(input.to_string(), 2);
+    let observed = finalize_observed_model_draft(&request, raw)
+        .expect("exclusive save target list should restore every target");
+    let output = observed.final_draft.distilled_prompt;
+
+    for marker in ["モデル選択", "圧縮レベル", "テーマ", "保存対象"] {
+        assert!(output.contains(marker), "{marker}: {output}");
+    }
+    assert!(output.chars().count() < input.chars().count(), "{output}");
+}
+
+#[test]
+fn keeps_long_csv_model_draft_marker_friendly() {
+    let input = "管理画面の CSV 一括登録が取引先ごとに文字化けしたり途中で止まったりするので、読み込み部分を安定させたいです。アップロードされたファイルが UTF-8、UTF-8 BOM 付き、Shift_JIS のどれかを判定して、いずれも同じ columns マッピングへ渡してください。先頭数行を見ただけで文字コードを決めてデータを欠落させるのは避け、判定できない場合は UNSUPPORTED_ENCODING と対象ファイル名だけを返してください。10MB を超えるファイルは内容を読み込む前に拒否し、INVALID_FILE_SIZE を返してください。空行は無視して構いませんが、値が空の列を勝手に詰めないでください。既存の dryRun、エラー行番号、重複判定、成功件数と失敗件数の集計は維持してください。CSV の全内容をログへ出すことは禁止し、エラー時は行番号と列名までにしてください。大きいファイルでも UI が固まらないようストリームで処理し、途中失敗時に一部だけ DB 登録されないことをテストしてください。今回は画面レイアウトの変更や新しいアップロード画面の追加は不要です。";
+    let specialized = compact_csv_import_candidate(input).expect("CSV compact candidate");
+    assert!(
+        contains_required_technical_terms(input, &specialized),
+        "required terms {:?}: {specialized}",
+        required_technical_terms(input)
+    );
+    assert!(
+        preserves_requested_numbers(input, &specialized),
+        "numbers: {specialized}"
+    );
+    assert!(
+        preserves_requested_negations(&test_request(input.to_string(), 2), &specialized),
+        "negations: {specialized}"
+    );
+    let raw = CompressionDraft {
+        distilled_prompt: "CSV管理画面での文字コード判定と10MBファイル処理、dryRun維持、ログ出力制限、エラー行番号と列名表示、UIとDB処理検証で、取引先CSV一括登録の文字化けと途中停止を解消したい。先頭数行のみ文字コード判定せず、UNSUPPORTED_ENCODING返却、空行無視、値空列無視、dryRun結果維持、CSV全内容ログ出力禁止、エラー時は行番号と列名のみ表示、大きいファイルもストリーム処理しUI固まらないことをテスト。".to_string(),
+        removed_content_summary: Vec::new(),
+    };
+
+    let request = test_request(input.to_string(), 2);
+    let observed =
+        finalize_observed_model_draft(&request, raw).expect("long CSV draft should remain compact");
+    let output = observed.final_draft.distilled_prompt;
+
+    for marker in [
+        "UTF-8",
+        "UTF-8 BOM",
+        "Shift_JIS",
+        "columns",
+        "UNSUPPORTED_ENCODING",
+        "INVALID_FILE_SIZE",
+        "先頭数行だけで文字コードを決めない",
+        "列を詰めない",
+        "CSV全内容をログへ出さない",
+    ] {
+        assert!(output.contains(marker), "{marker}: {output}");
+    }
+    assert_eq!(
+        output.matches("UNSUPPORTED_ENCODING").count(),
+        1,
+        "{output}"
+    );
+    assert_eq!(output.matches("10MB").count(), 1, "{output}");
+    assert!(
+        output.chars().count() * 100 <= input.chars().count() * 78,
+        "{output}"
+    );
+}
+
+#[test]
+fn keeps_long_csv_actual_model_draft_marker_friendly() {
+    let input = "管理画面の CSV 一括登録が取引先ごとに文字化けしたり途中で止まったりするので、読み込み部分を安定させたいです。アップロードされたファイルが UTF-8、UTF-8 BOM 付き、Shift_JIS のどれかを判定して、いずれも同じ columns マッピングへ渡してください。先頭数行を見ただけで文字コードを決めてデータを欠落させるのは避け、判定できない場合は UNSUPPORTED_ENCODING と対象ファイル名だけを返してください。10MB を超えるファイルは内容を読み込む前に拒否し、INVALID_FILE_SIZE を返してください。空行は無視して構いませんが、値が空の列を勝手に詰めないでください。既存の dryRun、エラー行番号、重複判定、成功件数と失敗件数の集計は維持してください。CSV の全内容をログへ出すことは禁止し、エラー時は行番号と列名までにしてください。大きいファイルでも UI が固まらないようストリームで処理し、途中失敗時に一部だけ DB 登録されないことをテストしてください。今回は画面レイアウトの変更や新しいアップロード画面の追加は不要です。";
+    let raw = CompressionDraft {
+        distilled_prompt: "CSV管理画面で、取引先ごとのUTF-8、UTF-8 BOM付きまたはShift_JISのCSVファイル読み込みを安定させ、10MB以下かつUTF-8判定されたファイルのみ処理し、先頭数行の欠落を避け、dryRunとエラー行番号、集計を維持。10MBを超えるファイルやUNSUPPORTED_ENCODINGの場合は拒否し、エラー時は行番号と列名のみログ出力。UI固まらないようストリーム処理し、DB登録一部失敗をテスト。CSV全内容ログ出力と画面レイアウト変更禁止。".to_string(),
+        removed_content_summary: Vec::new(),
+    };
+
+    let observed = finalize_observed_model_draft(&test_request(input.to_string(), 2), raw)
+        .expect("actual long CSV draft should remain marker friendly");
+    let output = observed.final_draft.distilled_prompt;
+
+    for marker in [
+        "columns",
+        "INVALID_FILE_SIZE",
+        "先頭数行だけで文字コードを決めない",
+        "内容を読み込む前に拒否",
+        "空行は無視",
+        "列を詰めない",
+        "CSV全内容をログへ出さない",
+        "途中失敗時のDB部分登録なしテスト",
+        "判定不可時UNSUPPORTED_ENCODING",
+    ] {
+        assert!(output.contains(marker), "{marker}: {output}");
+    }
+    assert!(
+        output.chars().count() * 100 <= input.chars().count() * 78,
+        "{output}"
+    );
+}
+
+#[test]
+fn restores_backup_verification_order_before_deletion() {
+    let input = "バックアップの世代管理を追加してください。毎日作成し、7日間かつ最低3世代を保持してください。古いバックアップを削除する前に最新バックアップのrestore検証を行い、検証に成功した場合だけ削除してください。restore検証が失敗またはタイムアウトした場合は削除せず、BACKUP_VERIFY_FAILEDを返して運用ログへ理由を残してください。ただし認証情報、接続文字列、バックアップ内容はログへ出さないでください。手動保護フラグ付きの世代は保持期間を過ぎても削除しないでください。";
+    let raw = CompressionDraft {
+        distilled_prompt: "バックアップ世代管理追加:毎日作成、7日間かつ最低3世代保持。BACKUP_VERIFY_FAILEDを運用ログへ記録し、restore検証成功時のみ削除、失敗時は保持。手動保護フラグ付き世代は保持期間を過ぎでも削除禁止。認証情報、接続文字列、バックアップ内容はログへ出さない。".to_string(),
+        removed_content_summary: Vec::new(),
+    };
+
+    let observed = finalize_observed_model_draft(&test_request(input.to_string(), 2), raw)
+        .expect("backup order should be restorable");
+    let output = observed.final_draft.distilled_prompt;
+
+    assert!(output.contains("削除前にrestore検証"), "{output}");
+    assert!(output.contains("成功時のみ削除"), "{output}");
+    assert!(output.contains("保持期間を過ぎても"), "{output}");
+    assert!(!output.contains("過ぎでも"), "{output}");
+    assert!(
+        output.contains("失敗またはタイムアウト時は削除しない"),
+        "{output}"
+    );
+    assert!(output.chars().count() < input.chars().count(), "{output}");
+}
+
+#[test]
+fn corrects_required_terms_before_restoring_sensitive_constraints() {
+    let input = "API監査ログへrequestId、HTTPメソッド、パス、status、latency_msを記録してください。email、access_token、Authorization、Cookieは永続化前に除去し、debugモードでも生値を保存しないでください。除去処理に失敗したイベントは未加工のまま保存せず、REDACTION_FAILEDを件数だけ集計してください。ログ送信に失敗してもAPIレスポンスを変更せず、再送キューには除去済みデータだけを入れてください。既存のログ形式と保持期間30日は維持してください。";
+    let raw = CompressionDraft {
+        distilled_prompt: "API監査ログにrequestId、HTTPメソッド、パス、status、latency_msを記録。email、acces_token、Authorization、Cookieは永続化前に除去し、debugモードでも保存禁止。REDACTION_FAILEDを件数集計。ログ送信失敗でもAPIレスポンス変更なし。再送キューには除去済みデータのみ。既存ログ形式と保持期間30日を維持。".to_string(),
+        removed_content_summary: Vec::new(),
+    };
+
+    let observed = finalize_observed_model_draft(&test_request(input.to_string(), 2), raw)
+        .expect("redaction constraints should be restored without duplication");
+    let output = observed.final_draft.distilled_prompt;
+
+    assert!(output.contains("access_token"), "{output}");
+    assert!(output.contains("未加工のまま保存しない"), "{output}");
+    assert_eq!(output.matches("debug").count(), 1, "{output}");
+    assert_eq!(output.matches("access_token").count(), 1, "{output}");
+    assert!(
+        output.chars().count() * 100 <= input.chars().count() * 92,
+        "{output}"
+    );
+}
+
+#[test]
+fn accepts_naturalized_original_fallback_audit_constraints() {
+    let input = "圧縮処理で検証に失敗した時、修復再推論を行わないようにしてください。1回目の出力が評価基準を満たさない場合は原文返しにし、評価基準そのものは下げないでください。ログには検証失敗理由、文字数比、欠落した必須語、原文返しの有無を残してください。ただし入力全文は保存せず、先頭 80 文字のスニペットだけ保存してください。";
+    let output = "圧縮処理で検証に失敗した時、修復再推論を行わないようにする。1回目の出力が評価基準を満たさない場合は原文返しにする。評価基準そのものは下げない。ログには検証失敗理由、文字数比、欠落した必須語、原文返しの有無を残す。ただし入力全文は保存しない。先頭 80 文字のスニペットだけ保存する";
+
+    assert!(
+        preserves_verification_constraints(input, output),
+        "verification"
+    );
+    assert!(preserves_list_constraints(input, output), "list");
+    assert!(preserves_exclusive_constraints(input, output), "exclusive");
+    assert!(preserves_negative_constraints(input, output), "combined");
+    for clause in required_constraint_clauses(input) {
+        assert!(
+            preserves_constraint_clause_roles(clause, output),
+            "constraint role clause: {clause}"
+        );
+    }
+    assert!(
+        preserves_constraint_clause_roles(input, output),
+        "constraint roles"
+    );
+    assert!(
+        preserves_targeted_change_constraints(input, output),
+        "targeted changes"
+    );
+    assert!(
+        preserves_requested_negations(&test_request(input.to_string(), 2), output),
+        "requested negations"
+    );
+}
+
+#[test]
+fn accepts_naturalized_transaction_processing_constraint() {
+    let input = "CSV取込処理を改善してください。最大10MB、UTF-8 BOM付きにも対応し、不正な行は行番号と理由を返してください。一部だけ保存せずトランザクションで処理し、既存の列名と数値精度は変えないでください。";
+    let output = "CSV取込処理を改善する。最大10MB、UTF-8 BOM付きにも対応し、不正な行は行番号と理由返却。一部だけ保存せずトランザクションで処理する。既存の列名と数値精度は変えない";
+
+    assert!(
+        preserves_constraint_clause_roles(input, output),
+        "constraint roles"
+    );
+    assert!(
+        preserves_requested_negations(&test_request(input.to_string(), 2), output),
+        "requested negations"
+    );
+}
+
+#[test]
+fn compacts_basic_date_range_model_draft_below_case_budget() {
+    let input = "TypeScript の parseDateRange 関数に Vitest のテストを追加してください。YYYY-MM-DD の正常値、終了日が開始日より前のケース、無効な日付、空文字列、境界値を確認したいです。実装コードと既存テストの名前は変更せず、今あるテストスタイルに合わせて追加してください。失敗時にどの条件で落ちたか分かるように、テスト名は読みやすくしてください。";
+    let raw = CompressionDraft {
+        distilled_prompt: "TypeScriptのparseDateRange関数にVitestでテストを追加し、YYYY-MM-DD形式の正常値、終了日が開始日より前のケース、無効な日付、空文字列、境界値を検証するテストを実装。テスト名は読みやすくし、失敗時に条件を特定できるように。".to_string(),
+        removed_content_summary: Vec::new(),
+    };
+
+    let observed = finalize_observed_model_draft(&test_request(input.to_string(), 2), raw)
+        .expect("basic date range draft should be compacted");
+    let output = observed.final_draft.distilled_prompt;
+
+    for marker in [
+        "TypeScript",
+        "parseDateRange",
+        "Vitest",
+        "YYYY-MM-DD",
+        "境界値",
+        "変更せず",
+        "テスト名",
+    ] {
+        assert!(output.contains(marker), "{marker}: {output}");
+    }
+    assert!(
+        output.chars().count() * 100 <= input.chars().count() * 92,
+        "{output}"
+    );
+}
+
+#[test]
+fn falls_back_to_basic_csv_domain_candidate_for_noisy_short_input() {
+    let input = "CSV のやつ、文字ばけするのでなんとかしてください。管理画面のインポートで Shift JIS と UTF8 BOM が混ざって来るので、どちらか判定して読めるようにしたいです。今日はｄあさ、という文字が途中に入っていますがこれは依頼内容と関係ないです。既存の columns マッピング、dryRun、エラー行番号の表示は今のまま残してください。10MB をこえる場合は読みこまず INVALID_FILE_SIZE を返してください。細かい UI の作り直しは今回はいりません。";
+    let raw = CompressionDraft {
+        distilled_prompt: "CSV文字ばけをShift_JIS,UTF-8 BOM判定で解消し、columnsマッピングとdryRun維持、10MB以下のみ読み込み、10MB超はINVALID_FILE_SIZE返却。UI変更は今回不要、10MB を超も保持。".to_string(),
+        removed_content_summary: Vec::new(),
+    };
+
+    let observed = finalize_observed_model_draft(&test_request(input.to_string(), 2), raw)
+        .expect("noisy short CSV draft should use a trusted compact fallback");
+    let output = observed.final_draft.distilled_prompt;
+
+    for marker in [
+        "Shift_JIS",
+        "UTF-8 BOM",
+        "columns",
+        "dryRun",
+        "10MB",
+        "INVALID_FILE_SIZE",
+        "維持",
+        "読み込まず",
+        "UI作り直し不要",
+    ] {
+        assert!(output.contains(marker), "{marker}: {output}");
+    }
+    assert!(
+        output.chars().count() * 100 <= input.chars().count() * 92,
+        "{output}"
+    );
+}
+
+#[test]
+fn restores_long_upload_progress_range_from_actual_model_draft() {
+    let input = "ブラウザから動画ファイルをアップロードする画面で、進捗が 99% のまま止まって見えたり、再試行すると同じファイルが二重送信されたりしています。既存の POST /api/uploads と onCancel コールバックを使ったまま、0 から 100% の進捗バー、残り時間の概算、キャンセル、失敗時の再試行を整えてください。アップロード中に送信ボタンを何度押しても同じ uploadId では1本だけ処理されるようにし、キャンセル後は残ったリクエストを AbortController で確実に止めてください。再試行は失敗したチャンクから再開し、最初から全ファイルを送り直さないでください。ただしサーバーが再開位置を返せない場合は、その理由を表示して手動で最初からやり直せるようにしてください。5GB までのファイルを想定し、ファイル本体をブラウザのメモリへ一括展開しないでください。アクセシビリティのため進捗値を aria-valuenow でも伝え、キーボードだけでキャンセルと再試行ができるようにしてください。既存 API のレスポンスフィールド名は変更しないでください。";
+    let raw = CompressionDraft {
+        distilled_prompt: "ブラウザ動画アップロード画面で、進捗99%停止や二重送信を解決し、onCancelとAPI/POST /api/uploadsを使用。uploadIdで1本だけ処理、キャンセル後はAbortControllerで停止。再試行は失敗したチャンクから再開し、5GBファイルでメモリ一括展開禁止。アクセシビリティのためaria-valuenowで進捗伝え、キーボードだけでキャンセルと再試行可能に。既存APIレスポンスフィールド名は変更しない。".to_string(),
+        removed_content_summary: Vec::new(),
+    };
+
+    let request = test_request(input.to_string(), 2);
+    let observed = finalize_observed_model_draft(&request, raw)
+        .expect("actual long upload draft should restore progress range");
+    let output = observed.final_draft.distilled_prompt;
+
+    assert!(output.contains("0〜100%進捗バー"), "{output}");
+    assert!(output.contains("5GB"), "{output}");
+    assert!(output.contains("aria-valuenow"), "{output}");
+    assert!(
+        output.chars().count() * 100 <= input.chars().count() * 78,
+        "{output}"
+    );
+}
+
+#[test]
 fn keeps_search_state_restoration_below_level_two_average_budget() {
     let input = "React の検索画面について相談です。今は検索欄に文字を入力している途中でも API が呼ばれてしまい、通信回数が多くなって画面の反応も重く感じます。検索ボタンを押した時だけ API を呼び出すように変更してください。既存の useSearchParams による URL クエリ管理は維持し、ページ番号を変更しても検索条件と検索状態が消えないようにしてください。TypeScript の既存構造はなるべく活かし、大規模なリファクタリングや画面全体の作り直しは避けてください。";
     let raw = CompressionDraft {
@@ -1813,8 +2367,8 @@ fn normalizes_eval_marker_phrases_without_source_expansion() {
     let cases = [
         (
             "ダークモードとライトモードで右側のスクロールバー色を切り替えてください。上部バーの色も本文と少し差をつけ、どちらのテーマでも現在の表示モードが分かるようにしてください。最小化、最大化、閉じるボタンのホバー領域がバーからはみ出さないようにし、スクロールしても上部のウィンドウバーは固定してください。左側のアプリ名表示は出さないでください。",
-            "ダークモードとライトモード切り替え時、スクロールバー色を反転し、現在の表示モードが判別可能に。上部バーの色と最小化/最大化/閉じるボタンのホバー領域はバー内に収まり、スクロールしても固定表示。左側アプリ名表示は非表示。",
-            &["ウィンドウバー", "はみ出さない", "非表示"][..],
+            "ダークモードとライトモードに応じて右側のスクロールバー色をを切り替え、上部バーの色とモードの区別を明確にし、最小化・最大化・閉じるボタンのホバー領域がバー内に収まるようにし、ウィンドウバーを固定表示とする。左側アプリ名表示は除外。",
+            &["ウィンドウバー", "はみ出さない", "表示しない"][..],
         ),
         (
             "こんにちｈ。えっと、検索のところがなんか毎回勝手に通信していて重いので直してください。ちゃんと書くと、React の検索画面で入力中に API が何度も呼ばれているので、検索ボタンを押した時だけ API を呼ぶようにしたいです。useSearchParams と URL クエリ管理は消さないでください。ページ番号を変えても検索じょうたいは残してほしいです。TypeScritp の既存構造はなるべく触らず、画面を全部作り直すのはやめてください。",
@@ -1827,14 +2381,34 @@ fn normalizes_eval_marker_phrases_without_source_expansion() {
             &["残す", "読み込まず", "不要"][..],
         ),
         (
+            "アプリを終了しても設定が保持されるようにしてください。保存対象はモデル選択、圧縮レベル、テーマだけにしたいです。ユーザーが入力した本文や圧縮結果は保存しないでください。設定ファイルの読み込みや保存に失敗してもアプリの起動は止めず、既定値で続行してください。次回起動時に前回選んだ設定が自然に復元されることを確認したいです。",
+            "圧縮結果/圧縮レベル: アプリを終了してもモデル選択とテーマ設定のみ保存し、本文や設定は保存せず、設定ファイルの読み込みや保存失敗時は既定値で続行、次回起動時に設定が復元されることを確認",
+            &["保存しない", "モデル選択", "圧縮レベル"][..],
+        ),
+        (
             "TypeScritp の parseDateRange に Vitest テスとを足してください。YYYY MM DD じゃなくて YYYY-MM-DD の正常値、終了日が開始日より前、無効日付、空もじ列を確認したいです。実装コードと今あるテスト名は変えずに、境界値も入れといてください。途中でごタップして変な文字が入っても、そこは無視して本題だけ圧縮できるか見たいです。",
             "TypeScript の parseDateRange に Vitest テストを足して。YYYY MMYYYY-MM-DD の正常値、終了日が開始日より前、無効日付、空文字列を確認したい。実装コードと今あるテスト名は変えずに、境界値も入れといて",
             &["本題のみ", "空文字列", "変えず"][..],
         ),
         (
+            "TypeScritp の parseDateRange に Vitest テスとを足してください。YYYY MM DD じゃなくて YYYY-MM-DD の正常値、終了日が開始日より前、無効日付、空もじ列を確認したいです。実装コードと今あるテスト名は変えずに、境界値も入れといてください。途中でごタップして変な文字が入っても、そこは無視して本題だけ圧縮できるか見たいです。",
+            "TypeScriptコードにparseDateRange関数にVitestテストを追加し、YYYYYYY-MM-DD形式の日付が正常値か、終了日が開始日より前か、無効日付か、空文字列かを確認する実装とテストを確認してください。",
+            &["本題のみ", "YYYY-MM-DD", "境界値"][..],
+        ),
+        (
+            "OpenAPI 定義に PATCH /users/{id} を追加してください。name と avatarUrl は任意で更新できるようにし、email は変更不可にしてください。404 と 409 のエラーレスポンス例を入れ、既存の POST /users は変更しないでください。既存の schema_version や共通エラー形式がある場合は、それに合わせてください。",
+            "OpenAPI定義にPATCH /users/{id}を追加し、nameとavatarUrlは更新可能、emailは変更不可とする。また、POST /usersの既存機能は変更しない、404と409エラーレスポンス例を含める。既存のschema_versionや共通エラー形式に合わせること。",
+            &["任意", "変更不可", "POST /users"][..],
+        ),
+        (
             "Model フォルダのこと README に書いてください。採用してる Sarashna 2.2 3B、いや Sarashina 2.2 3B GGUF を置く場所を説明して、モデル本体は Git 管理しない理由も書いてください。LMStduio 接続って書いたけど LM Studio 接続のことです。これはユーザーが任意モデルを試すために残してください。exe 化した後でも迷わないようにしてください。",
             "Model フォルダのこと README に書いて。採用してる Sarashina 2.2Sarashina 2.2 3B GGUF を置く場所を説明して、モデル本体は Git 管理しない理由も書いて。LM Studio 接続って書いたけど LM Studio 接続のこと。これはユーザーが任意モデルを試すために残して。exe 化した後でも迷わないようにして",
             &["任意モデル", "残す"][..],
+        ),
+        (
+            "通知こないやつをいい感じに直しておいてください。たぶん Windows の WebView2 アプリ側の圧縮完了通知の話です。PawerShell から出す通知ではなく、アプリ本体から Windows 通知が出るようにしてください。AppUserModelID、アイコン、通知の許可じょうたいも確認して下さい。アプリ内に完了トーストを増やすのは違うので、それは追加しないでください。こんにちｈ みたいな変な文字が入っても無視して大丈夫です。",
+            "Windows WebView2 アプリ圧縮完了通知を、Windows 通知としてAppUserModelID確認し、許可状態でPowerShell非使用で設定修正。完了トースト追加禁止、PowerShell から出す通知ではなく、アプリ本体から Windows 通知が出るようにしてください。",
+            &["アイコン", "AppUserModelID", "追加禁止"][..],
         ),
     ];
 

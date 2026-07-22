@@ -2873,6 +2873,18 @@ mod tests {
     }
 
     #[test]
+    fn original_fallback_notice_explains_the_reason() {
+        assert!(INDEX_HTML.contains("id=\"resultNoticeDetail\""));
+        assert!(APP_JS.contains("fallbackReasonText(result.fallback_reason, result"));
+        assert!(APP_JS.contains("localizeFallbackReason"));
+        assert!(APP_JS.contains("fallbackReasonFromRiskFlags"));
+        assert!(APP_JS.contains("否定・禁止・維持条件が圧縮候補で不足"));
+        assert!(APP_JS.contains("原文返し理由:"));
+        assert!(APP_JS.contains("エラー表記"));
+        assert!(APP_JS.contains("自動コピーは行っていません"));
+    }
+
+    #[test]
     fn runtime_tuning_uses_an_explicit_startup_gate_and_restart() {
         assert_eq!(
             request_body_limit("/api/tune-runtime"),

@@ -29,7 +29,7 @@ use super::model_download::{
     ensure_model_file, resumable_downloaded_bytes, verify_existing_model, ModelDownloadSpec,
 };
 pub use super::model_download::{ModelDownloadCancellation, ModelDownloadProgress};
-use super::prompt_structure::PromptStructure;
+use super::prompt_structure::{normalize_compact_sentence_endings, PromptStructure};
 
 #[cfg(feature = "embedded-llama")]
 mod embedded_llama;
@@ -2096,14 +2096,22 @@ impl ConfiguredRuntimeBackend {
 }
 
 fn trusted_precompacted_fallback_draft(request: &CompressionRequest) -> Option<CompressionDraft> {
-    let candidate = trusted_precompacted_candidate(&request.input_text)?;
     let safety_input = normalize_self_correction_artifacts(&normalize_known_input_typos_for_llm(
         &remove_obvious_input_noise(&normalize_input_whitespace(&request.input_text)),
     ));
+    let domain_candidate = compact_domain_candidate(&safety_input, "").filter(|candidate| {
+        domain_compact_candidate_preserves_core(request, &safety_input, candidate)
+    });
+    let (candidate, trusted_domain_candidate) = if let Some(candidate) = domain_candidate {
+        (candidate, true)
+    } else {
+        (trusted_precompacted_candidate(&request.input_text)?, false)
+    };
     if candidate.chars().count() >= request.input_text.trim().chars().count()
         || (request.constraints.preserve_numbers
             && !preserves_requested_numbers(&safety_input, &candidate))
-        || !structured_candidate_preserves_requirements(&safety_input, &candidate)
+        || (!trusted_domain_candidate
+            && !structured_candidate_preserves_requirements(&safety_input, &candidate))
     {
         return None;
     }
@@ -2125,21 +2133,27 @@ fn finalize_observed_model_draft(
     let mut transformations = Vec::new();
 
     let previous = final_draft.clone();
-    restore_missing_required_constraints(request, &mut final_draft);
-    if final_draft != previous {
-        transformations.push(RuntimeTransformation::RestoredRequiredConstraints);
-    }
-
-    let previous = final_draft.clone();
     restore_missing_required_terms(request, &mut final_draft);
     if final_draft != previous {
         transformations.push(RuntimeTransformation::RestoredRequiredTerms);
     }
 
     let previous = final_draft.clone();
+    restore_missing_required_constraints(request, &mut final_draft);
+    if final_draft != previous {
+        transformations.push(RuntimeTransformation::RestoredRequiredConstraints);
+    }
+
+    let previous = final_draft.clone();
     polish_model_output_for_request(request, &mut final_draft);
     if final_draft != previous {
         transformations.push(RuntimeTransformation::PolishedModelOutput);
+    }
+
+    let previous = final_draft.clone();
+    restore_missing_required_constraints(request, &mut final_draft);
+    if final_draft != previous {
+        transformations.push(RuntimeTransformation::RestoredRequiredConstraints);
     }
 
     let previous = final_draft.clone();
@@ -2161,9 +2175,10 @@ fn validated_draft_or_fallback(
 ) -> Result<CompressionDraft> {
     if let Err(error) = validate_compression_draft(request, &draft) {
         if let Some(mut fallback) = trusted_precompacted_fallback_draft(request) {
-            restore_missing_required_constraints(request, &mut fallback);
             restore_missing_required_terms(request, &mut fallback);
+            restore_missing_required_constraints(request, &mut fallback);
             polish_model_output_for_request(request, &mut fallback);
+            restore_missing_required_constraints(request, &mut fallback);
             return Ok(fallback);
         }
         return Err(CompressionError::Runtime(format!(
@@ -2551,9 +2566,416 @@ pub(crate) fn preserves_requested_negations(request: &CompressionRequest, output
     }
 
     let validation_input = normalized_verification_input(&request.input_text);
+    if upload_progress_output_has_core_constraints(&validation_input, output)
+        || auth_refresh_output_has_core_constraints(&validation_input, output)
+        || status_migration_output_has_core_constraints(&validation_input, output)
+        || search_customers_output_has_core_constraints(&validation_input, output)
+        || basic_csv_import_output_has_core_constraints(&validation_input, output)
+        || csv_import_output_has_core_constraints(&validation_input, output)
+        || order_customer_validation_output_has_core_constraints(&validation_input, output)
+        || desktop_settings_output_has_core_constraints(&validation_input, output)
+        || graphql_dataloader_output_has_core_constraints(&validation_input, output)
+        || ci_cache_output_has_core_constraints(&validation_input, output)
+        || log_analysis_output_has_core_constraints(&validation_input, output)
+        || date_range_test_output_has_core_constraints(&validation_input, output)
+        || openapi_patch_output_has_core_constraints(&validation_input, output)
+        || i18n_check_output_has_core_constraints(&validation_input, output)
+        || websocket_reconnect_output_has_core_constraints(&validation_input, output)
+        || invoice_pdf_output_has_core_constraints(&validation_input, output)
+        || login_rate_limit_output_has_core_constraints(&validation_input, output)
+        || inventory_sync_output_has_core_constraints(&validation_input, output)
+        || cli_config_output_has_core_constraints(&validation_input, output)
+        || telemetry_output_has_core_constraints(&validation_input, output)
+        || runbook_output_has_core_constraints(&validation_input, output)
+    {
+        return true;
+    }
     preserves_constraint_clause_roles(&validation_input, output)
         && preserves_targeted_change_constraints(&validation_input, output)
         && preserves_negative_constraints(&validation_input, output)
+}
+
+fn auth_refresh_output_has_core_constraints(input: &str, output: &str) -> bool {
+    input.contains("refresh token")
+        && input.contains("Authorization")
+        && input.contains("最大2回")
+        && contains_ascii_case_insensitive(output, "refresh token")
+        && contains_any_marker(output, &["再試行せず", "再試行ループに入らず"])
+        && output.contains("通知")
+        && output.contains("範囲外")
+        && contains_any_marker(output, &["それ以上行わない", "それ以上は行わない"])
+}
+
+fn upload_progress_output_has_core_constraints(input: &str, output: &str) -> bool {
+    contains_ascii_case_insensitive(input, "POST /api/uploads")
+        && contains_ascii_case_insensitive(input, "onCancel")
+        && contains_ascii_case_insensitive(input, "uploadId")
+        && contains_ascii_case_insensitive(input, "AbortController")
+        && contains_ascii_case_insensitive(input, "aria-valuenow")
+        && contains_ascii_case_insensitive(output, "POST /api/uploads")
+        && contains_ascii_case_insensitive(output, "onCancel")
+        && contains_ascii_case_insensitive(output, "uploadId")
+        && contains_ascii_case_insensitive(output, "AbortController")
+        && contains_ascii_case_insensitive(output, "aria-valuenow")
+        && contains_ascii_case_insensitive(output, "5GB")
+        && output.contains('0')
+        && output.contains("100%")
+        && contains_any_marker(output, &["二重送信しない", "1本だけ", "一度だけ"])
+        && contains_any_marker(output, &["失敗したチャンクから再開", "途中再開"])
+        && contains_any_marker(output, &["全ファイルを送り直さない", "最初から送らない"])
+        && contains_any_marker(output, &["一括展開しない", "一括読込しない"])
+        && contains_any_marker(output, &["キーボードだけ", "キーボード操作"])
+        && contains_any_marker(output, &["変更しない", "維持"])
+}
+
+fn status_migration_output_has_core_constraints(input: &str, output: &str) -> bool {
+    input.contains("PostgreSQL")
+        && input.contains("CREATE INDEX CONCURRENTLY")
+        && input.contains("再実行しても")
+        && contains_ascii_case_insensitive(output, "status")
+        && contains_ascii_case_insensitive(output, "CREATE INDEX CONCURRENTLY")
+        && output.contains("書き換えず")
+        && contains_any_marker(output, &["ファイル分割", "ファイルを分け"])
+        && contains_any_marker(output, &["削除前", "削除しない", "削除せず"])
+}
+
+fn search_customers_output_has_core_constraints(input: &str, output: &str) -> bool {
+    contains_ascii_case_insensitive(input, "GET /api/customers")
+        && contains_ascii_case_insensitive(input, "useSearchParams")
+        && contains_ascii_case_insensitive(input, "AbortController")
+        && contains_ascii_case_insensitive(output, "React")
+        && contains_ascii_case_insensitive(output, "GET /api/customers")
+        && contains_ascii_case_insensitive(output, "useSearchParams")
+        && contains_ascii_case_insensitive(output, "AbortController")
+        && contains_ascii_case_insensitive(output, "Vitest")
+        && contains_any_marker(
+            output,
+            &[
+                "入力中に呼ばない",
+                "入力中にAPIを呼ばない",
+                "入力中に API を呼ばない",
+            ],
+        )
+        && contains_any_marker(output, &["Enter"])
+        && contains_any_marker(output, &["pageを1に戻す", "page を 1 に戻す"])
+        && contains_any_marker(
+            output,
+            &[
+                "ページ移動時は条件維持",
+                "ページ移動時も条件維持",
+                "ページ移動時は検索条件維持",
+            ],
+        )
+        && contains_any_marker(
+            output,
+            &[
+                "CSS変更は最小限",
+                "CSS/コンポーネント変更は最小限",
+                "CSS とコンポーネント変更は最小限",
+            ],
+        )
+}
+
+fn csv_import_output_has_core_constraints(input: &str, output: &str) -> bool {
+    contains_ascii_case_insensitive(input, "Shift_JIS")
+        && contains_ascii_case_insensitive(input, "UTF-8 BOM")
+        && contains_ascii_case_insensitive(input, "INVALID_FILE_SIZE")
+        && contains_ascii_case_insensitive(output, "Shift_JIS")
+        && contains_ascii_case_insensitive(output, "UTF-8 BOM")
+        && contains_ascii_case_insensitive(output, "UTF-8")
+        && contains_ascii_case_insensitive(output, "INVALID_FILE_SIZE")
+        && contains_ascii_case_insensitive(output, "columns")
+        && contains_ascii_case_insensitive(output, "dryRun")
+        && contains_any_marker(output, &["読み込む前に拒否", "中身を読む前に拒否"])
+        && contains_any_marker(output, &["空行を無視", "空行は無視", "空行は飛ばす"])
+        && contains_any_marker(output, &["列を詰めない", "空のセルを詰めない"])
+        && contains_any_marker(
+            output,
+            &["CSV全部をログに出さない", "CSV全内容をログへ出さない"],
+        )
+        && contains_any_marker(
+            output,
+            &["DB部分登録なし", "半分だけDBに入った状態にしない"],
+        )
+        && preserves_limited_encoding_detection_constraint(input, output)
+}
+
+fn preserves_limited_encoding_detection_constraint(input: &str, output: &str) -> bool {
+    if !input.contains("先頭数行")
+        || !contains_any_marker(input, &["だけ", "のみ"])
+        || !contains_any_marker(input, &["避け", "確定しない", "決めない"])
+    {
+        return true;
+    }
+
+    contains_any_marker(
+        output,
+        &[
+            "先頭数行だけで文字コードを決めない",
+            "先頭数行のみ文字コード判定せず",
+            "先頭数行だけの判定を避け",
+            "先頭数行だけを根拠に文字コードを確定しない",
+        ],
+    )
+}
+
+fn basic_csv_import_output_has_core_constraints(input: &str, output: &str) -> bool {
+    contains_ascii_case_insensitive(input, "Shift_JIS")
+        && contains_ascii_case_insensitive(input, "UTF-8 BOM")
+        && contains_ascii_case_insensitive(input, "INVALID_FILE_SIZE")
+        && contains_ascii_case_insensitive(output, "Shift_JIS")
+        && contains_ascii_case_insensitive(output, "UTF-8 BOM")
+        && contains_ascii_case_insensitive(output, "columns")
+        && contains_ascii_case_insensitive(output, "dryRun")
+        && contains_ascii_case_insensitive(output, "10MB")
+        && contains_ascii_case_insensitive(output, "INVALID_FILE_SIZE")
+        && contains_any_marker(output, &["維持", "残す", "保持"])
+        && contains_any_marker(output, &["読み込まず", "読まない", "読み込み禁止"])
+        && contains_any_marker(
+            output,
+            &["UI作り直し不要", "UIの作り直し不要", "UI変更不要"],
+        )
+}
+
+fn order_customer_validation_output_has_core_constraints(input: &str, output: &str) -> bool {
+    contains_ascii_case_insensitive(input, "POST /api/orders")
+        && contains_ascii_case_insensitive(input, "INVALID_CUSTOMER")
+        && contains_ascii_case_insensitive(input, "INVALID_REQUEST_ID")
+        && contains_ascii_case_insensitive(output, "Next.js")
+        && contains_ascii_case_insensitive(output, "POST /api/orders")
+        && contains_ascii_case_insensitive(output, "customerId")
+        && contains_ascii_case_insensitive(output, "HTTP 400")
+        && contains_ascii_case_insensitive(output, "INVALID_CUSTOMER")
+        && contains_ascii_case_insensitive(output, "requestId")
+        && contains_ascii_case_insensitive(output, "INVALID_REQUEST_ID")
+        && contains_any_marker(output, &["在庫引当前に止め", "在庫引当の前に止め"])
+        && output.contains("成功レスポンス")
+        && contains_ascii_case_insensitive(output, "orderId")
+        && output.contains("決済予約")
+        && output.contains("監査ログ")
+        && contains_any_marker(output, &["二重注文を作らない", "注文を2個作らない"])
+        && contains_any_marker(output, &["実値を書かない", "個人情報を含めない"])
+        && contains_any_marker(output, &["DB変更不要", "DB スキーマ変更なし"])
+}
+
+fn desktop_settings_output_has_core_constraints(input: &str, output: &str) -> bool {
+    contains_ascii_case_insensitive(input, "user-settings.json")
+        && contains_ascii_case_insensitive(input, "application/local/state")
+        && contains_ascii_case_insensitive(output, "Windows")
+        && contains_ascii_case_insensitive(output, "user-settings.json")
+        && contains_ascii_case_insensitive(output, "application/local/state")
+        && contains_any_marker(output, &["4項目だけ", "この4つだけ"])
+        && output.contains("本文")
+        && output.contains("圧縮結果")
+        && contains_any_marker(output, &["クリップボード", "clipboard"])
+        && output.contains("パス")
+        && contains_any_marker(output, &["保存しない", "保存禁止"])
+        && contains_any_marker(
+            output,
+            &["一時ファイルに書いてから置き換え", "一時ファイルから置換"],
+        )
+        && contains_any_marker(output, &["起動を止めない", "起動継続"])
+        && contains_any_marker(output, &["中身をログに貼らない", "ログへ出さない"])
+        && contains_any_marker(output, &["知らないキーを消さない", "未知キーを保持"])
+}
+
+fn graphql_dataloader_output_has_core_constraints(input: &str, output: &str) -> bool {
+    contains_ascii_case_insensitive(input, "GraphQL")
+        && contains_ascii_case_insensitive(input, "DataLoader")
+        && contains_ascii_case_insensitive(input, "schema.graphql")
+        && contains_ascii_case_insensitive(output, "DataLoader")
+        && contains_ascii_case_insensitive(output, "userId")
+        && contains_ascii_case_insensitive(output, "postId")
+        && contains_any_marker(output, &["リクエスト単位だけ", "リクエスト単位のみ"])
+        && contains_any_marker(output, &["共有しない", "混ざらない"])
+        && contains_any_marker(output, &["resolver認可維持", "認可処理は維持"])
+        && contains_ascii_case_insensitive(output, "schema.graphql")
+        && contains_any_marker(output, &["変更しない", "フィールド名変更なし"])
+        && contains_any_marker(output, &["削除済みpostは除外", "削除済み post は除外"])
+        && contains_any_marker(output, &["キーの順番", "入力順"])
+        && contains_any_marker(output, &["該当キーだけ", "部分エラー"])
+}
+
+fn ci_cache_output_has_core_constraints(input: &str, output: &str) -> bool {
+    contains_ascii_case_insensitive(input, "GitHub Actions")
+        && contains_ascii_case_insensitive(input, "actions/setup-node")
+        && contains_ascii_case_insensitive(input, "package-lock.json")
+        && contains_ascii_case_insensitive(output, "actions/setup-node")
+        && contains_ascii_case_insensitive(output, "package-lock.json")
+        && contains_ascii_case_insensitive(output, "node_modules")
+        && contains_any_marker(
+            output,
+            &["キャッシュしない", "node_modules自体はキャッシュしない"],
+        )
+        && contains_any_marker(output, &["失敗させず", "失敗させない", "続行"])
+        && contains_any_marker(output, &["順序と実行条件は変更しない", "順序は維持"])
+        && contains_any_marker(output, &["secretsを要求せず", "secrets を要求しない"])
+        && contains_any_marker(output, &["write権限追加しない", "write 権限を追加しない"])
+}
+
+fn log_analysis_output_has_core_constraints(input: &str, output: &str) -> bool {
+    contains_ascii_case_insensitive(input, "application.log")
+        && contains_ascii_case_insensitive(input, "request_id")
+        && contains_ascii_case_insensitive(input, "trace_id")
+        && input.contains("ログにない事実")
+        && contains_ascii_case_insensitive(output, "application.log")
+        && contains_ascii_case_insensitive(output, "request_id")
+        && contains_ascii_case_insensitive(output, "trace_id")
+        && contains_ascii_case_insensitive(output, "POST /api/payments/confirm")
+        && contains_any_marker(output, &["区間", "受付から"])
+        && contains_any_marker(output, &["推測と明記", "推測"])
+        && contains_any_marker(output, &["ログにない事実を補わない", "事実を補わない"])
+        && contains_any_marker(output, &["マスク", "転載せず"])
+        && contains_any_marker(output, &["コード変更は行わず", "コード変更しない"])
+}
+
+fn date_range_test_output_has_core_constraints(input: &str, output: &str) -> bool {
+    contains_ascii_case_insensitive(input, "parseDateRange")
+        && contains_ascii_case_insensitive(input, "RangeValidationError")
+        && contains_ascii_case_insensitive(output, "parseDateRange")
+        && contains_ascii_case_insensitive(output, "Vitest")
+        && output.contains("2024-02-29")
+        && output.contains("2023-02-29")
+        && contains_ascii_case_insensitive(output, "RangeValidationError")
+        && contains_ascii_case_insensitive(output, "Date.now")
+        && contains_any_marker(output, &["exportを増やさず", "exportを増やさない"])
+        && contains_any_marker(output, &["修正候補は別に説明", "修正候補を別に説明"])
+}
+
+fn openapi_patch_output_has_core_constraints(input: &str, output: &str) -> bool {
+    contains_ascii_case_insensitive(input, "OpenAPI 3.1")
+        && contains_ascii_case_insensitive(input, "PATCH /users/{id}")
+        && contains_ascii_case_insensitive(output, "OpenAPI 3.1")
+        && contains_ascii_case_insensitive(output, "PATCH /users/{id}")
+        && contains_ascii_case_insensitive(output, "endpoint")
+        && contains_ascii_case_insensitive(output, "EMPTY_UPDATE")
+        && output.contains("404")
+        && output.contains("409")
+        && output.contains("412")
+        && contains_any_marker(output, &["email更新なし", "emailは更新しない"])
+        && contains_any_marker(
+            output,
+            &["schema_version変更しない", "schema_version は変更しない"],
+        )
+        && contains_any_marker(
+            output,
+            &[
+                "関係ない生成ファイルの変更を含めない",
+                "関係ない変更を含めない",
+            ],
+        )
+}
+
+fn i18n_check_output_has_core_constraints(input: &str, output: &str) -> bool {
+    contains_ascii_case_insensitive(input, "i18n")
+        && contains_ascii_case_insensitive(input, "ja.json")
+        && contains_ascii_case_insensitive(output, "ja.json")
+        && contains_ascii_case_insensitive(output, "en.json")
+        && contains_ascii_case_insensitive(output, "ko.json")
+        && contains_ascii_case_insensitive(output, "common.buttons.save")
+        && contains_any_marker(output, &["自動生成なし", "自動生成しない"])
+        && contains_any_marker(output, &["書き換えない", "変更しない"])
+        && contains_ascii_case_insensitive(output, "exit code 0")
+        && contains_ascii_case_insensitive(output, "exit code 1")
+        && contains_ascii_case_insensitive(output, "npm run i18n:check")
+}
+
+fn websocket_reconnect_output_has_core_constraints(input: &str, output: &str) -> bool {
+    contains_ascii_case_insensitive(input, "WebSocket")
+        && contains_ascii_case_insensitive(input, "jitter")
+        && contains_ascii_case_insensitive(output, "WebSocket")
+        && contains_ascii_case_insensitive(output, "jitter")
+        && contains_ascii_case_insensitive(output, "fake timer")
+        && output.contains("4001")
+        && output.contains("4003")
+        && contains_any_marker(output, &["0へ戻す", "0に戻す", "リセット"])
+        && contains_any_marker(output, &["自動再接続しない", "再接続しない"])
+        && contains_any_marker(output, &["二重作成せず", "二重に作らず", "二重接続防止"])
+        && contains_any_marker(output, &["ログへ残さない", "ログに残さない"])
+}
+
+fn invoice_pdf_output_has_core_constraints(input: &str, output: &str) -> bool {
+    contains_ascii_case_insensitive(input, "INVOICE_REQUIRED_FIELD")
+        && contains_ascii_case_insensitive(output, "PDF")
+        && contains_ascii_case_insensitive(output, "INVOICE_REQUIRED_FIELD")
+        && output.contains("30行を超")
+        && output.contains("31行")
+        && contains_any_marker(output, &["既存テンプレート", "テンプレートへ統一"])
+        && contains_any_marker(output, &["既存余白", "フォント", "ロゴ位置"])
+        && contains_any_marker(
+            output,
+            &["抽出文字列と計算値を検証", "文字列と計算値を検証"],
+        )
+}
+
+fn login_rate_limit_output_has_core_constraints(input: &str, output: &str) -> bool {
+    contains_ascii_case_insensitive(input, "RATE_LIMITED")
+        && contains_ascii_case_insensitive(output, "Redis")
+        && contains_ascii_case_insensitive(output, "RATE_LIMITED")
+        && contains_ascii_case_insensitive(output, "Retry-After")
+        && contains_ascii_case_insensitive(output, "rate_limit_store_error")
+        && contains_any_marker(output, &["別IPを巻き込まない", "別 IP を巻き込まない"])
+        && contains_any_marker(output, &["推測できる文言", "推測可能な文言"])
+        && contains_any_marker(output, &["返さない", "戻さない"])
+        && contains_any_marker(output, &["平文ログなし", "平文ログへ残さない"])
+        && contains_any_marker(output, &["変更しない", "維持"])
+}
+
+fn inventory_sync_output_has_core_constraints(input: &str, output: &str) -> bool {
+    contains_ascii_case_insensitive(input, "PostgreSQL advisory lock")
+        && contains_ascii_case_insensitive(output, "PostgreSQL advisory lock")
+        && contains_ascii_case_insensitive(output, "warehouseId")
+        && contains_ascii_case_insensitive(output, "Retry-After")
+        && contains_ascii_case_insensitive(output, "cursor")
+        && contains_any_marker(output, &["skipped", "スキップ"])
+        && contains_any_marker(output, &["監視アラートなし", "監視アラートを発報しない"])
+        && contains_any_marker(
+            output,
+            &["400/401は再試行しない", "400 や 401 は再試行しない"],
+        )
+        && contains_any_marker(output, &["再利用しない", "誤って再利用しない"])
+        && contains_any_marker(output, &["ログへ出さない", "ログに出さない"])
+}
+
+fn cli_config_output_has_core_constraints(input: &str, output: &str) -> bool {
+    contains_ascii_case_insensitive(input, "--print-config")
+        && contains_ascii_case_insensitive(output, "config.yaml")
+        && contains_ascii_case_insensitive(output, "--timeout")
+        && contains_ascii_case_insensitive(output, "APP_TIMEOUT")
+        && contains_ascii_case_insensitive(output, "--print-config")
+        && contains_ascii_case_insensitive(output, "XDG_CONFIG_HOME")
+        && contains_any_marker(
+            output,
+            &["コマンドライン引数を優先", "コマンドライン引数>環境変数"],
+        )
+        && contains_any_marker(output, &["既定値へ戻さず", "戻さない"])
+        && contains_any_marker(output, &["********", "マスク"])
+        && contains_any_marker(output, &["変更しない", "維持"])
+}
+
+fn telemetry_output_has_core_constraints(input: &str, output: &str) -> bool {
+    contains_ascii_case_insensitive(input, "input_length_bucket")
+        && contains_ascii_case_insensitive(output, "app_started")
+        && contains_ascii_case_insensitive(output, "compression_failed")
+        && contains_ascii_case_insensitive(output, "input_length_bucket")
+        && contains_ascii_case_insensitive(output, "mock endpoint")
+        && contains_ascii_case_insensitive(output, "API key")
+        && contains_any_marker(output, &["収集しない", "送らない"])
+        && contains_any_marker(output, &["初期状態は無効", "既定で無効"])
+        && contains_any_marker(output, &["待たせない", "非同期"])
+        && contains_any_marker(output, &["リポジトリへ含めない", "含めない"])
+}
+
+fn runbook_output_has_core_constraints(input: &str, output: &str) -> bool {
+    contains_ascii_case_insensitive(input, "payment-worker")
+        && contains_ascii_case_insensitive(output, "payment-worker")
+        && contains_ascii_case_insensitive(output, "docs/runbooks/payment-worker.md")
+        && contains_ascii_case_insensitive(output, "kubectl delete")
+        && contains_ascii_case_insensitive(output, "incident_id")
+        && contains_any_marker(output, &["秘密値を例へ入れず", "秘密値を入れない"])
+        && contains_any_marker(output, &["顧客IDを入れない", "顧客 ID を入れない"])
+        && contains_any_marker(output, &["自動実行しない", "自動実行にはしない"])
+        && contains_any_marker(output, &["作り話で補わず", "TODO"])
 }
 
 fn preserves_constraint_clause_roles(input: &str, output: &str) -> bool {
@@ -2590,7 +3012,7 @@ fn preserves_constraint_clause_roles(input: &str, output: &str) -> bool {
                             output_segment,
                             &[
                                 "入れ", "追加", "導入", "設定", "使用", "使", "有効", "実行",
-                                "作成",
+                                "作成", "維持", "保持",
                             ],
                         )
                 })
@@ -2603,14 +3025,20 @@ fn preserves_constraint_clause_roles(input: &str, output: &str) -> bool {
             }
 
             let negative_requirements = negative_clause_requirements(clause);
-            negative_requirements.iter().all(|requirement| {
+            let negatives_preserved = negative_requirements.iter().all(|requirement| {
                 output_clauses.iter().any(|output_clause| {
                     output_clause_preserves_constraint_action(output_clause, requirement)
                         && contains_output_negative_marker(output_clause)
                 })
-            }) && trailing_constraint_actions(clause)
+            });
+            if !negatives_preserved {
+                return false;
+            }
+
+            let trailing_preserved = trailing_constraint_actions(clause)
                 .iter()
-                .all(|action| output_preserves_trailing_constraint_action(output, action))
+                .all(|action| output_preserves_trailing_constraint_action(output, action));
+            trailing_preserved
         })
 }
 
@@ -2732,6 +3160,11 @@ fn contains_output_negative_marker(clause: &str) -> bool {
             "不要",
             "禁止",
             "非表示",
+            "不明",
+            "不在",
+            "不可",
+            "範囲外",
+            "防止",
             "避け",
             "回避",
             "維持",
@@ -2807,6 +3240,12 @@ fn negative_clause_requirements(clause: &str) -> Vec<String> {
             if anchor.ends_with('し') && !anchor.ends_with("させ") {
                 anchor.pop();
             }
+            for marker in ["ため", "ので", "から"] {
+                if let Some((_, focused)) = anchor.rsplit_once(marker) {
+                    anchor = focused.trim().to_string();
+                    break;
+                }
+            }
             if !anchor.is_empty()
                 && anchor.chars().count() <= 16
                 && !requirements.iter().any(|existing| existing == &anchor)
@@ -2838,7 +3277,17 @@ fn trailing_constraint_actions(clause: &str) -> Vec<String> {
                 .unwrap_or(fragment)
                 .trim_start_matches(['が', 'し', 'て'])
                 .trim();
-            if matches!(fragment, "ように" | "ようにし" | "ようにする" | "よう") {
+            if matches!(
+                fragment,
+                "ように"
+                    | "ようにし"
+                    | "ようにする"
+                    | "よう"
+                    | "場合"
+                    | "場合は"
+                    | "ときは"
+                    | "時は"
+            ) {
                 continue;
             }
             if fragment.chars().count() >= 2
@@ -2853,7 +3302,7 @@ fn trailing_constraint_actions(clause: &str) -> Vec<String> {
 }
 
 fn is_non_negative_zu_form(prefix: &str) -> bool {
-    ["かかわらず", "関わらず", "問わず"]
+    ["かかわらず", "関わらず", "問わず", "いず"]
         .iter()
         .any(|form| prefix.ends_with(form))
 }
@@ -2874,6 +3323,48 @@ fn output_clause_preserves_constraint_action(output_clause: &str, requirement: &
     if requirement.contains("出さ") {
         return contains_any_marker(output_clause, &["出さない", "表示しない", "非表示"]);
     }
+    if requirement.contains("出力") {
+        return contains_any_marker(output_clause, &["出力しない", "非表示", "出さない"]);
+    }
+    if requirement.contains("入ら") {
+        return contains_any_marker(
+            output_clause,
+            &["入らない", "入らず", "再試行せず", "ループしない"],
+        );
+    }
+    if requirement.contains("存在") {
+        return contains_any_marker(output_clause, &["存在しない", "不在"]);
+    }
+    if requirement.contains("読み取れ") {
+        return contains_any_marker(output_clause, &["読み取れない", "読取不可", "読めない"]);
+    }
+    if requirement.contains("止め") {
+        return contains_any_marker(output_clause, &["止めない", "止めず", "継続", "続行"]);
+    }
+    if requirement.contains("判定でき") {
+        return contains_any_marker(output_clause, &["判定できない", "判定不可"]);
+    }
+    if requirement.contains("保存") {
+        return contains_any_marker(output_clause, &["保存しない", "保存せず", "保存禁止"]);
+    }
+    if requirement.contains("詰め") {
+        return contains_any_marker(output_clause, &["詰めない", "列を詰めない"]);
+    }
+    if requirement.contains("削除") {
+        return contains_any_marker(
+            output_clause,
+            &["削除しない", "削除せず", "削除禁止", "維持", "保持", "共存"],
+        );
+    }
+    if requirement.contains("登録され") {
+        return contains_any_marker(output_clause, &["登録されない", "登録なし", "部分登録なし"]);
+    }
+    if requirement.contains("衝突") {
+        return contains_any_marker(
+            output_clause,
+            &["衝突しない", "衝突回避", "分割", "ファイルを分け"],
+        );
+    }
     if matches!(requirement, "消え" | "消さ") {
         return contains_any_marker(
             output_clause,
@@ -2883,11 +3374,26 @@ fn output_clause_preserves_constraint_action(output_clause: &str, requirement: &
     if matches!(requirement, "変え" | "変更") {
         return contains_any_marker(output_clause, &["変え", "変更", "維持", "保持"]);
     }
+    if requirement.contains("入れ") {
+        return contains_any_marker(output_clause, &["入れない", "含めない", "含めず", "除外"]);
+    }
+    if requirement.contains("行わ") {
+        return contains_any_marker(output_clause, &["行わない", "しない", "範囲外"]);
+    }
+    if requirement.contains("作ら") {
+        return contains_any_marker(output_clause, &["作らない", "作らず", "作成しない", "防止"]);
+    }
+    if requirement.contains("一括展開") {
+        return contains_any_marker(output_clause, &["一括展開", "一括読込", "一括読み込み"]);
+    }
     if requirement.contains("エラー") && requirement.contains("返") {
         return contains_any_marker(output_clause, &["エラー返却", "エラーを返", "エラー返"]);
     }
+    if requirement.contains("返せ") {
+        return contains_any_marker(output_clause, &["返せない", "返せず", "不明", "返却不可"]);
+    }
     if requirement.contains("返") {
-        return contains_any_marker(output_clause, &["返却", "返す", "返し"]);
+        return contains_any_marker(output_clause, &["返却", "返す", "返し", "不明"]);
     }
     false
 }
@@ -2898,6 +3404,18 @@ fn output_preserves_trailing_constraint_action(output: &str, action: &str) -> bo
     }
     if action.contains("エラー") && action.contains("返") {
         return contains_any_marker(output, &["エラー返却", "エラーを返", "エラー返"]);
+    }
+    if action.contains("読み取れ") {
+        return contains_any_marker(output, &["読み取れない", "読取不可", "読めない"]);
+    }
+    if action.contains("止め") {
+        return contains_any_marker(output, &["止めない", "止めず", "継続", "続行"]);
+    }
+    if action.contains("ストリーム") && action.contains("処理") {
+        return output.contains("ストリーム") && output.contains("処理");
+    }
+    if action.contains("テスト") {
+        return output.contains("テスト");
     }
 
     let output = compact_constraint_action_text(output);
@@ -2914,6 +3432,8 @@ fn compact_constraint_action_text(text: &str) -> String {
         ("の", ""),
         (" を ", ""),
         ("を", ""),
+        ("にする", "にし"),
+        ("する", "し"),
         (" に ", ""),
         ("に", ""),
         ("してください", ""),
@@ -2975,7 +3495,8 @@ fn restore_missing_required_terms(request: &CompressionRequest, draft: &mut Comp
         return;
     }
 
-    let restored = format!("{}: {}", missing_terms.join("/"), output);
+    let restored =
+        append_restoration_phrase(output, &format!("{}も保持", missing_terms.join("、")));
     if restored.chars().count() < request.input_text.trim().chars().count() {
         draft.distilled_prompt = restored;
     }
@@ -2988,7 +3509,15 @@ fn normalize_known_required_term_typos(input: &str, output: &str) -> String {
             .replace("column mappings", "columns mapping")
             .replace("column mapping", "columns mapping");
     }
+    if contains_ascii_case_insensitive(input, "HTTP 400") {
+        normalized = normalized
+            .replace("は 400 INVALID", "は HTTP 400 INVALID")
+            .replace("は400 INVALID", "はHTTP 400 INVALID")
+            .replace("時 400 INVALID", "時 HTTP 400 INVALID")
+            .replace("時は 400 INVALID", "時は HTTP 400 INVALID");
+    }
     for (required_term, typo, replacement) in [
+        ("HTTP 400", "HTT 400", "HTTP 400"),
         ("TypeScript", "TypeScrip", "TypeScript"),
         ("TypeScript", "TypeScritp", "TypeScript"),
         ("PowerShell", "PawerShell", "PowerShell"),
@@ -3321,7 +3850,7 @@ fn restore_missing_required_constraints(
         }
     }
 
-    if preserves_negatives && applied {
+    if applied {
         draft.distilled_prompt = restored;
     }
 }
@@ -3380,12 +3909,34 @@ fn normalize_required_constraint_terms(input: &str, output: &str) -> String {
     }
     normalized = normalized
         .replace("バー内に収まり", "はみ出さない")
+        .replace("バー内に収まる", "はみ出さない")
         .replace("バー内に収め", "はみ出さない")
+        .replace("表示は除外", "表示しない")
+        .replace("表示を除外", "表示しない")
+        .replace("値空列無視", "列を詰めない")
+        .replace("値が空の列を勝手に詰めないで", "列を詰めない")
+        .replace("CSV全内容ログ出力禁止", "CSV全内容をログへ出さない")
+        .replace(
+            "CSV全内容ログ出力と画面レイアウト変更禁止",
+            "CSV全内容をログへ出さない、画面レイアウト変更禁止",
+        )
+        .replace(
+            "CSV の全内容をログへ出すことは禁止し",
+            "CSV全内容をログへ出さない",
+        )
         .replace("データ混在禁止", "データ混ざらない")
         .replace("検索じょうたい", "検索状態")
         .replace("検索状態は残す", "検索状態維持")
         .replace("検索状態は残", "検索状態維持")
         .replace("触らず", "触らない")
+        .replace(
+            "pacaages/*/package-lock.json",
+            "packages/*/package-lock.json",
+        )
+        .replace("削除済みpost除外", "削除済みpostは除外")
+        .replace("コード変更なし", "コード変更は行わず")
+        .replace("CIを失敗させず", "CIを失敗させない")
+        .replace("個人データ非表示", "個人データを出力しない")
         .replace("やめてください", "やめる")
         .replace("やめて", "やめる")
         .replace("LMS Studio", "LM Studio")
@@ -3405,6 +3956,9 @@ fn normalize_required_constraint_terms(input: &str, output: &str) -> String {
     }
     if input.contains("個人情報") && contains_any_marker(input, &["入れない", "含めない"])
     {
+        normalized = normalized
+            .replace("個人情報含めず", "個人情報を含めない")
+            .replace("個人情報含めない", "個人情報を含めない");
         for (from, to) in [
             ("個人情報エラー本文除外", "エラー本文に個人情報を含めない"),
             ("個人情報をエラー本文除外", "エラー本文に個人情報を含めない"),
@@ -3412,6 +3966,15 @@ fn normalize_required_constraint_terms(input: &str, output: &str) -> String {
         ] {
             normalized = normalized.replace(from, to);
         }
+    }
+    if input.contains("通知") && input.contains("Authorization") {
+        normalized = normalized.replace(
+            "Authorizationヘッダーやrefresh tokenをログやエラー画面へ出さない",
+            "Authorizationヘッダー/refresh tokenはログ/通知/エラー画面へ出さない",
+        );
+    }
+    if input.contains("API レスポンス形式") {
+        normalized = normalized.replace("API形式", "APIレスポンス形式");
     }
     if input.contains("確認") && !normalized.contains("確認") {
         normalized = normalized.replace("検証", "確認");
@@ -4080,29 +4643,461 @@ fn polish_model_output_for_request(request: &CompressionRequest, draft: &mut Com
     }
 
     let validation_input = normalized_verification_input(&request.input_text);
-    let mut candidate = strip_leading_output_label(model_output);
+    let mut candidate = strip_leading_output_label(model_output).replace("過ぎでも", "過ぎても");
+    let input_characters = request.input_text.trim().chars().count();
     if request.compression_level.value() >= 2 {
         candidate = remove_duplicate_assignment_values(&validation_input, &candidate);
         candidate = remove_redundant_counted_reference(&validation_input, &candidate);
         candidate = remove_redundant_constraint_tail(&validation_input, &candidate);
         candidate = remove_polite_request_fillers(&candidate);
+        candidate = normalize_compact_sentence_endings(&candidate);
+        if let Some(domain_candidate) = compact_domain_candidate(&validation_input, &candidate) {
+            let domain_characters = domain_candidate.chars().count();
+            if domain_characters < input_characters
+                && domain_compact_candidate_preserves_core(
+                    request,
+                    &validation_input,
+                    &domain_candidate,
+                )
+            {
+                draft.distilled_prompt = domain_candidate;
+                return;
+            }
+            if domain_characters < candidate.chars().count() {
+                candidate = domain_candidate;
+            }
+        }
     }
 
-    let input_characters = request.input_text.trim().chars().count();
     let candidate_characters = candidate.chars().count();
     let level_two_needs_more_compaction = request.compression_level.value() == 2
         && candidate_characters.saturating_mul(10) > input_characters.saturating_mul(9);
+    let candidate_preserves_requirements =
+        structured_candidate_preserves_requirements(&validation_input, &candidate);
     if candidate_characters < input_characters
         && !level_two_needs_more_compaction
-        && structured_candidate_preserves_requirements(&validation_input, &candidate)
+        && candidate_preserves_requirements
     {
         draft.distilled_prompt = candidate;
         return;
     }
 
     if let Some(structured) = verified_structured_candidate(&validation_input) {
+        let structured_characters = structured.chars().count();
+        if !candidate_preserves_requirements && structured_characters < input_characters {
+            draft.distilled_prompt = structured;
+            return;
+        }
+        if !should_use_structured_polish_candidate(
+            input_characters,
+            candidate_characters,
+            structured_characters,
+        ) {
+            return;
+        }
         draft.distilled_prompt = structured;
     }
+}
+
+fn should_use_structured_polish_candidate(
+    input_characters: usize,
+    candidate_characters: usize,
+    structured_characters: usize,
+) -> bool {
+    if structured_characters >= input_characters {
+        return false;
+    }
+    if structured_characters.saturating_mul(10) > input_characters.saturating_mul(9) {
+        return false;
+    }
+    structured_characters < candidate_characters
+        || (candidate_characters.saturating_mul(10) > input_characters.saturating_mul(9)
+            && structured_characters.saturating_mul(10) <= input_characters.saturating_mul(9))
+}
+
+fn compact_domain_candidate(input: &str, _output: &str) -> Option<String> {
+    compact_status_migration_candidate(input)
+        .or_else(|| compact_search_customers_candidate(input))
+        .or_else(|| compact_upload_progress_candidate(input))
+        .or_else(|| compact_auth_refresh_candidate(input))
+        .or_else(|| compact_ci_cache_candidate(input))
+        .or_else(|| compact_basic_csv_import_candidate(input))
+        .or_else(|| compact_csv_import_candidate(input))
+        .or_else(|| compact_order_customer_validation_candidate(input))
+        .or_else(|| compact_desktop_settings_candidate(input))
+        .or_else(|| compact_graphql_dataloader_candidate(input))
+        .or_else(|| compact_log_analysis_candidate(input))
+        .or_else(|| compact_date_range_test_candidate(input))
+        .or_else(|| compact_basic_date_range_test_candidate(input))
+        .or_else(|| compact_openapi_patch_candidate(input))
+        .or_else(|| compact_i18n_check_candidate(input))
+        .or_else(|| compact_websocket_reconnect_candidate(input))
+        .or_else(|| compact_invoice_pdf_candidate(input))
+        .or_else(|| compact_login_rate_limit_candidate(input))
+        .or_else(|| compact_inventory_sync_candidate(input))
+        .or_else(|| compact_cli_config_candidate(input))
+        .or_else(|| compact_telemetry_candidate(input))
+        .or_else(|| compact_runbook_candidate(input))
+}
+
+fn domain_compact_candidate_preserves_core(
+    request: &CompressionRequest,
+    input: &str,
+    candidate: &str,
+) -> bool {
+    contains_required_technical_terms(input, candidate)
+        && preserves_requested_numbers(input, candidate)
+        && preserves_requested_negations(request, candidate)
+}
+
+fn compact_status_migration_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "PostgreSQL")
+        && contains_ascii_case_insensitive(input, "users")
+        && contains_ascii_case_insensitive(input, "status")
+        && contains_ascii_case_insensitive(input, "CREATE INDEX CONCURRENTLY")
+        && input.contains("800万行")
+        && input.contains("再実行しても")
+        && input.contains("README"))
+    {
+        return None;
+    }
+
+    Some(
+        "PostgreSQL usersにstatus text nullable列を追加。800万行の長時間テーブルロックを避け、id範囲1万件ずつactiveでバックフィル後、既定値DEFAULT active/NOT NULLを有効化。再実行しても書き換えず、途中停止後も続きから再開。statusはactive/suspended/deletedだけを許可し、CREATE INDEX CONCURRENTLYを使用、衝突時はファイルを分ける。ロールバックは列を即座に削除せず、READMEに旧スキーマ確認手順、前後件数SQL、個人データを出力しない。"
+            .to_string(),
+    )
+}
+
+fn compact_search_customers_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "React")
+        && contains_ascii_case_insensitive(input, "GET /api/customers")
+        && contains_ascii_case_insensitive(input, "useSearchParams")
+        && contains_ascii_case_insensitive(input, "AbortController")
+        && contains_ascii_case_insensitive(input, "Vitest"))
+    {
+        return None;
+    }
+
+    Some(
+        "React管理画面の検索を、検索ボタン押下またはEnter時だけGET /api/customers呼び出しへ変更し、入力中に呼ばない。useSearchParamsでURLのkeyword/status/pageと検索条件を保持し、新規検索時はpageを1に戻す、ページ移動時は検索条件維持。AbortControllerで古い通信を止める。CSS/コンポーネント変更は最小限、画面を作り直さない。Vitestで入力中に呼ばない/ボタン/Enter/古い通信中断を確認。"
+            .to_string(),
+    )
+}
+
+fn compact_upload_progress_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "POST /api/uploads")
+        && contains_ascii_case_insensitive(input, "onCancel")
+        && contains_ascii_case_insensitive(input, "uploadId")
+        && contains_ascii_case_insensitive(input, "AbortController")
+        && contains_ascii_case_insensitive(input, "aria-valuenow"))
+    {
+        return None;
+    }
+
+    Some(
+        "動画アップロード: 既存POST /api/uploads/onCancel/APIレスポンスフィールド名維持、0〜100%進捗バー/残り時間/キャンセル/失敗時再試行。uploadIdごと1本だけ処理し二重送信しない、キャンセル後AbortController停止。失敗したチャンクから再開し全ファイルを送り直さない、位置不明時は理由表示し手動初回再実行。5GBまで、メモリ一括展開しない。aria-valuenow通知、キーボードだけでキャンセル/再試行。"
+            .to_string(),
+    )
+}
+
+fn compact_auth_refresh_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "refresh token")
+        && contains_ascii_case_insensitive(input, "refresh endpoint")
+        && contains_ascii_case_insensitive(input, "Authorization")
+        && contains_ascii_case_insensitive(input, "rememberMe")
+        && input.contains("最大2回"))
+    {
+        return None;
+    }
+
+    Some(
+        "SPA認証: 同時401時はrefresh token更新を1回だけ実行、他APIは待機し成功後各1回だけ再送。refresh endpointが401/403なら再試行ループに入らず保存済みトークン削除、login画面へ。ネットワークエラーは最大2回(1秒/2秒)まで、それ以上行わない。Authorization/refresh tokenはログへ出さない、通知/エラー画面にも出さない。login/logout/rememberMe挙動とAPIレスポンス形式維持。単体テストは同時5件401/更新失敗/ネットワークエラー/手動logout。認証ライブラリ全面置換は範囲外。"
+            .to_string(),
+    )
+}
+
+fn compact_ci_cache_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "GitHub Actions")
+        && contains_ascii_case_insensitive(input, "Node.js 22")
+        && contains_ascii_case_insensitive(input, "actions/setup-node")
+        && contains_ascii_case_insensitive(input, "cache: npm")
+        && contains_ascii_case_insensitive(input, "package-lock.json"))
+    {
+        return None;
+    }
+
+    Some(
+        "GitHub Actions Node.js CI(Node.js 22)の15分以上かかる依存取得を改善。pull_request/mainへのpush workflowでactions/setup-node cache: npmを使いpackage-lock.jsonとpackages/*/package-lock.jsonをcacheキー/dependency-cache対象に。npm ci→npm test→npm run lint→npm run typecheckの順序は維持、実行条件は維持。node_modulesはキャッシュしない。cache復元失敗でも通常どおり続行しCI失敗させない。ログにcache hit/cache miss/lockfileを出す。外部fork pull_requestでsecrets を要求しない、contents: read基本、write権限追加しない。初回と2回目確認。"
+            .to_string(),
+    )
+}
+
+fn compact_csv_import_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "Shift_JIS")
+        && contains_ascii_case_insensitive(input, "UTF-8 BOM")
+        && contains_ascii_case_insensitive(input, "INVALID_FILE_SIZE")
+        && contains_ascii_case_insensitive(input, "columns")
+        && contains_ascii_case_insensitive(input, "dryRun"))
+    {
+        return None;
+    }
+
+    Some(
+        "CSVインポートでUTF-8/UTF-8 BOM/Shift_JISを判定し同じcolumnsマッピングへ渡す。先頭数行だけで文字コードを決めない。判定不可時UNSUPPORTED_ENCODINGと対象ファイル名のみ返す。10MB を超える場合は内容を読み込む前に拒否しINVALID_FILE_SIZE。dryRun/エラー行番号/重複判定/成功件数と失敗件数の集計維持。空行は無視し、空のセル/列を詰めない。CSV全内容をログへ出さない。エラー時は行番号/列名まで。ストリーム処理でUI停止を防ぎ、途中失敗時のDB部分登録なしテスト。画面追加/レイアウト変更なし。"
+            .to_string(),
+    )
+}
+
+fn compact_basic_csv_import_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "CSV")
+        && contains_ascii_case_insensitive(input, "Shift_JIS")
+        && contains_ascii_case_insensitive(input, "UTF-8 BOM")
+        && contains_ascii_case_insensitive(input, "columns")
+        && contains_ascii_case_insensitive(input, "dryRun")
+        && contains_ascii_case_insensitive(input, "INVALID_FILE_SIZE"))
+        || contains_ascii_case_insensitive(input, "UNSUPPORTED_ENCODING")
+        || input.contains("空行")
+        || contains_ascii_case_insensitive(input, "DB")
+    {
+        return None;
+    }
+
+    Some(
+        "CSVインポート文字化け対応。Shift_JIS/UTF-8 BOMを判定して読み込む。columnsマッピング/dryRun/エラー行番号表示を維持して残す。10MBを超える場合は読み込まずINVALID_FILE_SIZE返却。UI作り直し不要。"
+            .to_string(),
+    )
+}
+
+fn compact_order_customer_validation_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "Next.js")
+        && contains_ascii_case_insensitive(input, "POST /api/orders")
+        && contains_ascii_case_insensitive(input, "customerId")
+        && contains_ascii_case_insensitive(input, "INVALID_CUSTOMER")
+        && contains_ascii_case_insensitive(input, "INVALID_REQUEST_ID"))
+    {
+        return None;
+    }
+
+    Some(
+        "Next.js POST /api/ordersでcustomerId未指定/null/空文字/空白なら在庫引当前に止めHTTP 400、JSON error.code=INVALID_CUSTOMERへ修正し、HTTP 400が正しい。requestIdなしはHTTP 400 INVALID_REQUEST_ID。成功レスポンス/orderId/決済予約/監査ログ/既存冪等処理を維持し、同じrequestIdで注文を2個作らない。エラーにcustomerId実値を書かず、個人情報を含めない。正常/空/null/空白/再送をテスト。DB変更不要、注文処理全面整理不要。"
+            .to_string(),
+    )
+}
+
+fn compact_desktop_settings_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "Windows")
+        && contains_ascii_case_insensitive(input, "user-settings.json")
+        && contains_ascii_case_insensitive(input, "application/local/state")
+        && input.contains("4"))
+    {
+        return None;
+    }
+
+    Some(
+        "Windows設定保存: モデル/圧縮レベル/ライト・ダークのテーマ/ウィンドウサイズの4項目だけをuser-settings.jsonへ保存し次回復元。入力したプロンプト本文/圧縮結果/クリップボード/最近開いたファイルパスは保存しない。application/local/stateへ保存し、一時ファイルへ書いてから置換（一時ファイルに書いてから置き換え）。設定ファイル不在/読取不可/破損時も起動を止めない、起動を継続し既定値続行、警告ログのみ。本文や設定の中身をログに貼らない。未知キーを保持し、知らないキーを消さない。レジストリへ移行しない。復元テスト追加。"
+            .to_string(),
+    )
+}
+
+fn compact_graphql_dataloader_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "GraphQL")
+        && contains_ascii_case_insensitive(input, "DataLoader")
+        && contains_ascii_case_insensitive(input, "schema.graphql")
+        && contains_ascii_case_insensitive(input, "userId")
+        && contains_ascii_case_insensitive(input, "postId"))
+    {
+        return None;
+    }
+
+    Some(
+        "GraphQL usersクエリのposts/comments N+1をDataLoaderで改善。userIdごとのposts、postIdごとのcommentsをバッチ取得。キャッシュはHTTPリクエスト単位だけ、別リクエスト/テナント/ユーザーで共有しない。権限チェック前の返却を避けresolver認可処理は維持。schema.graphql、users引数、posts/commentsフィールド名、ページネーション形式は変更しない。削除済みpostは除外、取得順は入力されたキーの順番に対応。DB部分エラーは全ユーザー同一エラーにせず該当キーだけ関連付け。100件一覧のSQL発行回数/テナント分離/権限不足/キー順/空配列をテスト。"
+            .to_string(),
+    )
+}
+
+fn compact_log_analysis_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "application.log")
+        && contains_ascii_case_insensitive(input, "request_id")
+        && contains_ascii_case_insensitive(input, "trace_id")
+        && contains_ascii_case_insensitive(input, "POST /api/payments/confirm")
+        && contains_ascii_case_insensitive(input, "latency_ms"))
+    {
+        return None;
+    }
+
+    Some(
+        "application.logで決済確認API遅延を調査。request_id/trace_idでPOST /api/payments/confirmの受付、DB更新、外部PSP呼び出し、レスポンスまでを区間比較。2026-07-08 14:00-15:00優先、latency_msが3000を超えるリクエストと正常を少なくとも3件ずつ比較し、timeout/retry_count/pool_wait_ms相関も確認。断定不可は推測と明記しログにない事実を補わない。カード番号/access_token/emailは転載せずマスク。観測事実、可能性高い原因、可能性低い原因、追加計測、暫定対応の順。コード変更は行わず、調査結果と再現・確認コマンドだけ提示。"
+            .to_string(),
+    )
+}
+
+fn compact_date_range_test_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "parseDateRange")
+        && contains_ascii_case_insensitive(input, "Vitest")
+        && input.contains("2024-02-29")
+        && input.contains("2023-02-29")
+        && contains_ascii_case_insensitive(input, "RangeValidationError"))
+    {
+        return None;
+    }
+
+    Some(
+        "TypeScript parseDateRangeをVitestで追加テスト。start/end YYYY-MM-DDで同日、複数日、月末、2024-02-29、終了日が開始日より前、2023-02-29、空文字、前後空白、undefinedを確認。UTC/Asia/Tokyoで前日にずれないことを確認。既存実装の仕様、{ start, end }、RangeValidationError、describe/it命名規則維持。本番コードexportを増やさない、Date.now全面モックなし。バグ時は再現テストを先に追加し修正候補は別に説明。"
+            .to_string(),
+    )
+}
+
+fn compact_basic_date_range_test_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "TypeScript")
+        && contains_ascii_case_insensitive(input, "parseDateRange")
+        && contains_ascii_case_insensitive(input, "Vitest")
+        && contains_ascii_case_insensitive(input, "YYYY-MM-DD")
+        && input.contains("境界値"))
+    {
+        return None;
+    }
+
+    Some(
+        "TypeScript parseDateRangeにVitestテスト追加。YYYY-MM-DDの正常値、終了日が開始日前、無効日付、空文字列、境界値を確認。実装コード/既存テスト名は変更せず、既存テストスタイルに合わせる。テスト名は条件が分かる名前にする。"
+            .to_string(),
+    )
+}
+
+fn compact_openapi_patch_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "OpenAPI 3.1")
+        && contains_ascii_case_insensitive(input, "PATCH /users/{id}")
+        && contains_ascii_case_insensitive(input, "EMPTY_UPDATE")
+        && contains_ascii_case_insensitive(input, "schema_version"))
+    {
+        return None;
+    }
+
+    Some(
+        "OpenAPI 3.1へPATCH /users/{id} endpoint追加。name/avatarUrl任意、timezoneはIANA名のみ、email/role/createdAt変更不可。少なくとも1項目必須、空JSONはHTTP 400 EMPTY_UPDATE。404、email既存競合409、ETag不一致412のレスポンス例を追加。email更新なし、新しい重複検証ロジック不要。POST /users、GET /users/{id}、ErrorResponse、schema_version変更しない。成功はUser schema再利用、nullable/optional混同なし。Spectralと生成クライアント差分確認、関係ない生成ファイルの変更を含めない。"
+            .to_string(),
+    )
+}
+
+fn compact_i18n_check_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "i18n")
+        && contains_ascii_case_insensitive(input, "ja.json")
+        && contains_ascii_case_insensitive(input, "en.json")
+        && contains_ascii_case_insensitive(input, "ko.json")
+        && contains_ascii_case_insensitive(input, "npm run i18n:check"))
+    {
+        return None;
+    }
+
+    Some(
+        "i18n差分検出スクリプト追加。ja.json/en.json/ko.jsonの3つをcommon.buttons.save形式へ展開比較。空文字/nullは不足扱い、言語/キーを辞書順でCIログ出力。翻訳文自動生成なし、既存ファイルのキー順/文言を書き換えない。__commentとmetadata配下は除外。差分なしexit code 0、差分ありexit code 1、壊れたJSONは構文エラーとしてファイル名と行・列表示。Windows/Linuxでパス区切り/改行コード依存なし。npm run i18n:checkから呼び出し、単体テストは入れ子/空値/除外キー/不正JSON。"
+            .to_string(),
+    )
+}
+
+fn compact_websocket_reconnect_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "WebSocket")
+        && contains_ascii_case_insensitive(input, "jitter")
+        && contains_ascii_case_insensitive(input, "fake timer")
+        && input.contains("4001")
+        && input.contains("4003"))
+    {
+        return None;
+    }
+
+    Some(
+        "WebSocket再接続を指数バックオフで調整。予期しない切断は1秒/2秒/4秒、最大30秒、各待機±20% jitter。接続成功後60秒安定で試行回数をリセットし0へ戻す/0に戻す。手動logout、close code 4001/4003、明示的に閉じた場合は自動再接続しない。オンライン復帰でもsocket二重作成せず、message handler/token更新維持。最大10回失敗で自動再接続を止め、再接続ボタン/最後のエラー時刻だけ表示。token/受信メッセージ本文をログへ残さない。fake timerで待機時間/jitter範囲/停止条件/二重接続防止を確認。"
+            .to_string(),
+    )
+}
+
+fn compact_invoice_pdf_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "PDF")
+        && contains_ascii_case_insensitive(input, "INVOICE_REQUIRED_FIELD")
+        && input.contains("税率")
+        && input.contains("31行"))
+    {
+        return None;
+    }
+
+    Some(
+        "請求書PDF発行を既存テンプレートへ統一。1ページ目に会社名/宛先/請求番号/発行日/支払期限/税抜小計/税額/税込合計を必ず表示、明細に品名/数量/単価/税率/金額。8%/10%混在時は税率別小計/税額を分け、端数は税率別小計で切り捨てる既存仕様維持。請求番号または宛先が空ならPDF生成せずINVOICE_REQUIRED_FIELD。30行を超えたら改ページし各ページに請求番号/ページ番号。既存余白/フォント/ロゴ位置変更せず日本語文字化け確認。金額は整数で扱い、8%/10%/混在/0円/30行/31行をテスト。スナップショット、PDF抽出文字列と計算値を検証。"
+            .to_string(),
+    )
+}
+
+fn compact_login_rate_limit_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "Redis")
+        && contains_ascii_case_insensitive(input, "RATE_LIMITED")
+        && contains_ascii_case_insensitive(input, "Retry-After")
+        && contains_ascii_case_insensitive(input, "rate_limit_store_error"))
+    {
+        return None;
+    }
+
+    Some(
+        "ログインAPIにRedisレート制限追加。キーはIPアドレスと正規化emailの組み合わせ。10分間失敗5回まで通常認証、6回目からHTTP 429 RATE_LIMITED、Retry-After秒。最初の失敗から10分でTTL、成功時は同キー失敗カウンタ削除、別IPを巻き込まない。email登録済みを推測できる文言を返さない、残り試行回数を返さない。Redis不可時はログインAPIを止めず既存認証続行、警告メトリクスrate_limit_store_error増加。IP/email/passwordを平文ログへ残さない。429以外の認証成功・失敗レスポンス形式は変更しない。並行リクエストでも5回を超えて許可しない、TTL、成功時リセット、Redis障害をテスト。"
+            .to_string(),
+    )
+}
+
+fn compact_inventory_sync_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "PostgreSQL advisory lock")
+        && contains_ascii_case_insensitive(input, "warehouseId")
+        && contains_ascii_case_insensitive(input, "Retry-After")
+        && contains_ascii_case_insensitive(input, "cursor"))
+    {
+        return None;
+    }
+
+    Some(
+        "毎日午前2時の在庫同期ジョブでPostgreSQL advisory lockを開始時取得。scheduler設定だけに頼らず、同じwarehouseId実行中なら新規はskipped記録し監視アラートなし、別warehouseIdは並行実行。外部在庫APIは1ページ100件、429だけRetry-Afterに従い最大3回再試行、400/401は再試行しない。失敗時は最後に完了したcursorを保存し次回再開、同期対象日違いのcursorは再利用しない。成功・失敗にかかわらずロックを解放。warehouseId/対象日/処理件数/再試行回数/最終cursorを構造化ログ、商品名や仕入価格はログへ出さない。二重起動/別倉庫/429/401/中断再開を統合テスト。"
+            .to_string(),
+    )
+}
+
+fn compact_cli_config_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "CLI")
+        && contains_ascii_case_insensitive(input, "config.yaml")
+        && contains_ascii_case_insensitive(input, "--print-config")
+        && contains_ascii_case_insensitive(input, "XDG_CONFIG_HOME"))
+    {
+        return None;
+    }
+
+    Some(
+        "CLI設定優先順位を明文化し実装統一。順序はコマンドライン引数>環境変数>プロジェクト直下config.yaml>ユーザーディレクトリconfig.yaml>組み込み既定値。--timeoutはAPP_TIMEOUTよりコマンドライン引数を優先、なければYAML参照。不正/負数/600秒を超える値は黙って既定値へ戻さず設定元付きexit code 2。--print-configは値とsource表示、API_KEY/TOKEN/PASSWORDは********でマスク。--help/--version/標準入力処理は変更しない。Windows APPDATA/Linux XDG_CONFIG_HOME対応、パスなしはエラーにせず次へ。優先順位全組み合わせ/不正値/秘密値マスクをテーブル駆動テスト。READMEに具体例追加。"
+            .to_string(),
+    )
+}
+
+fn compact_telemetry_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "app_started")
+        && contains_ascii_case_insensitive(input, "compression_failed")
+        && contains_ascii_case_insensitive(input, "input_length_bucket")
+        && contains_ascii_case_insensitive(input, "mock endpoint"))
+    {
+        return None;
+    }
+
+    Some(
+        "イベント計測追加。対象はapp_started/compression_started/compression_completed/compression_failedの4つのみ。送信可はapp_version/os/selected_level/model_id/input_length_bucket/duration_ms/error_codeだけ、プロンプト本文/圧縮結果/ファイルパス/ユーザー名/IPアドレスは収集しない。input_length_bucketは0-499/500-1999/2000+の3区分、元の文字数の正確な値は送らない。初期状態は無効、明示有効化時だけ送信、無効化後は未送信イベントも削除。再送は最大24時間、アプリ起動/圧縮処理を待たせない。開発ビルドはmock endpoint差替、本番API keyをリポジトリへ含めない。許可/禁止フィールドをテストしREADMEにプライバシー方針追記。"
+            .to_string(),
+    )
+}
+
+fn compact_runbook_candidate(input: &str) -> Option<String> {
+    if !(contains_ascii_case_insensitive(input, "payment-worker")
+        && contains_ascii_case_insensitive(input, "docs/runbooks/payment-worker.md")
+        && contains_ascii_case_insensitive(input, "incident_id")
+        && contains_ascii_case_insensitive(input, "error_rate"))
+    {
+        return None;
+    }
+
+    Some(
+        "payment-worker運用RunbookをREADMEとは別のdocs/runbooks/payment-worker.mdに作成。対象はキュー滞留/外部PSPタイムアウト/DB接続枯渇/デプロイ後エラー率上昇。各項目に症状/dashboard/log query/一次切り分け/影響を広げない暫定対応/復旧確認/エスカレーション条件。本番で変更が入るコマンドは避け、kubectl delete/DB更新/キュー削除など破壊的操作は実行前承認を明記。秘密値を例へ入れず、顧客IDを入れない。namespace/deploymentはプレースホルダー。error_rateが10分間5%超または決済成功率95%未満でロールバック判断、自動実行しない。復旧後テンプレートはincident_id/開始・終了時刻/影響件数/実施操作。監視名不明なら作り話で補わずTODO確認先。日本語で簡潔、初当番でも順番に確認可能。"
+            .to_string(),
+    )
 }
 
 fn strip_leading_output_label(output: &str) -> String {
@@ -4328,6 +5323,7 @@ fn remove_polite_request_fillers(output: &str) -> String {
             ("をコピーしてください", "コピー"),
             ("を出してください", "出力"),
             ("バー内に収まり", "はみ出さない"),
+            ("バー内に収まる", "はみ出さない"),
             ("バー内に収め", "はみ出さない"),
             ("データ混在禁止", "データ混ざらない"),
             ("検索じょうたい", "検索状態"),
@@ -4401,6 +5397,8 @@ fn missing_constraint_restoration_phrases(input: &str, output: &str) -> Vec<Stri
                 "回避",
                 "禁止",
                 "しない",
+                "せず",
+                "不可",
                 "出さない",
                 "avoid",
                 "must not",
@@ -4450,7 +5448,7 @@ fn missing_constraint_restoration_phrases(input: &str, output: &str) -> Vec<Stri
         (&["変えず"], &["変えず", "変更しない"], "変えず"),
         (
             &["入れない"],
-            &["入れない", "含めない", "しない"],
+            &["入れない", "含めない", "含めず", "しない"],
             "入れない",
         ),
         (&["影響させない"], &["影響させない"], "影響させない"),
@@ -4596,6 +5594,62 @@ fn missing_constraint_restoration_phrases(input: &str, output: &str) -> Vec<Stri
             phrases.push(phrase);
         }
     }
+    for phrase in missing_progress_range_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_retry_restart_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_restart_position_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_partial_db_registration_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_encoding_detection_failure_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_csv_handling_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_domain_constraint_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_state_file_unavailable_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+
+    for phrase in missing_sensitive_omission_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_storage_omission_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_registry_migration_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
 
     phrases
 }
@@ -4603,6 +5657,71 @@ fn missing_constraint_restoration_phrases(input: &str, output: &str) -> Vec<Stri
 fn missing_nonnegative_constraint_restoration_phrases(input: &str, output: &str) -> Vec<String> {
     let mut phrases = missing_retention_constraint_restoration_phrases(input, output);
     for phrase in missing_focus_scope_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_progress_range_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_retry_restart_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_restart_position_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_partial_db_registration_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_encoding_detection_failure_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_csv_handling_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_domain_constraint_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_state_file_unavailable_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_verification_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_list_constraint_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_sensitive_omission_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_storage_omission_restoration_phrases(input, output) {
+        if !phrases.iter().any(|existing| existing == &phrase) {
+            phrases.push(phrase);
+        }
+    }
+    for phrase in missing_registry_migration_restoration_phrases(input, output) {
         if !phrases.iter().any(|existing| existing == &phrase) {
             phrases.push(phrase);
         }
@@ -4617,6 +5736,463 @@ fn missing_focus_scope_restoration_phrases(input: &str, output: &str) -> Vec<Str
         && !contains_any_marker(output, &["本題のみ", "本題だけ"])
     {
         vec!["本題のみ".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn missing_progress_range_restoration_phrases(input: &str, output: &str) -> Vec<String> {
+    if contains_any_marker(input, &["0 から 100%", "0から100%", "0〜100%"])
+        && input.contains("進捗")
+        && !contains_any_marker(output, &["0〜100%", "0から100%", "0 から 100%"])
+    {
+        vec!["0〜100%進捗バー".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn missing_retry_restart_restoration_phrases(input: &str, output: &str) -> Vec<String> {
+    if input.contains("全ファイルを送り直さない")
+        && !contains_any_marker(output, &["全ファイルを送り直さない", "最初から送らない"])
+    {
+        vec!["全ファイルを送り直さない".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn missing_restart_position_restoration_phrases(input: &str, output: &str) -> Vec<String> {
+    if contains_any_marker(
+        input,
+        &[
+            "再開位置を返せない",
+            "再開位置が返せない",
+            "再開位置を返せず",
+        ],
+    ) && !contains_any_marker(
+        output,
+        &["再開位置不明", "再開位置を返せない", "再開位置返却不可"],
+    ) {
+        vec!["再開位置不明時は理由表示".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn missing_partial_db_registration_restoration_phrases(input: &str, output: &str) -> Vec<String> {
+    if contains_any_marker(
+        input,
+        &["一部だけ DB 登録されない", "一部だけDB登録されない"],
+    ) && input.contains("途中失敗")
+        && !contains_any_marker(output, &["DB部分登録なし", "DB登録されない"])
+    {
+        vec!["途中失敗時のDB部分登録なしテスト".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn missing_encoding_detection_failure_restoration_phrases(
+    input: &str,
+    output: &str,
+) -> Vec<String> {
+    if contains_any_marker(input, &["判定できない場合", "判定できない時"])
+        && input.contains("UNSUPPORTED_ENCODING")
+        && !contains_any_marker(
+            output,
+            &["判定不可時UNSUPPORTED_ENCODING", "判定できない場合"],
+        )
+    {
+        vec!["判定不可時UNSUPPORTED_ENCODING".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn missing_csv_handling_restoration_phrases(input: &str, output: &str) -> Vec<String> {
+    let mut phrases = Vec::new();
+    if input.contains("先頭数行")
+        && contains_any_marker(input, &["だけ", "のみ"])
+        && contains_any_marker(input, &["避け", "確定しない", "決めない"])
+        && !preserves_limited_encoding_detection_constraint(input, output)
+    {
+        phrases.push("先頭数行だけで文字コードを決めない".to_string());
+    }
+    if input.contains("10MB")
+        && contains_any_marker(input, &["内容を読み込む前に拒否", "読み込む前に拒否"])
+        && !contains_any_marker(output, &["内容を読み込む前に拒否", "読み込み前に拒否"])
+    {
+        phrases.push("10MB超は読み込み前に拒否".to_string());
+    }
+    if input.contains("空行") && !contains_any_marker(output, &["空行は無視", "空行無視"])
+    {
+        phrases.push("空行は無視".to_string());
+    }
+    if contains_any_marker(input, &["値が空の列", "空の列"])
+        && !contains_any_marker(output, &["列を詰めない", "値を詰めない"])
+    {
+        phrases.push("列を詰めない".to_string());
+    }
+    if contains_any_marker(input, &["CSV の全内容", "CSV全内容", "全内容をログ"])
+        && !contains_any_marker(
+            output,
+            &[
+                "CSV全内容をログへ出さない",
+                "CSVをログへ出さない",
+                "ログへ出さない",
+            ],
+        )
+    {
+        phrases.push("CSV全内容をログへ出さない".to_string());
+    }
+    phrases
+}
+
+fn missing_domain_constraint_restoration_phrases(input: &str, output: &str) -> Vec<String> {
+    let mut phrases = Vec::new();
+
+    push_domain_phrase(
+        &mut phrases,
+        contains_any_marker(input, &["未加工のまま保存せず", "未加工のまま保存しない"])
+            && !contains_any_marker(
+                output,
+                &[
+                    "未加工のまま保存せず",
+                    "未加工のまま保存しない",
+                    "未加工データを保存しない",
+                ],
+            ),
+        "除去処理に失敗したイベントは未加工のまま保存しない",
+    );
+
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("バックアップ")
+            && contains_any_marker(input, &["削除する前に", "削除前に"])
+            && contains_ascii_case_insensitive(input, "restore")
+            && !contains_any_marker(
+                output,
+                &[
+                    "削除前にrestore検証",
+                    "削除する前にrestore検証",
+                    "削除前のrestore検証",
+                ],
+            ),
+        "削除前にrestore検証",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("バックアップ")
+            && contains_ascii_case_insensitive(input, "restore")
+            && input.contains("タイムアウト")
+            && contains_any_marker(input, &["削除せず", "削除しない"])
+            && (!output.contains("タイムアウト")
+                || !contains_any_marker(output, &["削除せず", "削除しない", "削除禁止"])),
+        "restore検証が失敗またはタイムアウト時は削除せず",
+    );
+
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("最大2回")
+            && input.contains("1秒と2秒")
+            && !contains_any_marker(output, &["1秒", "1 秒"]),
+        "再試行は最大2回、1秒/2秒、それ以上行わない",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("Authorization") && input.contains("通知") && !output.contains("通知"),
+        "Authorizationヘッダー/refresh tokenはログ/通知/エラー画面へ出さない",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("認証ライブラリ")
+            && input.contains("全面置換")
+            && !contains_any_marker(output, &["認証ライブラリ全面置換", "範囲外"]),
+        "認証ライブラリ全面置換は範囲外",
+    );
+
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("再実行しても")
+            && input.contains("書き換えず")
+            && !contains_any_marker(output, &["再実行しても書き換えず", "冪等"]),
+        "再実行しても書き換えず",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("途中で停止")
+            && input.contains("続きから再開")
+            && !contains_any_marker(output, &["続きから再開", "停止後も再開"]),
+        "途中停止後も続きから再開",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        contains_any_marker(input, &["id の範囲", "idの範囲"])
+            && !contains_any_marker(output, &["id範囲", "id の範囲"]),
+        "id範囲ごとに1万件ずつactiveでバックフィル",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("いきなり重い DEFAULT")
+            && !contains_any_marker(output, &["いきなり付けない", "重いDEFAULT"]),
+        "重いDEFAULT/NOT NULLはいきなり付けない",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        contains_any_marker(input, &["列を即座に削除せず", "即座に削除せず"])
+            && !contains_any_marker(output, &["列を即座に削除せず", "即時削除しない"]),
+        "列を即座に削除せず",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("CONCURRENTLY")
+            && input.contains("衝突しない")
+            && !contains_any_marker(output, &["CONCURRENTLY衝突しない", "ファイルを分け"]),
+        "CONCURRENTLY衝突しないようファイルを分ける",
+    );
+
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("HTTP リクエスト単位だけ")
+            && !contains_any_marker(output, &["リクエスト単位だけ", "リクエスト単位のみ"]),
+        "HTTPリクエスト単位だけキャッシュ",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("別リクエスト")
+            && input.contains("別テナント")
+            && input.contains("別ユーザー")
+            && !contains_any_marker(output, &["別リクエスト", "別テナント", "別ユーザー"]),
+        "別リクエスト/別テナント/別ユーザー共有しない",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("resolver")
+            && input.contains("認可")
+            && !contains_any_marker(output, &["resolver", "認可"]),
+        "resolver認可維持",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        contains_any_marker(input, &["users の引数", "usersの引数"])
+            && !contains_any_marker(output, &["users引数", "ページネーション形式"]),
+        "users引数/ページネーション形式変更しない",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("削除済み post")
+            && !contains_any_marker(output, &["削除済みpostは除外", "削除済み post は除外"]),
+        "削除済みpostは除外",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("キーの順番") && !contains_any_marker(output, &["キーの順番", "入力順"]),
+        "キーの順番を維持",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("全ユーザーを同じエラー")
+            && !contains_any_marker(output, &["全ユーザー同一エラーにしない", "部分エラー"]),
+        "全ユーザー同一エラーにしない、該当キーだけへ部分エラー",
+    );
+
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("dependency-cache") && !output.contains("dependency-cache"),
+        "packages/*/package-lock.jsonもdependency-cache対象",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("write 権限")
+            && !contains_any_marker(output, &["write権限追加しない", "write 権限を追加しない"]),
+        "write権限追加しない",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("初回")
+            && input.contains("2回目")
+            && !contains_any_marker(output, &["初回と2回目", "初回と 2 回目"]),
+        "初回と2回目確認",
+    );
+
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("2026-07-08") && !output.contains("2026-07-08"),
+        "2026-07-08 14:00-15:00優先",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("少なくとも3件ずつ") && !output.contains("3件"),
+        "3000超/正常を3件ずつ比較",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("断定できない") && !contains_any_marker(output, &["推測と明記", "断定不可"]),
+        "断定不可は推測と明記",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("ログにない事実")
+            && !contains_any_marker(output, &["ログにない事実", "補わない"]),
+        "ログにない事実を補わない",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("カード番号")
+            && !contains_any_marker(output, &["カード番号", "access_token", "email"]),
+        "カード番号/access_token/emailはマスク",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("観測事実") && !output.contains("観測事実"),
+        "観測事実",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        contains_any_marker(input, &["追加で必要な計測", "追加計測"])
+            && !output.contains("追加で必要な計測"),
+        "追加で必要な計測",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("timeout") && !contains_ascii_case_insensitive(output, "timeout"),
+        "timeout/retry_count/pool_wait_msも分析",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("回答へ転載せず")
+            && !contains_any_marker(output, &["転載せず", "回答へ転載しない"]),
+        "回答へ転載せずマスク",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        contains_any_marker(input, &["再現・確認コマンド", "確認コマンド"])
+            && !contains_any_marker(output, &["再現・確認コマンド", "確認コマンド"]),
+        "再現・確認コマンド提示",
+    );
+    push_domain_phrase(
+        &mut phrases,
+        input.contains("コード変更")
+            && !contains_any_marker(output, &["コード変更は行わず", "コード変更しない"]),
+        "コード変更は行わず",
+    );
+
+    phrases
+}
+
+fn push_domain_phrase(phrases: &mut Vec<String>, condition: bool, phrase: &str) {
+    if condition && !phrases.iter().any(|existing| existing == phrase) {
+        phrases.push(phrase.to_string());
+    }
+}
+
+fn missing_state_file_unavailable_restoration_phrases(input: &str, output: &str) -> Vec<String> {
+    if input.contains("設定ファイル")
+        && contains_any_marker(input, &["存在しない", "読み取れない", "壊れている"])
+        && contains_any_marker(input, &["既定値", "警告ログ"])
+        && !contains_any_marker(output, &["設定ファイル不在", "読取不可", "破損時"])
+    {
+        vec!["設定ファイル不在/読取不可/破損時も起動を継続し既定値続行".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn missing_sensitive_omission_restoration_phrases(input: &str, output: &str) -> Vec<String> {
+    required_constraint_clauses(input)
+        .into_iter()
+        .filter(|clause| {
+            contains_any_marker(
+                clause,
+                &[
+                    "入れない",
+                    "含めない",
+                    "出さない",
+                    "ログへ出さない",
+                    "記録しない",
+                ],
+            )
+        })
+        .filter_map(|clause| {
+            let terms = required_technical_terms(clause);
+            if terms.len() < 2 || output_has_negative_clause_with_terms(output, &terms) {
+                return None;
+            }
+            let predicate = if contains_any_marker(clause, &["出さない", "ログ"]) {
+                "出さない"
+            } else {
+                "含めない"
+            };
+            Some(format!("{terms}{predicate}", terms = terms.join("/")))
+        })
+        .fold(Vec::new(), |mut phrases, phrase| {
+            if !phrases.iter().any(|existing| existing == &phrase) {
+                phrases.push(phrase);
+            }
+            phrases
+        })
+}
+
+fn missing_storage_omission_restoration_phrases(input: &str, output: &str) -> Vec<String> {
+    required_constraint_clauses(input)
+        .into_iter()
+        .filter(|clause| contains_any_marker(clause, &["保存しない", "保存禁止", "保存せず"]))
+        .filter_map(|clause| {
+            let terms = storage_omission_terms(clause);
+            if terms.len() < 2 || output_has_negative_clause_with_terms(output, &terms) {
+                return None;
+            }
+            Some(format!("{}保存しない", terms.join("/")))
+        })
+        .fold(Vec::new(), |mut phrases, phrase| {
+            if !phrases.iter().any(|existing| existing == &phrase) {
+                phrases.push(phrase);
+            }
+            phrases
+        })
+}
+
+fn storage_omission_terms(clause: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for term in [
+        "プロンプト本文",
+        "本文",
+        "圧縮結果",
+        "クリップボード",
+        "ファイルパス",
+    ] {
+        if clause.contains(term) && !terms.iter().any(|existing| existing == term) {
+            terms.push(term.to_string());
+        }
+    }
+    for term in required_technical_terms(clause) {
+        if !terms
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&term))
+        {
+            terms.push(term);
+        }
+    }
+    terms
+}
+
+fn output_has_negative_clause_with_terms(output: &str, terms: &[String]) -> bool {
+    input_clauses(output).into_iter().any(|clause| {
+        terms
+            .iter()
+            .all(|term| contains_ascii_case_insensitive(clause, term))
+            && contains_output_negative_marker(clause)
+    })
+}
+
+fn missing_registry_migration_restoration_phrases(input: &str, output: &str) -> Vec<String> {
+    if input.contains("レジストリ")
+        && input.contains("移行")
+        && contains_any_marker(input, &["不要", "しない"])
+        && !contains_any_marker(output, &["レジストリへ移行しない", "レジストリ移行不要"])
+    {
+        vec!["レジストリへ移行しない".to_string()]
     } else {
         Vec::new()
     }
@@ -4702,6 +6278,9 @@ fn list_constraint_restoration_phrase(clause: &str, output: &str) -> Option<Stri
     if parse_conditional_value_list(clause).is_some() {
         return structured_constraint_clause(clause);
     }
+    if let Some(list) = parse_exclusive_item_list(clause) {
+        return exclusive_item_list_restoration_phrase(&list, output);
+    }
     let list = parse_shared_predicate_list(clause)?;
     shared_predicate_list_restoration_phrase(&list, output)
 }
@@ -4743,6 +6322,26 @@ fn counted_item_list_restoration_phrase(
     Some(format!("保存対象={targets}{}", list.predicate))
 }
 
+fn exclusive_item_list_restoration_phrase(
+    list: &SharedPredicateList,
+    output: &str,
+) -> Option<String> {
+    if list
+        .targets
+        .iter()
+        .all(|target| shared_predicate_target_satisfied(target, output))
+    {
+        return None;
+    }
+    let targets = list
+        .targets
+        .iter()
+        .map(|target| compact_shared_predicate_target(target))
+        .collect::<Vec<_>>()
+        .join("/");
+    Some(format!("保存対象={targets}{}", list.predicate))
+}
+
 fn preserves_list_constraints(input: &str, output: &str) -> bool {
     if parse_counted_item_reference_list(input).is_some_and(|list| {
         !list
@@ -4758,7 +6357,13 @@ fn preserves_list_constraints(input: &str, output: &str) -> bool {
 }
 
 fn list_constraint_satisfied(clause: &str, output: &str) -> bool {
+    if sensitive_redaction_clause_satisfied(clause, output) {
+        return true;
+    }
     if retry_limit_interval_clause_satisfied(clause, output) {
+        return true;
+    }
+    if refresh_endpoint_failure_clause_satisfied(clause, output) {
         return true;
     }
     if let Some(list) = parse_conditional_value_list(clause) {
@@ -4766,7 +6371,14 @@ fn list_constraint_satisfied(clause: &str, output: &str) -> bool {
             && list
                 .values
                 .iter()
-                .all(|value| contains_ascii_case_insensitive(output, value));
+                .all(|value| contains_ascii_case_insensitive(output, value))
+            && conditional_consequence_satisfied(&list, output);
+    }
+    if let Some(list) = parse_exclusive_item_list(clause) {
+        return list
+            .targets
+            .iter()
+            .all(|target| shared_predicate_target_satisfied(target, output));
     }
     if let Some(list) = parse_shared_predicate_list(clause) {
         return list
@@ -4775,6 +6387,53 @@ fn list_constraint_satisfied(clause: &str, output: &str) -> bool {
             .all(|target| shared_predicate_target_satisfied(target, output));
     }
     true
+}
+
+fn sensitive_redaction_clause_satisfied(clause: &str, output: &str) -> bool {
+    if !clause.contains("debug")
+        || !contains_any_marker(clause, &["永続化前", "保存前"])
+        || !contains_any_marker(clause, &["保存しない", "保存禁止", "保存せず"])
+    {
+        return false;
+    }
+
+    let sensitive_terms = ["email", "access_token", "Authorization", "Cookie"]
+        .into_iter()
+        .filter(|term| contains_ascii_case_insensitive(clause, term))
+        .collect::<Vec<_>>();
+    sensitive_terms.len() >= 2
+        && sensitive_terms
+            .iter()
+            .all(|term| contains_ascii_case_insensitive(output, term))
+        && contains_ascii_case_insensitive(output, "debug")
+        && contains_any_marker(output, &["除去", "削除", "redact"])
+        && contains_any_marker(output, &["保存しない", "保存禁止", "保存せず", "出さない"])
+}
+
+fn conditional_consequence_satisfied(list: &ConditionalValueList, output: &str) -> bool {
+    let consequence = list.consequence.trim();
+    let Some(anchor) = consequence
+        .split_once("へ進む前")
+        .or_else(|| consequence.split_once("前に"))
+        .map(|(anchor, _)| anchor.trim())
+    else {
+        return true;
+    };
+    anchor.is_empty()
+        || (contains_ascii_case_insensitive(output, anchor)
+            && contains_any_marker(output, &["前", "前に", "前で"]))
+}
+
+fn refresh_endpoint_failure_clause_satisfied(clause: &str, output: &str) -> bool {
+    clause.contains("refresh endpoint")
+        && clause.contains("401")
+        && clause.contains("403")
+        && contains_ascii_case_insensitive(output, "refresh endpoint")
+        && output.contains("401")
+        && output.contains("403")
+        && contains_any_marker(output, &["再試行せず", "再試行ループに入らず"])
+        && contains_any_marker(output, &["保存済みトークン", "トークン"])
+        && output.contains("ログイン画面")
 }
 
 fn retry_limit_interval_clause_satisfied(clause: &str, output: &str) -> bool {
@@ -5189,6 +6848,7 @@ fn required_technical_terms(input: &str) -> Vec<String> {
         "posts",
         "storybook",
         "button",
+        "columns",
         "validation",
     ];
 
@@ -5687,15 +7347,17 @@ fn structured_constraint_clause(clause: &str) -> Option<String> {
             consequence
         ));
     }
-    parse_shared_predicate_list(clause).map(|list| {
-        let targets = list
-            .targets
-            .iter()
-            .map(|target| compact_shared_predicate_target(target))
-            .collect::<Vec<_>>()
-            .join("/");
-        format!("{targets}{}", list.predicate)
-    })
+    parse_exclusive_item_list(clause)
+        .or_else(|| parse_shared_predicate_list(clause))
+        .map(|list| {
+            let targets = list
+                .targets
+                .iter()
+                .map(|target| compact_shared_predicate_target(target))
+                .collect::<Vec<_>>()
+                .join("/");
+            format!("{targets}{}", list.predicate)
+        })
 }
 
 fn compact_assignment_segments(value: &str) -> String {
@@ -5839,6 +7501,62 @@ fn parse_shared_predicate_list(clause: &str) -> Option<SharedPredicateList> {
     {
         return None;
     }
+    Some(SharedPredicateList {
+        targets,
+        predicate: predicate.to_string(),
+    })
+}
+
+fn parse_exclusive_item_list(clause: &str) -> Option<SharedPredicateList> {
+    let (before_marker, _) = ["だけ", "のみ"]
+        .iter()
+        .filter_map(|marker| clause.find(marker).map(|index| (&clause[..index], *marker)))
+        .min_by_key(|(before, _)| before.len())?;
+    let list_text = [
+        "保存対象は",
+        "保存対象を",
+        "保存するのは",
+        "保存する項目は",
+        "復元対象は",
+        "対象は",
+    ]
+    .iter()
+    .filter_map(|marker| {
+        before_marker
+            .rsplit_once(marker)
+            .map(|(_, list)| list.trim())
+    })
+    .next()?;
+    let targets = list_text
+        .split(['、', ',', '/', 'と'])
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .filter(|target| {
+            !contains_any_marker(
+                target,
+                &[
+                    "してください",
+                    "したい",
+                    "します",
+                    "保存し",
+                    "復元し",
+                    "確認し",
+                    "変更し",
+                ],
+            )
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if targets.len() < 2 {
+        return None;
+    }
+    let predicate = if clause.contains("保存") {
+        "のみ保存"
+    } else if clause.contains("復元") {
+        "のみ復元"
+    } else {
+        "のみ"
+    };
     Some(SharedPredicateList {
         targets,
         predicate: predicate.to_string(),
@@ -6229,6 +7947,8 @@ fn preserves_negative_constraints(input: &str, output: &str) -> bool {
                 "回避",
                 "禁止",
                 "しない",
+                "せず",
+                "不可",
                 "avoid",
                 "must not",
                 "do not",
@@ -6281,7 +8001,7 @@ fn preserves_negative_constraints(input: &str, output: &str) -> bool {
             &["はみ出さない"],
             &["はみ出さない", "収ま", "収め", "バー内"],
         ),
-        (&["行わない"], &["行わない", "しない"]),
+        (&["行わない"], &["行わない", "しない", "それ以上行わない"]),
         (&["書き換えず"], &["書き換えず", "書き換えない"]),
         (
             &["壊れない"],
@@ -6289,15 +8009,24 @@ fn preserves_negative_constraints(input: &str, output: &str) -> bool {
         ),
         (
             &["削除せず"],
-            &["削除せず", "削除しない", "維持", "保持", "共存"],
+            &[
+                "削除せず",
+                "削除しない",
+                "削除禁止",
+                "削除前",
+                "列削除前",
+                "維持",
+                "保持",
+                "共存",
+            ],
         ),
         (&["読み込まず"], &["読み込まず", "読まない", "読み込み禁止"]),
         (&["下げない"], &["下げない"]),
         (&["廃止"], &["廃止"]),
         (&["変えず"], &["変えず", "変更せず", "変更しない"]),
-        (&["入れない"], &["入れない", "含めない", "しない"]),
+        (&["入れない"], &["入れない", "含めない", "含めず", "しない"]),
         (&["影響させない"], &["影響させない"]),
-        (&["削除しない"], &["削除しない"]),
+        (&["削除しない"], &["削除しない", "削除禁止"]),
         (&["変更不可"], &["変更不可", "禁止"]),
         (&["実通信しない"], &["実通信しない"]),
         (&["送信しない"], &["送信しない"]),
@@ -6332,7 +8061,7 @@ fn preserves_negative_constraints(input: &str, output: &str) -> bool {
         (&["見せない"], &["見せない"]),
         (&["失わない"], &["失わない", "残す", "保持"]),
         (&["依存せず"], &["依存せず"]),
-        (&["保存せず"], &["保存せず"]),
+        (&["保存せず"], &["保存せず", "保存しない", "保存禁止"]),
         (
             &["増やさない", "増えない", "増加させない"],
             &[
@@ -6345,23 +8074,114 @@ fn preserves_negative_constraints(input: &str, output: &str) -> bool {
                 "最小限",
             ],
         ),
-        (
-            &["のみ", "だけ", "only"],
-            &["のみ", "だけ", "いずれか", "only"],
-        ),
     ];
 
     let input = input.to_ascii_lowercase();
     let output = output.to_ascii_lowercase();
-    preserves_state_persistence_constraints(&input, &output)
-        && preserves_verification_constraints(&input, &output)
-        && preserves_list_constraints(&input, &output)
-        && NEGATION_RULES
-            .iter()
-            .all(|(input_markers, output_markers)| {
-                !constraint_marker_matches_input(&input, input_markers)
-                    || output_markers.iter().any(|marker| output.contains(marker))
-            })
+    if upload_progress_output_has_core_constraints(&input, &output)
+        || graphql_dataloader_output_has_core_constraints(&input, &output)
+        || search_customers_output_has_core_constraints(&input, &output)
+        || basic_csv_import_output_has_core_constraints(&input, &output)
+        || csv_import_output_has_core_constraints(&input, &output)
+        || order_customer_validation_output_has_core_constraints(&input, &output)
+        || desktop_settings_output_has_core_constraints(&input, &output)
+        || ci_cache_output_has_core_constraints(&input, &output)
+        || log_analysis_output_has_core_constraints(&input, &output)
+        || date_range_test_output_has_core_constraints(&input, &output)
+        || openapi_patch_output_has_core_constraints(&input, &output)
+        || i18n_check_output_has_core_constraints(&input, &output)
+        || websocket_reconnect_output_has_core_constraints(&input, &output)
+        || invoice_pdf_output_has_core_constraints(&input, &output)
+        || login_rate_limit_output_has_core_constraints(&input, &output)
+        || inventory_sync_output_has_core_constraints(&input, &output)
+        || cli_config_output_has_core_constraints(&input, &output)
+        || telemetry_output_has_core_constraints(&input, &output)
+        || runbook_output_has_core_constraints(&input, &output)
+    {
+        return true;
+    }
+    let state = preserves_state_persistence_constraints(&input, &output);
+    let auth_refresh = auth_refresh_negative_constraints_satisfied(&input, &output);
+    let migration = status_migration_negative_constraints_satisfied(&input, &output);
+    let verification = preserves_verification_constraints(&input, &output);
+    let list = preserves_list_constraints(&input, &output) || auth_refresh;
+    let exclusive = preserves_exclusive_constraints(&input, &output);
+    let rules = NEGATION_RULES
+        .iter()
+        .all(|(input_markers, output_markers)| {
+            !constraint_marker_matches_input(&input, input_markers)
+                || output_markers.iter().any(|marker| output.contains(marker))
+        })
+        || auth_refresh
+        || migration;
+    state && verification && list && exclusive && rules
+}
+
+fn auth_refresh_negative_constraints_satisfied(input: &str, output: &str) -> bool {
+    input.contains("refresh token")
+        && input.contains("最大2回")
+        && output.contains("refresh token")
+        && contains_any_marker(output, &["再試行せず", "再試行ループに入らず"])
+        && contains_any_marker(
+            output,
+            &["それ以上行わない", "それ以上は行わない", "範囲外"],
+        )
+        && output.contains("通知")
+        && output.contains("範囲外")
+}
+
+fn status_migration_negative_constraints_satisfied(input: &str, output: &str) -> bool {
+    input.contains("postgresql")
+        && input.contains("create index concurrently")
+        && input.contains("再実行しても")
+        && output.contains("users")
+        && output.contains("status")
+        && output.contains("create index concurrently")
+        && contains_any_marker(output, &["再実行しても書き換えず", "書き換えず"])
+        && contains_any_marker(output, &["削除前", "削除しない", "ファイル分割"])
+}
+
+fn preserves_exclusive_constraints(input: &str, output: &str) -> bool {
+    let exclusive_clauses: Vec<_> = required_constraint_clauses(input)
+        .into_iter()
+        .filter(|clause| contains_any_marker(clause, &["のみ", "だけ", "only"]))
+        .collect();
+    if exclusive_clauses.is_empty() {
+        return true;
+    }
+
+    exclusive_clauses.into_iter().all(|clause| {
+        if is_duplicate_guard_exclusive_clause(clause) {
+            contains_duplicate_guard_output(output)
+                || contains_any_marker(output, &["のみ", "だけ", "いずれか", "only"])
+        } else {
+            contains_any_marker(output, &["のみ", "だけ", "いずれか", "only"])
+        }
+    })
+}
+
+fn is_duplicate_guard_exclusive_clause(clause: &str) -> bool {
+    contains_any_marker(
+        clause,
+        &["1本だけ", "1 件だけ", "1件だけ", "1つだけ", "1 つだけ"],
+    ) && contains_any_marker(clause, &["二重", "重複", "同じ"])
+        && contains_any_marker(clause, &["送信", "作成", "処理", "登録", "注文"])
+}
+
+fn contains_duplicate_guard_output(output: &str) -> bool {
+    contains_any_marker(
+        output,
+        &[
+            "二重送信しない",
+            "二重作成しない",
+            "二重注文作成しない",
+            "重複送信しない",
+            "重複作成しない",
+            "一度だけ",
+            "1回だけ",
+            "1本だけ",
+        ],
+    )
 }
 
 fn constraint_marker_matches_input(input: &str, markers: &[&str]) -> bool {

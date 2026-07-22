@@ -1,8 +1,8 @@
 ﻿TrimPrompt desktop package
 
-Generated: 2026-07-22 03:29:03
-Build ID: 20260721182739-066395371331
-Inference compatibility ID: a7026363d1cd242f7cc3e1d392786761058407f2c39689722098c791882cc09f
+Generated: 2026-07-22 09:43:40
+Build ID: 20260722004256-7b9634ac79f6
+Inference compatibility ID: cd903b0fa615e73447b3237ba01f71e06c0e6b5307c912c8c3fcff7f7967a934
 Executable: TrimPrompt.exe
 Default profile: internal_llm
 Model: downloaded from Hugging Face on first launch to application/local/models/sarashina2.2-3b-instruct-v0.1/sarashina2.2-3b-instruct-v0.1-Q4_K_S.gguf

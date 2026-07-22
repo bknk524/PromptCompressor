@@ -12,11 +12,23 @@ pub struct VerificationSummary {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SimpleVerifier;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CheckStatus {
     NotApplicable,
     Preserved,
-    Missing,
+    Missing(Vec<String>),
+}
+
+impl CheckStatus {
+    fn is_preserved(&self) -> bool {
+        matches!(self, CheckStatus::Preserved)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MissingCheck {
+    name: &'static str,
+    examples: Vec<String>,
 }
 
 impl SimpleVerifier {
@@ -35,7 +47,7 @@ impl SimpleVerifier {
                         .to_string(),
                 }],
                 should_send_original: true,
-                fallback_reason: Some("empty_distilled_prompt".to_string()),
+                fallback_reason: Some("原文返し理由: 圧縮結果が空でした。".to_string()),
             };
         }
 
@@ -81,7 +93,7 @@ impl SimpleVerifier {
 
         let preserved_requirements = checks
             .iter()
-            .filter(|(_, status)| *status == CheckStatus::Preserved)
+            .filter(|(_, status)| status.is_preserved())
             .map(|(name, _)| PreservedRequirement {
                 kind: "constraint".to_string(),
                 text: (*name).to_string(),
@@ -89,20 +101,21 @@ impl SimpleVerifier {
             .collect();
         let missing: Vec<_> = checks
             .iter()
-            .filter(|(_, status)| *status == CheckStatus::Missing)
-            .map(|(name, _)| *name)
+            .filter_map(|(name, status)| match status {
+                CheckStatus::Missing(examples) => Some(MissingCheck {
+                    name,
+                    examples: examples.clone(),
+                }),
+                CheckStatus::NotApplicable | CheckStatus::Preserved => None,
+            })
             .collect();
         let should_send_original = !missing.is_empty();
-        let fallback_reason =
-            should_send_original.then(|| format!("verification_failed: {}", missing.join(", ")));
+        let fallback_reason = should_send_original.then(|| verification_fallback_reason(&missing));
         let risk_flags = should_send_original
             .then(|| RiskFlag {
                 code: "VERIFICATION_FAILED".to_string(),
                 severity: RiskSeverity::High,
-                message: format!(
-                    "Compression omitted protected content for: {}. Sending the original is safer.",
-                    missing.join(", ")
-                ),
+                message: verification_risk_message(&missing),
             })
             .into_iter()
             .collect();
@@ -116,14 +129,61 @@ impl SimpleVerifier {
     }
 }
 
+fn verification_fallback_reason(missing: &[MissingCheck]) -> String {
+    format!(
+        "原文返し理由: {}を圧縮結果で安全に確認できませんでした。",
+        missing
+            .iter()
+            .map(verification_missing_detail)
+            .collect::<Vec<_>>()
+            .join("、")
+    )
+}
+
+fn verification_risk_message(missing: &[MissingCheck]) -> String {
+    format!(
+        "圧縮結果で{}を保持できなかったため、原文返しを選択しました。",
+        missing
+            .iter()
+            .map(verification_missing_detail)
+            .collect::<Vec<_>>()
+            .join("、")
+    )
+}
+
+fn verification_missing_detail(check: &MissingCheck) -> String {
+    let label = verification_reason_label(check.name);
+    let examples = diagnostic_examples(&check.examples);
+    if examples.is_empty() {
+        label.to_string()
+    } else {
+        format!("{label}（例: {}）", examples.join(" / "))
+    }
+}
+
+fn verification_reason_label(check_name: &str) -> &'static str {
+    match check_name {
+        "preserve_code_blocks" => "コードブロック",
+        "preserve_file_names" => "ファイル名",
+        "preserve_error_messages" => "エラー表記",
+        "preserve_numbers" => "数値",
+        "preserve_negations" => "否定・禁止・維持条件",
+        _ => "必須条件",
+    }
+}
+
 fn check_exact_values(enabled: bool, input: Vec<String>, output: Vec<String>) -> CheckStatus {
     if !enabled || input.is_empty() {
         return CheckStatus::NotApplicable;
     }
-    if input.iter().all(|value| output.contains(value)) {
+    let missing = input
+        .into_iter()
+        .filter(|value| !output.contains(value))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
         CheckStatus::Preserved
     } else {
-        CheckStatus::Missing
+        CheckStatus::Missing(missing)
     }
 }
 
@@ -135,13 +195,14 @@ fn check_case_insensitive_values(
     if !enabled || input.is_empty() {
         return CheckStatus::NotApplicable;
     }
-    if input
-        .iter()
-        .all(|value| output.iter().any(|item| item.eq_ignore_ascii_case(value)))
-    {
+    let missing = input
+        .into_iter()
+        .filter(|value| !output.iter().any(|item| item.eq_ignore_ascii_case(value)))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
         CheckStatus::Preserved
     } else {
-        CheckStatus::Missing
+        CheckStatus::Missing(missing)
     }
 }
 
@@ -149,10 +210,14 @@ fn check_values_in_text(enabled: bool, input: Vec<String>, output: &str) -> Chec
     if !enabled || input.is_empty() {
         return CheckStatus::NotApplicable;
     }
-    if input.iter().all(|value| output.contains(value)) {
+    let missing = input
+        .into_iter()
+        .filter(|value| !output.contains(value))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
         CheckStatus::Preserved
     } else {
-        CheckStatus::Missing
+        CheckStatus::Missing(missing)
     }
 }
 
@@ -163,7 +228,10 @@ fn check_negations(request: &CompressionRequest, output: &str) -> CheckStatus {
     if preserves_requested_negations(request, output) {
         CheckStatus::Preserved
     } else {
-        CheckStatus::Missing
+        CheckStatus::Missing(extract_constraint_examples(
+            &normalized_verification_input(&request.input_text),
+            output,
+        ))
     }
 }
 
@@ -189,6 +257,96 @@ fn contains_constraint_marker(input: &str) -> bool {
     ]
     .iter()
     .any(|marker| lower.contains(marker))
+}
+
+fn extract_constraint_examples(input: &str, output: &str) -> Vec<String> {
+    let mut examples = Vec::new();
+    for clause in input.split(['。', '！', '？', '\n', ';']) {
+        let effective = corrected_clause_tail(clause).trim();
+        if effective.is_empty() || !contains_constraint_marker(effective) {
+            continue;
+        }
+        if diagnostic_constraint_maybe_preserved(effective, output) {
+            continue;
+        }
+        push_unique(&mut examples, effective.to_string());
+        if examples.len() >= 3 {
+            break;
+        }
+    }
+    examples
+}
+
+fn diagnostic_constraint_maybe_preserved(clause: &str, output: &str) -> bool {
+    let lower_output = output.to_ascii_lowercase();
+    let has_matching_marker = [
+        "しない",
+        "せず",
+        "禁止",
+        "避け",
+        "変更しない",
+        "変更せず",
+        "維持",
+        "保持",
+        "だけ",
+        "のみ",
+        "must not",
+        "do not",
+        "without",
+        "preserve",
+        "keep",
+    ]
+    .iter()
+    .any(|marker| lower_output.contains(&marker.to_ascii_lowercase()));
+    if !has_matching_marker {
+        return false;
+    }
+
+    let terms = diagnostic_terms(clause);
+    terms.is_empty()
+        || terms
+            .iter()
+            .any(|term| contains_any_marker(output, &[term.as_str()]))
+}
+
+fn diagnostic_terms(clause: &str) -> Vec<String> {
+    let mut terms = extract_file_names(clause);
+    for token in ascii_identifier_tokens(clause) {
+        let lower = token.to_ascii_lowercase();
+        if token.len() >= 3
+            && ![
+                "api", "get", "post", "put", "delete", "http", "json", "the", "and", "for",
+            ]
+            .contains(&lower.as_str())
+        {
+            push_unique(&mut terms, token);
+        }
+    }
+    terms
+}
+
+fn diagnostic_examples(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| compact_diagnostic_value(value))
+        .filter(|value| !value.is_empty())
+        .take(3)
+        .collect()
+}
+
+fn compact_diagnostic_value(value: &str) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_chars(&compact, 48)
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
 }
 
 fn extract_fenced_code_blocks(input: &str) -> Vec<String> {
@@ -368,18 +526,142 @@ fn extract_numbers(input: &str) -> Vec<String> {
         }
         let effective = corrected_clause_tail(clause);
         let mut current = String::new();
-        for character in effective.chars() {
+        let mut current_start = 0;
+        for (index, character) in effective.char_indices() {
             if character.is_ascii_digit() {
+                if current.is_empty() {
+                    current_start = index;
+                }
                 current.push(character);
             } else if !current.is_empty() {
-                push_unique(&mut values, std::mem::take(&mut current));
+                if !number_can_be_preserved_semantically(effective, current_start, index, &current)
+                    && !number_is_background_context(effective, current_start, index)
+                {
+                    push_unique(&mut values, std::mem::take(&mut current));
+                } else {
+                    current.clear();
+                }
             }
         }
-        if !current.is_empty() {
+        if !current.is_empty()
+            && !number_can_be_preserved_semantically(
+                effective,
+                current_start,
+                effective.len(),
+                &current,
+            )
+            && !number_is_background_context(effective, current_start, effective.len())
+        {
             push_unique(&mut values, current);
         }
     }
     values
+}
+
+fn number_can_be_preserved_semantically(
+    clause: &str,
+    number_start: usize,
+    number_end: usize,
+    number: &str,
+) -> bool {
+    if number != "1" {
+        return false;
+    }
+    let local = local_number_context(clause, number_start, number_end, 10, 12);
+    contains_any_marker(&local, &["だけ", "のみ"])
+        && contains_any_marker(clause, &["二重", "重複", "同じ"])
+        && contains_any_marker(clause, &["送信", "作成", "処理", "登録", "注文"])
+}
+
+fn number_is_background_context(clause: &str, number_start: usize, number_end: usize) -> bool {
+    let local = local_number_context(clause, number_start, number_end, 24, 24);
+    if !contains_any_marker(
+        &local,
+        &[
+            "増えて",
+            "止まって",
+            "見え",
+            "発生",
+            "起きて",
+            "なって",
+            "重く",
+            "遅く",
+            "不便",
+            "困って",
+            "言われ",
+            "問題",
+            "落ち",
+            "数百回",
+            "になるやつ",
+            "エラーにな",
+        ],
+    ) {
+        return false;
+    }
+
+    // HTTPステータスや明示的な条件・制約に結びつく数値は、症状説明に見えても保護する。
+    let protection_scope = local_number_context(clause, number_start, number_end, 12, 18);
+    !contains_any_marker(
+        &protection_scope,
+        &[
+            "HTTP",
+            "code",
+            "コード",
+            "最大",
+            "最小",
+            "以上",
+            "以下",
+            "超",
+            "未満",
+            "まで",
+            "から",
+            "なら",
+            "場合",
+            "時",
+            "とき",
+            "だけ",
+            "のみ",
+            "返し",
+            "返す",
+            "拒否",
+            "許可",
+            "追加",
+            "維持",
+            "変更",
+            "確認",
+            "テスト",
+            "想定",
+        ],
+    )
+}
+
+fn local_number_context(
+    clause: &str,
+    number_start: usize,
+    number_end: usize,
+    before_chars: usize,
+    after_chars: usize,
+) -> String {
+    let before_start = clause[..number_start]
+        .char_indices()
+        .rev()
+        .take(before_chars)
+        .last()
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    let after_end = clause[number_end..]
+        .char_indices()
+        .nth(after_chars)
+        .map(|(index, _)| number_end + index)
+        .unwrap_or(clause.len());
+    clause[before_start..after_end].to_string()
+}
+
+fn contains_any_marker(value: &str, markers: &[&str]) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    markers
+        .iter()
+        .any(|marker| normalized.contains(&marker.to_ascii_lowercase()))
 }
 
 pub(crate) fn preserves_requested_numbers(input: &str, output: &str) -> bool {
@@ -434,10 +716,21 @@ mod tests {
         let summary = SimpleVerifier.verify(&request, "入力エラーを返すよう修正する。");
 
         assert!(summary.should_send_original);
-        assert_eq!(
-            summary.fallback_reason.as_deref(),
-            Some("verification_failed: preserve_file_names, preserve_error_messages, preserve_numbers, preserve_negations")
-        );
+        let fallback_reason = summary.fallback_reason.as_deref().unwrap_or_default();
+        assert!(fallback_reason.contains("原文返し理由:"));
+        for detail in [
+            "ファイル名（例: config.yaml）",
+            "エラー表記（例: INVALID_CUSTOMER）",
+            "数値（例: 400）",
+            "否定・禁止・維持条件",
+            "既存画面の表示文言は変えないでください",
+        ] {
+            assert!(fallback_reason.contains(detail), "{fallback_reason}");
+        }
+        assert!(summary
+            .risk_flags
+            .iter()
+            .any(|risk| risk.message.contains("エラー表記")));
         for missing in [
             "preserve_file_names",
             "preserve_error_messages",
@@ -503,6 +796,43 @@ mod tests {
             .preserved_requirements
             .iter()
             .any(|requirement| requirement.text == "preserve_numbers"));
+    }
+
+    #[test]
+    fn ignores_symptom_numbers_before_verifying_required_numbers() {
+        let input = "Next.js の注文作成 API について、最近フロント側の入力漏れで 500 が増えているので、ひとまず落ち方を正したいです。customerId が未指定なら HTTP 400 を返してください。";
+        let output = "Next.js注文作成API: customerId未指定時はHTTP 400を返す。";
+        let request = test_request(input);
+
+        let summary = SimpleVerifier.verify(&request, output);
+
+        assert!(!summary.should_send_original, "{summary:?}");
+        assert!(summary
+            .preserved_requirements
+            .iter()
+            .any(|requirement| requirement.text == "preserve_numbers"));
+    }
+
+    #[test]
+    fn still_requires_numbers_used_as_conditions() {
+        let input = "SPA の認証で 401 を受けた時は refresh token を1回だけ更新してください。";
+        let output = "SPA認証: refresh tokenを1回だけ更新。";
+        let request = test_request(input);
+
+        let summary = SimpleVerifier.verify(&request, output);
+
+        assert!(summary.should_send_original, "{summary:?}");
+    }
+
+    #[test]
+    fn accepts_duplicate_guard_wording_for_single_item_counts() {
+        let input = "同じ uploadId では1本だけ処理されるようにしてください。";
+        let output = "uploadId単位で二重送信しない。";
+        let request = test_request(input);
+
+        let summary = SimpleVerifier.verify(&request, output);
+
+        assert!(!summary.should_send_original, "{summary:?}");
     }
 
     #[test]

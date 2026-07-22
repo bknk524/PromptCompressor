@@ -638,7 +638,83 @@ fn compact_surface_text(text: &str) -> String {
             break;
         }
     }
-    compact
+    normalize_compact_sentence_ending(compact)
+}
+
+pub(crate) fn normalize_compact_sentence_endings(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut sentence_start = 0;
+    for (index, character) in text.char_indices() {
+        if character != '。' {
+            continue;
+        }
+        normalized.push_str(&normalize_compact_sentence_ending(
+            text[sentence_start..index].to_string(),
+        ));
+        normalized.push(character);
+        sentence_start = index + character.len_utf8();
+    }
+    normalized.push_str(&normalize_compact_sentence_ending(
+        text[sentence_start..].to_string(),
+    ));
+    normalized
+}
+
+fn normalize_compact_sentence_ending(mut text: String) -> String {
+    for (from, to) in [
+        ("変更しないで", "変更しない"),
+        ("保存しないで", "保存しない"),
+        ("削除しないで", "削除しない"),
+        ("出さないで", "出さない"),
+        ("作り直さないで", "作り直さない"),
+        ("させないで", "させない"),
+        ("しないで", "しない"),
+        ("ないで", "ない"),
+        ("書き込まず", "書き込まない"),
+        ("保存せず", "保存しない"),
+        ("せず", "しない"),
+        ("呼び出し", "呼び出す"),
+        ("呼び", "呼ぶ"),
+        ("処理し", "処理する"),
+        ("中断し", "中断する"),
+        ("続行し", "続行する"),
+        ("更新し", "更新する"),
+        ("保存し", "保存する"),
+        ("実行し", "実行する"),
+        ("照合し", "照合する"),
+        ("維持し", "維持する"),
+        ("追加し", "追加する"),
+        ("確認し", "確認する"),
+        ("原文返しにし", "原文返しにする"),
+        ("残し", "残す"),
+        ("返し", "返す"),
+        ("示し", "示す"),
+        ("示して", "示す"),
+        ("返して", "返す"),
+        ("追加して", "追加する"),
+        ("更新して", "更新する"),
+        ("保存して", "保存する"),
+        ("取得して", "取得する"),
+        ("実行して", "実行する"),
+        ("照合して", "照合する"),
+        ("維持して", "維持する"),
+        ("指定して", "指定する"),
+        ("公開して", "公開する"),
+        ("改善して", "改善する"),
+        ("parseして", "parseする"),
+        ("残して", "残す"),
+        ("にして", "にする"),
+        ("行って", "行う"),
+        ("使って", "使う"),
+        ("防いで", "防ぐ"),
+        ("させて", "させる"),
+    ] {
+        if let Some(stem) = text.strip_suffix(from) {
+            text = format!("{stem}{to}");
+            break;
+        }
+    }
+    text
 }
 
 fn contains_any_marker(value: &str, markers: &[&str]) -> bool {
@@ -656,7 +732,7 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::PromptStructure;
+    use super::{normalize_compact_sentence_endings, PromptStructure};
 
     #[test]
     fn renders_conditional_constraints_and_verification_as_distinct_facts() {
@@ -734,5 +810,36 @@ mod tests {
             .any(|value| value.contains("無効にしない")));
         assert!(expressions.iter().any(|value| value.contains("場合")));
         assert!(!expressions.iter().any(|value| value == "場合"));
+    }
+
+    #[test]
+    fn finishes_atomic_constraint_items_with_finite_verbs() {
+        let input = "ReactとTypeScriptで検索フォームを修正してください。検索ボタンを押した時だけAPIを呼び、入力が空なら通信せずエラーを表示します。既存のキーボード操作とテストは維持し、変更したファイルと確認結果も示してください。";
+        let terms = vec![
+            "React".to_string(),
+            "TypeScript".to_string(),
+            "API".to_string(),
+        ];
+
+        let candidate = PromptStructure::analyze(input, &terms)
+            .compact_candidate()
+            .expect("generic candidate");
+
+        assert!(candidate.contains("APIを呼ぶ。"), "{candidate}");
+        assert!(candidate.contains("テストは維持し、"), "{candidate}");
+        assert!(candidate.ends_with("確認結果も示す"), "{candidate}");
+        for fragment in ["呼び。", "維持し。", "示して"] {
+            assert!(!candidate.contains(fragment), "{fragment}: {candidate}");
+        }
+    }
+
+    #[test]
+    fn normalizes_each_model_sentence_to_a_finite_ending() {
+        let output = "cacheを指定して。npm testを続行し。secretsを要求せず。CIを失敗させないで。成功扱いにしないで。ログを残して。原文返しにし。旧値を残さないで";
+
+        assert_eq!(
+            normalize_compact_sentence_endings(output),
+            "cacheを指定する。npm testを続行する。secretsを要求しない。CIを失敗させない。成功扱いにしない。ログを残す。原文返しにする。旧値を残さない"
+        );
     }
 }
